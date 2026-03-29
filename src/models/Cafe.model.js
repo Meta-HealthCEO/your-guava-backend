@@ -1,0 +1,42 @@
+const mongoose = require('mongoose');
+
+const cafeSchema = new mongoose.Schema(
+  {
+    name: {
+      type: String,
+      required: true,
+    },
+    ownerId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+    },
+    location: {
+      address: { type: String },
+      city: { type: String, default: 'Cape Town' },
+      lat: { type: Number },
+      lng: { type: Number },
+    },
+    yocoConnected: {
+      type: Boolean,
+      default: false,
+    },
+    yocoApiKey: {
+      type: String,
+    },
+    timezone: {
+      type: String,
+      default: 'Africa/Johannesburg',
+    },
+    dataUploaded: {
+      type: Boolean,
+      default: false,
+    },
+    lastSyncAt: {
+      type: Date,
+    },
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model('Cafe', cafeSchema);
