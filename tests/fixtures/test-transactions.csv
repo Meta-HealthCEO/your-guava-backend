@@ -1,0 +1,6 @@
+Receipt,Date,Time,Status,Payment Method,Order Number,Card Reader,Items,Note,Currency,Tip,Discount,VAT,Total (incl. tax),Fee Amount,Net Amount
+2026/01/000001,2026/01/15,09:30:00,Approved,Credit Card,#0001,12345,1 x Flat White (Blend),,ZAR,5.0,0.0,0.0,48.0,1.5,46.5
+2026/01/000002,2026/01/15,10:15:00,Approved,Cash,#0002,,2 x Long White (Blend),1 x Brownie,,ZAR,0.0,0.0,0.0,143.0,0.0,143.0
+2026/01/000003,2026/01/15,11:00:00,Declined,Credit Card,#0003,12345,1 x Cortado (Blend),,ZAR,0.0,0.0,0.0,42.0,0.0,42.0
+2026/01/000004,2026/01/16,08:00:00,Approved,Credit Card,#0004,12345,1 x Iced Coffee (None),,ZAR,3.0,0.0,0.0,64.0,2.0,62.0
+2026/01/000005,2026/01/16,09:00:00,Approved,Credit Card,#0005,12345,3 x Brownie,1 x Espresso (Blend),,ZAR,0.0,0.0,0.0,159.0,5.0,154.0
