@@ -11,6 +11,10 @@ const forecastsRoutes = require('./routes/forecasts.routes');
 const yocoRoutes = require('./routes/yoco.routes');
 const eventsRoutes = require('./routes/events.routes');
 const teamRoutes = require('./routes/team.routes');
+const analyticsRoutes = require('./routes/analytics.routes');
+const staffRoutes = require('./routes/staff.routes');
+const shiftsRoutes = require('./routes/shifts.routes');
+const leaveRoutes = require('./routes/leave.routes');
 const errorMiddleware = require('./middleware/error.middleware');
 
 const app = express();
@@ -36,6 +40,10 @@ app.use('/api/forecasts', forecastsRoutes);
 app.use('/api/yoco', yocoRoutes);
 app.use('/api/events', eventsRoutes);
 app.use('/api/team', teamRoutes);
+app.use('/api/analytics', analyticsRoutes);
+app.use('/api/staff', staffRoutes);
+app.use('/api/shifts', shiftsRoutes);
+app.use('/api/leave', leaveRoutes);
 
 // Health check
 app.get('/api/health', (_req, res) => {
