@@ -33,6 +33,7 @@ const forecastSchema = new mongoose.Schema(
       isSchoolHoliday: { type: Boolean, default: false },
       isPayday: { type: Boolean, default: false },
       dayOfWeek: { type: Number },
+      events: [{ name: String, impact: String }],
     },
     totalPredictedRevenue: {
       type: Number,

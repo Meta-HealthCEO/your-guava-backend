@@ -21,9 +21,13 @@ const cafeSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
-    yocoApiKey: {
-      type: String,
+    yocoTokens: {
+      accessToken: String,
+      refreshToken: String,
+      expiresAt: Date,
     },
+    yocoBusinessId: String,
+    yocoLocationId: String,
     timezone: {
       type: String,
       default: 'Africa/Johannesburg',

@@ -181,4 +181,21 @@ const logout = async (req, res, next) => {
   }
 };
 
-module.exports = { register, login, refresh, logout };
+const me = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.user.id).select('-password -refreshTokens');
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    return res.status(200).json({
+      id: user._id,
+      email: user.email,
+      name: user.name,
+      cafeId: user.cafeId,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { register, login, refresh, logout, me };

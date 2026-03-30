@@ -107,4 +107,23 @@ const getInsights = async (req, res, next) => {
   }
 };
 
-module.exports = { getToday, getWeek, generate, getAccuracy, getInsights };
+const getTomorrow = async (req, res, next) => {
+  try {
+    const cafeId = req.user.cafeId;
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(0, 0, 0, 0);
+
+    let forecast = await Forecast.findOne({ cafeId, date: tomorrow });
+
+    if (!forecast) {
+      forecast = await generateForecast(cafeId, tomorrow);
+    }
+
+    return res.status(200).json({ success: true, forecast });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { getToday, getTomorrow, getWeek, generate, getAccuracy, getInsights };

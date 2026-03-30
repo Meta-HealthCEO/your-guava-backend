@@ -12,6 +12,7 @@ const {
 router.use(authMiddleware);
 
 router.get('/today', getToday);
+router.get('/tomorrow', require('../controllers/forecasts.controller').getTomorrow);
 router.get('/week', getWeek);
 router.post('/generate', generate);
 router.get('/accuracy', getAccuracy);

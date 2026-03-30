@@ -1,6 +1,7 @@
 const Transaction = require('../models/Transaction.model');
 const Item = require('../models/Item.model');
 const Forecast = require('../models/Forecast.model');
+const Event = require('../models/Event.model');
 const Cafe = require('../models/Cafe.model');
 const { getSignalsForDate } = require('../utils/signals');
 const { getWeatherForecast } = require('./weather.service');
@@ -58,6 +59,17 @@ const holidayModifier = (isPublicHoliday, isSchoolHoliday) => {
  * Returns a payday multiplier.
  */
 const paydayModifier = (isPayday) => (isPayday ? 1.20 : 1.0);
+
+/**
+ * Returns an events multiplier based on the highest-impact event.
+ * low = +10%, medium = +20%, high = +35%
+ */
+const eventsModifier = (events) => {
+  if (!events || events.length === 0) return 1.0;
+  const impactMap = { low: 1.10, medium: 1.20, high: 1.35 };
+  const maxImpact = Math.max(...events.map((e) => impactMap[e.impact] || 1.0));
+  return maxImpact;
+};
 
 /**
  * Groups transactions by week bucket (most recent = bucket 0) and by item name.
@@ -148,10 +160,11 @@ const generateForecast = async (cafeId, targetDate) => {
   const lat = cafe?.location?.lat || -33.9249; // Cape Town default
   const lng = cafe?.location?.lng || 18.4241;
 
-  // Fetch signals and weather in parallel
-  const [signals, weather] = await Promise.all([
+  // Fetch signals, weather, and events in parallel
+  const [signals, weather, events] = await Promise.all([
     getSignalsForDate(target, { lat, lng }),
     getWeatherForecast(lat, lng, target),
+    Event.find({ cafeId, date: target }).lean(),
   ]);
 
   // Group transactions by week and item
@@ -181,6 +194,7 @@ const generateForecast = async (cafeId, targetDate) => {
   const loadMod = loadSheddingModifier(signals.loadSheddingStage);
   const holidayMod = holidayModifier(signals.isPublicHoliday, signals.isSchoolHoliday);
   const paydayMod = paydayModifier(signals.isPayday);
+  const eventMod = eventsModifier(events);
 
   const forecastItems = [];
   let totalPredictedRevenue = 0;
@@ -191,7 +205,7 @@ const generateForecast = async (cafeId, targetDate) => {
     const category = categoryMap.get(name) || 'other';
     const weatherMod = weatherModifier(category, weather);
 
-    const finalQty = Math.round(baseQty * weatherMod * loadMod * holidayMod * paydayMod);
+    const finalQty = Math.round(baseQty * weatherMod * loadMod * holidayMod * paydayMod * eventMod);
 
     // Estimate revenue using item avgPrice if available
     const itemDoc = itemDocs.find((d) => d.name === name);
@@ -223,6 +237,7 @@ const generateForecast = async (cafeId, targetDate) => {
           isSchoolHoliday: signals.isSchoolHoliday,
           isPayday: signals.isPayday,
           dayOfWeek: targetDayOfWeek,
+          events: events.map((e) => ({ name: e.name, impact: e.impact })),
         },
         totalPredictedRevenue: parseFloat(totalPredictedRevenue.toFixed(2)),
       },

@@ -1,0 +1,14 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: your-guava-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: your-guava
+
+volumes:
+  mongo_data:
