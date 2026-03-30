@@ -15,6 +15,14 @@ const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const generateInsights = async (cafeId) => {
   const cafeKey = cafeId.toString();
 
+  // Guard: no API key
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return {
+      insights: ['AI insights require an Anthropic API key. Add ANTHROPIC_API_KEY to your environment variables.'],
+      generatedAt: new Date(),
+    };
+  }
+
   // Check cache
   const cached = insightsCache.get(cafeKey);
   if (cached && Date.now() - cached.generatedAt.getTime() < CACHE_TTL_MS) {

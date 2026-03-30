@@ -113,20 +113,27 @@ const weightedAverage = (buckets, totalWeeks) => {
   const numWeeks = Math.min(totalWeeks, 8);
   if (numWeeks === 0) return 0;
 
-  const remainingWeight = 1.0 - WEIGHTS[0] - WEIGHTS[1] - WEIGHTS[2]; // 0.20
-  const olderWeeks = Math.max(numWeeks - 3, 0);
-  const olderWeightPerWeek = olderWeeks > 0 ? remainingWeight / olderWeeks : 0;
+  // Redistribute weights based on available data
+  let weights;
+  if (numWeeks === 1) {
+    weights = [1.0];
+  } else if (numWeeks === 2) {
+    weights = [0.6, 0.4];
+  } else {
+    // 3+ weeks: use standard weights with remainder split across older weeks
+    const remainingWeight = 1.0 - WEIGHTS[0] - WEIGHTS[1] - WEIGHTS[2]; // 0.20
+    const olderWeeks = Math.max(numWeeks - 3, 0);
+    const olderWeightPerWeek = olderWeeks > 0 ? remainingWeight / olderWeeks : 0;
+    weights = [];
+    for (let i = 0; i < numWeeks; i++) {
+      weights.push(i < WEIGHTS.length ? WEIGHTS[i] : olderWeightPerWeek);
+    }
+  }
 
   let total = 0;
   for (let i = 0; i < numWeeks; i++) {
     const qty = buckets[i] || 0;
-    let weight;
-    if (i < WEIGHTS.length) {
-      weight = WEIGHTS[i];
-    } else {
-      weight = olderWeightPerWeek;
-    }
-    total += qty * weight;
+    total += qty * (weights[i] || 0);
   }
 
   return total;
