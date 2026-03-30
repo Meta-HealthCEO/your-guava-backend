@@ -2,6 +2,7 @@ require('dotenv').config();
 const mongoose = require('mongoose');
 const User = require('./models/User.model');
 const Cafe = require('./models/Cafe.model');
+const Organization = require('./models/Organization.model');
 const { ingestFile } = require('./services/ingestion.service');
 
 const YOCO_FILE = 'C:\\Users\\shaun\\transactions_temp.xlsx';
@@ -13,18 +14,26 @@ async function seed() {
   // Clean existing data
   await User.deleteMany({});
   await Cafe.deleteMany({});
-  console.log('Cleared existing users and cafes');
+  await Organization.deleteMany({});
+  console.log('Cleared existing users, cafes, and organizations');
 
-  // Create cafe first (needs ownerId after user creation)
+  // Create user + org + cafe
   const user = new User({
     name: 'Shaun Schoeman',
     email: 'shaun@yourguava.com',
     password: 'password123',
+    role: 'owner',
+  });
+  await user.save();
+
+  const org = await Organization.create({
+    name: 'Schoeman Coffee Group',
+    ownerId: user._id,
   });
 
   const cafe = await Cafe.create({
     name: 'Blouberg Coffee',
-    ownerId: user._id,
+    orgId: org._id,
     location: {
       address: 'Bloubergstrand',
       city: 'Cape Town',
@@ -35,7 +44,9 @@ async function seed() {
     timezone: 'Africa/Johannesburg',
   });
 
-  user.cafeId = cafe._id;
+  user.orgId = org._id;
+  user.cafeIds = [cafe._id];
+  user.activeCafeId = cafe._id;
   await user.save();
 
   console.log(`User created: shaun@yourguava.com / password123`);

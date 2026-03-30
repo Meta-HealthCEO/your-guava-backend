@@ -19,7 +19,22 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
-    cafeId: {
+    role: {
+      type: String,
+      enum: ['owner', 'manager'],
+      default: 'owner',
+    },
+    orgId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Organization',
+    },
+    cafeIds: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Cafe',
+      },
+    ],
+    activeCafeId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Cafe',
     },

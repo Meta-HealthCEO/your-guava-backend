@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User.model');
 const Cafe = require('../models/Cafe.model');
+const Organization = require('../models/Organization.model');
 
 const COOKIE_OPTIONS = {
   httpOnly: true,
@@ -8,9 +9,14 @@ const COOKIE_OPTIONS = {
   maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days in ms
 };
 
-const generateTokens = (userId, cafeId) => {
+const generateTokens = (userId, cafeId, role, orgId) => {
   const accessToken = jwt.sign(
-    { id: userId, cafeId: cafeId ? cafeId.toString() : null },
+    {
+      id: userId,
+      cafeId: cafeId ? cafeId.toString() : null,
+      role: role || 'owner',
+      orgId: orgId ? orgId.toString() : null,
+    },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
   );
@@ -26,7 +32,7 @@ const generateTokens = (userId, cafeId) => {
 
 const register = async (req, res, next) => {
   try {
-    const { email, password, name, cafeName } = req.body;
+    const { email, password, name, cafeName, orgName } = req.body;
 
     if (!email || !password || !name) {
       return res
@@ -39,19 +45,27 @@ const register = async (req, res, next) => {
       return res.status(409).json({ success: false, message: 'Email already registered' });
     }
 
-    // Create user (password hashed by pre-save hook)
-    const user = await User.create({ email, password, name });
+    // Create user first (owner by default)
+    const user = await User.create({ email, password, name, role: 'owner' });
 
-    // Create cafe
-    const cafe = await Cafe.create({
-      name: cafeName || 'My Cafe',
+    // Create organization
+    const org = await Organization.create({
+      name: orgName || `${name}'s Organization`,
       ownerId: user._id,
     });
 
-    // Link cafe to user
-    user.cafeId = cafe._id;
+    // Create first cafe
+    const cafe = await Cafe.create({
+      name: cafeName || 'My Cafe',
+      orgId: org._id,
+    });
 
-    const { accessToken, refreshToken } = generateTokens(user._id, cafe._id);
+    // Link user to org and cafe
+    user.orgId = org._id;
+    user.cafeIds = [cafe._id];
+    user.activeCafeId = cafe._id;
+
+    const { accessToken, refreshToken } = generateTokens(user._id, cafe._id, 'owner', org._id);
 
     user.refreshTokens.push({ token: refreshToken });
     await user.save();
@@ -70,7 +84,10 @@ const register = async (req, res, next) => {
         id: user._id,
         email: user.email,
         name: user.name,
-        cafeId: cafe._id,
+        role: user.role,
+        orgId: org._id,
+        cafeIds: user.cafeIds,
+        activeCafeId: cafe._id,
       },
     });
   } catch (error) {
@@ -98,7 +115,7 @@ const login = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
-    const { accessToken, refreshToken } = generateTokens(user._id, user.cafeId);
+    const { accessToken, refreshToken } = generateTokens(user._id, user.activeCafeId, user.role, user.orgId);
 
     user.refreshTokens.push({ token: refreshToken });
     await user.save();
@@ -117,7 +134,10 @@ const login = async (req, res, next) => {
         id: user._id,
         email: user.email,
         name: user.name,
-        cafeId: user.cafeId,
+        role: user.role,
+        orgId: user.orgId,
+        cafeIds: user.cafeIds,
+        activeCafeId: user.activeCafeId,
       },
     });
   } catch (error) {
@@ -143,7 +163,12 @@ const refresh = async (req, res, next) => {
     jwt.verify(token, process.env.JWT_REFRESH_SECRET);
 
     const accessToken = jwt.sign(
-      { id: user._id, cafeId: user.cafeId ? user.cafeId.toString() : null },
+      {
+        id: user._id,
+        cafeId: user.activeCafeId ? user.activeCafeId.toString() : null,
+        role: user.role || 'owner',
+        orgId: user.orgId ? user.orgId.toString() : null,
+      },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
     );
@@ -191,7 +216,10 @@ const me = async (req, res, next) => {
       id: user._id,
       email: user.email,
       name: user.name,
-      cafeId: user.cafeId,
+      role: user.role,
+      orgId: user.orgId,
+      cafeIds: user.cafeIds,
+      activeCafeId: user.activeCafeId,
     });
   } catch (error) {
     next(error);

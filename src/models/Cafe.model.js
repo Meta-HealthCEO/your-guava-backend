@@ -6,9 +6,9 @@ const cafeSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
-    ownerId: {
+    orgId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
+      ref: 'Organization',
       required: true,
     },
     location: {
