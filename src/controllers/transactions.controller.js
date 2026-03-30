@@ -1,3 +1,4 @@
+const fs = require('fs');
 const Transaction = require('../models/Transaction.model');
 const Cafe = require('../models/Cafe.model');
 const { ingestFile } = require('../services/ingestion.service');
@@ -13,16 +14,28 @@ const upload = async (req, res, next) => {
 
     const result = await ingestFile(filePath, cafeId);
 
+    // Clean up uploaded file
+    try { fs.unlinkSync(filePath); } catch (_) {}
+
     // Update cafe metadata
     await Cafe.findByIdAndUpdate(cafeId, {
       $set: { dataUploaded: true, lastSyncAt: new Date() },
     });
+
+    // Get date range for response
+    const dateRange = await Transaction.aggregate([
+      { $match: { cafeId: require('mongoose').Types.ObjectId.createFromHexString(cafeId) } },
+      { $group: { _id: null, firstDate: { $min: '$date' }, lastDate: { $max: '$date' } } },
+    ]);
 
     return res.status(200).json({
       success: true,
       imported: result.imported,
       skipped: result.skipped,
       errors: result.errors,
+      total: result.imported + result.skipped + result.errors,
+      firstDate: dateRange[0]?.firstDate || null,
+      lastDate: dateRange[0]?.lastDate || null,
     });
   } catch (error) {
     next(error);
