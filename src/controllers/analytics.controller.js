@@ -531,7 +531,7 @@ const getCustomers = async (req, res, next) => {
  * GET /api/analytics/waste
  * Waste analytics — placeholder
  */
-const getWaste = async (req, res, next) => {
+const getWaste = async (_req, res, next) => {
   try {
     return res.status(200).json({
       success: true,
