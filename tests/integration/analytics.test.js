@@ -1,3 +1,17 @@
+const mockR2Files = new Map();
+jest.mock('../../src/services/r2.service', () => ({
+  uploadFile: async (buffer, key) => { mockR2Files.set(key, buffer); },
+  downloadFile: async (key) => mockR2Files.get(key),
+  getSignedDownloadUrl: async (key) => `https://test.r2.local/${key}`,
+  deleteFile: async (key) => { mockR2Files.delete(key); },
+  _resetClient: () => {},
+}));
+jest.mock('../../src/services/anthropic.service', () => ({
+  generateInsights: async () => ({ insights: [], generatedAt: new Date() }),
+  proposeColumnMapping: async () => ({ mapping: {}, itemsMode: 'packed' }),
+  _resetMappingCache: () => {},
+}));
+
 const path = require('path');
 const supertest = require('supertest');
 const { setup, teardown, clearDB, createTestUser, app } = require('../setup');
@@ -18,10 +32,14 @@ describe('Analytics API', () => {
 
   const uploadTestData = async () => {
     const csvPath = path.join(__dirname, '..', 'fixtures', 'test-transactions.csv');
-    await request
+    const stage = await request
       .post('/api/transactions/upload')
       .set('Authorization', `Bearer ${token}`)
       .attach('file', csvPath);
+    await request
+      .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
   };
 
   describe('GET /api/analytics/revenue', () => {
