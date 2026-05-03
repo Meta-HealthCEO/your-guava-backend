@@ -1,180 +1,164 @@
 const fs = require('fs');
 const path = require('path');
-const csv = require('csv-parser');
-const XLSX = require('xlsx');
 const Transaction = require('../models/Transaction.model');
 const Item = require('../models/Item.model');
+const { parseBuffer } = require('./parser.service');
+const { computeDedupKey } = require('../utils/dedupKey');
+
+const YOCO_HEADERS = [
+  'Receipt', 'Date', 'Time', 'Status', 'Payment Method', 'Order Number',
+  'Card Reader', 'Items', 'Note', 'Currency', 'Tip', 'Discount', 'VAT',
+  'Total (incl. tax)', 'Fee Amount', 'Net Amount',
+];
 
 /**
- * Parses a Yoco CSV export and upserts transactions into the database.
- *
- * Yoco CSV columns:
- * Receipt, Date, Time, Status, Payment Method, Order Number, Card Reader,
- * Items, Note, Currency, Tip, Discount, VAT, Total (incl. tax), Fee Amount, Net Amount
- *
- * @param {string} filePath - Absolute path to the uploaded CSV file
- * @param {string} cafeId   - Mongoose ObjectId of the cafe
- * @returns {Promise<{ imported: number, skipped: number, errors: number }>}
+ * Returns true if the headers strongly match a Yoco export.
+ * Looks for at least 6 of the canonical Yoco headers.
  */
-const parseYocoCSV = (filePath, cafeId) => {
-  return new Promise((resolve, reject) => {
-    const results = [];
+const isYocoFormat = (headers) => {
+  const matches = YOCO_HEADERS.filter((h) => headers.includes(h)).length;
+  return matches >= 6;
+};
 
-    fs.createReadStream(filePath)
-      .pipe(csv())
-      .on('data', (row) => results.push(row))
-      .on('error', reject)
-      .on('end', async () => {
-        try {
-          const stats = await processRows(results, cafeId);
-          resolve(stats);
-        } catch (err) {
-          reject(err);
-        }
-      });
+const yocoMapping = () => ({
+  mapping: {
+    receiptId: 'Receipt',
+    date: 'Date',
+    time: 'Time',
+    items: 'Items',
+    total: 'Total (incl. tax)',
+    tip: 'Tip',
+    discount: 'Discount',
+    paymentMethod: 'Payment Method',
+    status: 'Status',
+  },
+  itemsMode: 'packed',
+});
+
+/**
+ * Reads the first row of a CSV buffer to extract headers.
+ * @param {Buffer} buffer
+ * @returns {Promise<string[]>}
+ */
+const extractHeaders = async (buffer) => {
+  const csv = require('csv-parser');
+  const { Readable } = require('stream');
+  return new Promise((resolve, reject) => {
+    let captured = false;
+    const stream = Readable.from(buffer).pipe(csv());
+    stream.on('headers', (h) => {
+      captured = true;
+      resolve(h);
+      stream.destroy();
+    });
+    stream.on('error', reject);
+    stream.on('end', () => {
+      if (!captured) resolve([]);
+    });
   });
 };
 
 /**
- * Parses a Yoco XLSX export and upserts transactions into the database.
- *
- * @param {string} filePath
- * @param {string} cafeId
- * @returns {Promise<{ imported: number, skipped: number, errors: number }>}
+ * Returns headers + first 5 rows for AI/preset analysis.
  */
-const parseYocoXLSX = async (filePath, cafeId) => {
-  const workbook = XLSX.readFile(filePath);
-  const sheetName = workbook.SheetNames[0];
-  const sheet = workbook.Sheets[sheetName];
-  const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
-  return processRows(rows, cafeId);
+const previewBuffer = async (buffer) => {
+  const csv = require('csv-parser');
+  const { Readable } = require('stream');
+  return new Promise((resolve, reject) => {
+    const rows = [];
+    let headers = [];
+    Readable.from(buffer)
+      .pipe(csv())
+      .on('headers', (h) => { headers = h; })
+      .on('data', (row) => {
+        if (rows.length < 5) rows.push(row);
+      })
+      .on('error', reject)
+      .on('end', () => resolve({ headers, sampleRows: rows }));
+  });
 };
 
 /**
- * Shared row processing logic for both CSV and XLSX.
+ * Phase 2: parses a buffer using the given mapping and writes transactions.
+ *
+ * @param {Buffer} buffer
+ * @param {object} opts
+ * @param {string} opts.cafeId
+ * @param {string} opts.uploadId
+ * @param {object} opts.columnMapping
+ * @param {'packed'|'line-per-row'} opts.itemsMode
+ * @param {string} [opts.fileExt='csv']
+ * @returns {Promise<{imported: number, skipped: number, errors: number, totalRows: number, dateRange: object}>}
  */
-const processRows = async (rows, cafeId) => {
+const ingestParsedRows = async (buffer, { cafeId, uploadId, columnMapping, itemsMode, fileExt = 'csv' }) => {
+  const parsed = await parseBuffer(buffer, { columnMapping, itemsMode, fileExt });
+
   let imported = 0;
   let skipped = 0;
-  let errors = 0;
+  let errors = parsed.errors;
 
-  const itemNamesSeen = new Map(); // itemName -> { totalQty, totalRevenue }
+  const itemNamesSeen = new Map();
 
-  for (const row of rows) {
+  for (const row of parsed.rows) {
     try {
-      // Normalise column names (trim whitespace)
-      const status = (row['Status'] || row['status'] || '').trim();
-
-      // Only process approved transactions
-      if (status.toLowerCase() !== 'approved') {
+      const status = (row.status || 'approved').toLowerCase();
+      if (status !== 'approved') {
         skipped++;
         continue;
       }
 
-      const receiptId = (row['Receipt'] || row['receipt'] || '').trim();
-      if (!receiptId) {
+      const dedupKey = row.receiptId ? undefined : computeDedupKey({
+        date: row.date.toISOString().slice(0, 10),
+        time: row.date.toISOString().slice(11, 16),
+        total: row.total,
+        items: row.items,
+      });
+
+      const filter = row.receiptId
+        ? { cafeId, receiptId: row.receiptId }
+        : { cafeId, dedupKey };
+
+      const existing = await Transaction.findOne(filter).lean();
+      if (existing) {
         skipped++;
         continue;
       }
 
-      // Parse date: YYYY/MM/DD
-      const dateStr = (row['Date'] || row['date'] || '').trim();
-      const timeStr = (row['Time'] || row['time'] || '').trim();
+      await Transaction.create({
+        cafeId,
+        uploadId,
+        receiptId: row.receiptId,
+        dedupKey,
+        date: row.date,
+        hour: row.hour,
+        dayOfWeek: row.dayOfWeek,
+        status: 'approved',
+        paymentMethod: row.paymentMethod,
+        items: row.items,
+        total: row.total,
+        tip: row.tip,
+        discount: row.discount,
+        source: 'csv',
+      });
+      imported++;
 
-      if (!dateStr) {
-        skipped++;
-        continue;
-      }
-
-      // Support both YYYY/MM/DD and YYYY-MM-DD
-      const normalizedDate = dateStr.replace(/\//g, '-');
-      const dateTimeStr = timeStr ? `${normalizedDate}T${timeStr}` : normalizedDate;
-      const parsedDate = new Date(dateTimeStr);
-
-      if (isNaN(parsedDate.getTime())) {
-        errors++;
-        continue;
-      }
-
-      const hour = parsedDate.getHours();
-      const dayOfWeek = parsedDate.getDay();
-
-      // Parse items: "1 x Flat White (Blend),3 x Brownie"
-      const itemsStr = (row['Items'] || row['items'] || '').trim();
-      const parsedItems = parseItems(itemsStr);
-
-      const totalRaw = row['Total (incl. tax)'] || row['Total'] || row['total'] || 0;
-      const total = parseFloat(String(totalRaw).replace(/[^0-9.-]/g, '')) || 0;
-      const tip = parseFloat(String(row['Tip'] || row['tip'] || '0').replace(/[^0-9.-]/g, '')) || 0;
-      const discount = parseFloat(String(row['Discount'] || row['discount'] || '0').replace(/[^0-9.-]/g, '')) || 0;
-
-      // Rough unit price estimate: total / total items quantity
-      const totalQty = parsedItems.reduce((sum, i) => sum + i.quantity, 0);
-      const unitPrice = totalQty > 0 ? total / totalQty : 0;
-      const itemsWithPrice = parsedItems.map((item) => ({
-        ...item,
-        unitPrice: parseFloat(unitPrice.toFixed(2)),
-      }));
-
-      const paymentMethod = (
-        row['Payment Method'] ||
-        row['payment_method'] ||
-        row['payment method'] ||
-        ''
-      ).trim();
-
-      // Upsert by cafeId + receiptId
-      await Transaction.findOneAndUpdate(
-        { cafeId, receiptId },
-        {
-          $setOnInsert: {
-            cafeId,
-            receiptId,
-            date: parsedDate,
-            hour,
-            dayOfWeek,
-            status: 'approved',
-            paymentMethod,
-            items: itemsWithPrice,
-            total,
-            tip,
-            discount,
-            source: 'csv',
-          },
-        },
-        { upsert: true, new: false }
-      )
-        .then((existing) => {
-          if (existing === null) {
-            imported++;
-          } else {
-            skipped++;
-          }
-        })
-        .catch((err) => {
-          if (err.code === 11000) {
-            // Duplicate key — already exists
-            skipped++;
-          } else {
-            throw err;
-          }
-        });
-
-      // Track item names for Item upserts
-      for (const item of parsedItems) {
-        const key = item.name;
-        const current = itemNamesSeen.get(key) || { totalQty: 0, totalRevenue: 0 };
-        current.totalQty += item.quantity;
-        current.totalRevenue += unitPrice * item.quantity;
-        itemNamesSeen.set(key, current);
+      for (const item of row.items) {
+        const cur = itemNamesSeen.get(item.name) || { totalQty: 0, totalRevenue: 0 };
+        cur.totalQty += item.quantity;
+        cur.totalRevenue += (item.unitPrice || 0) * item.quantity;
+        itemNamesSeen.set(item.name, cur);
       }
     } catch (err) {
-      console.error('[ingestion] Row error:', err.message);
-      errors++;
+      if (err.code === 11000) {
+        skipped++;
+      } else {
+        console.error('[ingestion] row error:', err.message);
+        errors++;
+      }
     }
   }
 
-  // Upsert Item records
+  // Item upserts
   for (const [name, stats] of itemNamesSeen.entries()) {
     try {
       await Item.findOneAndUpdate(
@@ -182,65 +166,49 @@ const processRows = async (rows, cafeId) => {
         {
           $inc: { totalSold: stats.totalQty },
           $set: {
-            avgPrice:
-              stats.totalQty > 0
-                ? parseFloat((stats.totalRevenue / stats.totalQty).toFixed(2))
-                : 0,
+            avgPrice: stats.totalQty > 0
+              ? parseFloat((stats.totalRevenue / stats.totalQty).toFixed(2))
+              : 0,
           },
           $setOnInsert: { cafeId, name },
         },
         { upsert: true, new: true }
       );
     } catch (err) {
-      console.error(`[ingestion] Item upsert error for "${name}":`, err.message);
+      console.error(`[ingestion] item upsert error "${name}":`, err.message);
     }
   }
 
-  return { imported, skipped, errors };
+  return {
+    imported,
+    skipped,
+    errors,
+    totalRows: parsed.totalRows,
+    dateRange: parsed.dateRange,
+  };
 };
 
 /**
- * Parses Yoco item string into an array of { name, quantity } objects.
- * e.g. "1 x Flat White (Blend),3 x Brownie" -> [{name:"Flat White (Blend)", quantity:1}, ...]
- *
- * @param {string} itemsStr
- * @returns {{ name: string, quantity: number }[]}
- */
-const parseItems = (itemsStr) => {
-  if (!itemsStr) return [];
-  const items = [];
-  const regex = /(\d+)\s+x\s+(.+?)(?:,(?=\d+\s+x\s+)|$)/g;
-  let match;
-  while ((match = regex.exec(itemsStr)) !== null) {
-    const quantity = parseInt(match[1], 10);
-    const name = match[2].trim();
-    if (name) {
-      items.push({ name, quantity });
-    }
-  }
-  return items;
-};
-
-/**
- * Auto-detects file type by extension and routes to the correct parser.
- *
- * @param {string} filePath
- * @param {string} cafeId
- * @returns {Promise<{ imported: number, skipped: number, errors: number }>}
+ * Legacy file-path API. Reads a local file and ingests using the Yoco preset.
+ * Preserved so the existing transactions.controller.upload tests still pass while
+ * the new two-phase flow is being built up.
  */
 const ingestFile = async (filePath, cafeId) => {
-  const ext = path.extname(filePath).toLowerCase();
-  if (ext === '.csv') {
-    return parseYocoCSV(filePath, cafeId);
-  } else if (ext === '.xlsx' || ext === '.xls') {
-    return parseYocoXLSX(filePath, cafeId);
-  } else {
-    throw new Error(`Unsupported file type: ${ext}`);
-  }
+  const buffer = fs.readFileSync(filePath);
+  const ext = path.extname(filePath).toLowerCase().slice(1);
+  const { mapping, itemsMode } = yocoMapping();
+  return ingestParsedRows(buffer, { cafeId, uploadId: null, columnMapping: mapping, itemsMode, fileExt: ext });
 };
 
+// Backward-compat alias — unit tests written before the refactor still call this
+const parseYocoCSV = ingestFile;
+
 module.exports = {
-  parseYocoCSV,
-  parseYocoXLSX,
   ingestFile,
+  ingestParsedRows,
+  isYocoFormat,
+  yocoMapping,
+  extractHeaders,
+  previewBuffer,
+  parseYocoCSV,
 };
