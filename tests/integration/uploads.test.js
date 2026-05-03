@@ -208,4 +208,29 @@ describe('Uploads API', () => {
       expect(res.status).toBe(409);
     });
   });
+
+  describe('DELETE /api/uploads/:id', () => {
+    it('owner soft-deletes upload, removing transactions and R2 object', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      const res = await request
+        .delete(`/api/uploads/${stage.body.uploadId}`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      const txns = await Transaction.find({ uploadId: stage.body.uploadId }).lean();
+      expect(txns).toHaveLength(0);
+
+      const Upload = require('../../src/models/Upload.model');
+      const u = await Upload.findById(stage.body.uploadId).lean();
+      expect(u.status).toBe('deleted');
+    });
+  });
 });

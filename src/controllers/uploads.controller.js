@@ -215,4 +215,25 @@ const remap = async (req, res, next) => {
   }
 };
 
-module.exports = { confirm, list, detail, rows, remap };
+const remove = async (req, res, next) => {
+  try {
+    const cafeId = req.user.cafeId;
+    const upload = await Upload.findOne({ _id: req.params.id, cafeId });
+    if (!upload || upload.status === 'deleted') {
+      return res.status(404).json({ success: false, message: 'Upload not found' });
+    }
+
+    await Transaction.deleteMany({ cafeId, uploadId: upload._id });
+    try { await r2.deleteFile(upload.r2Key); } catch (err) {
+      console.error('[uploads] r2 delete failed:', err.message);
+    }
+    upload.status = 'deleted';
+    await upload.save();
+
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { confirm, list, detail, rows, remap, remove };
