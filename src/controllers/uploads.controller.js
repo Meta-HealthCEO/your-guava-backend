@@ -149,4 +149,70 @@ const rows = async (req, res, next) => {
   }
 };
 
-module.exports = { confirm, list, detail, rows };
+const remap = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { columnMapping, itemsMode } = req.body;
+    const cafeId = req.user.cafeId;
+
+    const missing = REQUIRED.filter((f) => !columnMapping?.[f]);
+    if (missing.length > 0) {
+      return res.status(400).json({ success: false, message: `Missing required mapping: ${missing.join(', ')}` });
+    }
+
+    const upload = await Upload.findOne({ _id: id, cafeId });
+    if (!upload || upload.status === 'deleted') {
+      return res.status(404).json({ success: false, message: 'Upload not found' });
+    }
+    if (upload.status === 'parsing' || upload.status === 'pending_mapping') {
+      return res.status(409).json({ success: false, message: `Cannot remap while ${upload.status}` });
+    }
+
+    upload.status = 'parsing';
+    upload.columnMapping = columnMapping;
+    upload.itemsMode = itemsMode || 'packed';
+    await upload.save();
+
+    try {
+      await Transaction.deleteMany({ cafeId, uploadId: upload._id });
+
+      const buffer = await r2.downloadFile(upload.r2Key);
+      const ext = upload.fileName.split('.').pop().toLowerCase();
+      const result = await ingestion.ingestParsedRows(buffer, {
+        cafeId,
+        uploadId: upload._id,
+        columnMapping,
+        itemsMode: upload.itemsMode,
+        fileExt: ext,
+      });
+
+      upload.status = 'completed';
+      upload.stats = {
+        imported: result.imported,
+        skipped: result.skipped,
+        errors: result.errors,
+        totalRows: result.totalRows,
+      };
+      upload.dateRange = result.dateRange;
+      upload.completedAt = new Date();
+      upload.errorMessage = undefined;
+      await upload.save();
+
+      return res.status(200).json({
+        success: true,
+        uploadId: upload._id,
+        stats: upload.stats,
+        dateRange: upload.dateRange,
+      });
+    } catch (err) {
+      upload.status = 'failed';
+      upload.errorMessage = err.message;
+      await upload.save();
+      throw err;
+    }
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { confirm, list, detail, rows, remap };

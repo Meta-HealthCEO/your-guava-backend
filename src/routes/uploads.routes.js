@@ -8,5 +8,6 @@ router.get('/', authMiddleware, uploads.list);
 router.get('/:id/rows', authMiddleware, uploads.rows);
 router.get('/:id', authMiddleware, uploads.detail);
 router.post('/:id/confirm', authMiddleware, uploads.confirm);
+router.patch('/:id/mapping', authMiddleware, uploads.remap);
 
 module.exports = router;

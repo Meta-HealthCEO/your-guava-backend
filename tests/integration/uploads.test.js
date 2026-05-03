@@ -168,4 +168,44 @@ describe('Uploads API', () => {
       expect(res.body.transactions[0].uploadId).toBe(stage.body.uploadId);
     });
   });
+
+  describe('PATCH /api/uploads/:id/mapping', () => {
+    it('re-parses with new mapping, replacing transactions', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      const before = await Transaction.find({ uploadId: stage.body.uploadId }).lean();
+      expect(before).toHaveLength(4);
+
+      const res = await request
+        .patch(`/api/uploads/${stage.body.uploadId}/mapping`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      expect(res.status).toBe(200);
+      expect(res.body.stats.imported).toBe(4);
+      const after = await Transaction.find({ uploadId: stage.body.uploadId }).lean();
+      expect(after).toHaveLength(4);
+    });
+
+    it('returns 409 when status is parsing', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      const Upload = require('../../src/models/Upload.model');
+      await Upload.updateOne({ _id: stage.body.uploadId }, { $set: { status: 'parsing' } });
+      const res = await request
+        .patch(`/api/uploads/${stage.body.uploadId}/mapping`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+      expect(res.status).toBe(409);
+    });
+  });
 });
