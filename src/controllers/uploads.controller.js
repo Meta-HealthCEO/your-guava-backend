@@ -77,4 +77,31 @@ const confirm = async (req, res, next) => {
   }
 };
 
-module.exports = { confirm };
+const list = async (req, res, next) => {
+  try {
+    const cafeId = req.user.cafeId;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const skip = (page - 1) * limit;
+
+    const [uploads, total] = await Promise.all([
+      Upload.find({ cafeId, status: { $ne: 'deleted' } })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate('uploadedBy', 'name email')
+        .lean(),
+      Upload.countDocuments({ cafeId, status: { $ne: 'deleted' } }),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      uploads,
+      pagination: { total, page, limit, pages: Math.ceil(total / limit) },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { confirm, list };

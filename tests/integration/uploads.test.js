@@ -84,4 +84,33 @@ describe('Uploads API', () => {
       expect(res.status).toBe(400);
     });
   });
+
+  describe('GET /api/uploads', () => {
+    it('returns uploads for the current cafe in reverse chronological order', async () => {
+      await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+
+      const res = await request.get('/api/uploads').set('Authorization', `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.body.uploads).toHaveLength(2);
+      expect(new Date(res.body.uploads[0].createdAt).getTime())
+        .toBeGreaterThanOrEqual(new Date(res.body.uploads[1].createdAt).getTime());
+    });
+
+    it('does not leak uploads across cafes', async () => {
+      const other = await createTestUser({ email: 'b@yourguava.com', cafeName: 'Cafe B', orgName: 'Org B' });
+      await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${other.token}`)
+        .attach('file', yocoFixture);
+      const res = await request.get('/api/uploads').set('Authorization', `Bearer ${token}`);
+      expect(res.body.uploads).toHaveLength(0);
+    });
+  });
 });
