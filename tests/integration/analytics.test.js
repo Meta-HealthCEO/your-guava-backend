@@ -60,6 +60,8 @@ describe('Analytics API', () => {
       expect(Array.isArray(res.body.data)).toBe(true);
       expect(res.body.summary).toBeDefined();
       expect(res.body.summary.totalRevenue).toBeGreaterThan(0);
+      expect(res.body.meta).toBeDefined();
+      expect(res.body.meta.period).toBe('daily');
     });
 
     it('returns empty data with no transactions', async () => {
@@ -85,6 +87,9 @@ describe('Analytics API', () => {
       expect(res.body.success).toBe(true);
       expect(res.body.items).toBeDefined();
       expect(Array.isArray(res.body.items)).toBe(true);
+      expect(res.body.meta).toBeDefined();
+      expect(Array.isArray(res.body.meta.risingItems)).toBe(true);
+      expect(Array.isArray(res.body.meta.decliningItems)).toBe(true);
     });
 
     it('returns empty arrays when no data', async () => {
@@ -94,6 +99,20 @@ describe('Analytics API', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.items).toEqual([]);
+    });
+
+    it('accepts date range params', async () => {
+      await uploadTestData();
+
+      const res = await request
+        .get('/api/analytics/items')
+        .set('Authorization', `Bearer ${token}`)
+        .query({ startDate: '2026-01-01', endDate: '2026-01-31' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.meta.startDate).toBe('2026-01-01');
+      expect(res.body.meta.endDate).toBe('2026-01-31');
     });
   });
 
@@ -109,8 +128,18 @@ describe('Analytics API', () => {
       expect(res.body.success).toBe(true);
       expect(res.body.heatmap).toBeDefined();
       expect(Array.isArray(res.body.heatmap)).toBe(true);
-      // 7 days * 18 hours (5-22) = 126 entries
-      expect(res.body.heatmap.length).toBe(126);
+      // 7 days * 17 hours (6-22) = 119 entries
+      expect(res.body.heatmap.length).toBe(119);
+    });
+
+    it('accepts date range params', async () => {
+      const res = await request
+        .get('/api/analytics/heatmap')
+        .set('Authorization', `Bearer ${token}`)
+        .query({ startDate: '2026-01-01', endDate: '2026-01-31' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.meta.startDate).toBe('2026-01-01');
     });
   });
 
@@ -135,6 +164,31 @@ describe('Analytics API', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.insights.avgTransactionValue).toBe(0);
+    });
+  });
+
+  describe('GET /api/analytics/combos', () => {
+    it('returns top item pairs', async () => {
+      await uploadTestData();
+
+      const res = await request
+        .get('/api/analytics/combos')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(Array.isArray(res.body.data)).toBe(true);
+      expect(res.body.meta).toBeDefined();
+    });
+
+    it('returns empty array when no data', async () => {
+      const res = await request
+        .get('/api/analytics/combos')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(Array.isArray(res.body.data)).toBe(true);
     });
   });
 });

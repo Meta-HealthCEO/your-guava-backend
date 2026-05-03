@@ -1,6 +1,5 @@
 const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction.model');
-const Forecast = require('../models/Forecast.model');
 
 /**
  * GET /api/analytics/revenue
@@ -112,15 +111,23 @@ const getRevenue = async (req, res, next) => {
       trend = parseFloat((((totalRevenue - prevRevenue) / prevRevenue) * 100).toFixed(1));
     }
 
+    const summary = {
+      totalRevenue: parseFloat(totalRevenue.toFixed(2)),
+      avgDailyRevenue: parseFloat(avgDailyRevenue.toFixed(2)),
+      bestDay,
+      worstDay,
+      trend,
+    };
+
     return res.status(200).json({
       success: true,
       data,
-      summary: {
-        totalRevenue: parseFloat(totalRevenue.toFixed(2)),
-        avgDailyRevenue: parseFloat(avgDailyRevenue.toFixed(2)),
-        bestDay,
-        worstDay,
-        trend,
+      summary,
+      meta: {
+        startDate: req.query.startDate || null,
+        endDate: req.query.endDate || null,
+        summary,
+        period,
       },
     });
   } catch (error) {
@@ -137,9 +144,21 @@ const getItems = async (req, res, next) => {
     const cafeId = req.user.cafeId;
     const cafeObjectId = mongoose.Types.ObjectId.createFromHexString(cafeId);
 
+    const { startDate, endDate } = req.query;
+    const dateMatch = {};
+    if (startDate || endDate) {
+      if (startDate) dateMatch.$gte = new Date(startDate);
+      if (endDate) dateMatch.$lte = new Date(endDate);
+    }
+    const matchStage = {
+      cafeId: cafeObjectId,
+      status: 'approved',
+      ...(Object.keys(dateMatch).length > 0 && { date: dateMatch }),
+    };
+
     // Get the date range for the dataset
     const rangeResult = await Transaction.aggregate([
-      { $match: { cafeId: cafeObjectId, status: 'approved' } },
+      { $match: matchStage },
       {
         $group: {
           _id: null,
@@ -153,8 +172,15 @@ const getItems = async (req, res, next) => {
       return res.status(200).json({
         success: true,
         items: [],
+        data: [],
         risingItems: [],
         decliningItems: [],
+        meta: {
+          startDate: startDate || null,
+          endDate: endDate || null,
+          risingItems: [],
+          decliningItems: [],
+        },
       });
     }
 
@@ -166,7 +192,7 @@ const getItems = async (req, res, next) => {
 
     // Top 20 items overall
     const itemsPipeline = [
-      { $match: { cafeId: cafeObjectId, status: 'approved' } },
+      { $match: matchStage },
       { $unwind: '$items' },
       {
         $group: {
@@ -257,19 +283,24 @@ const getItems = async (req, res, next) => {
 
     const risingItems = [...allItemTrends]
       .sort((a, b) => b.trend - a.trend)
-      .slice(0, 3)
+      .slice(0, 5)
       .map(({ name, trend }) => ({ name, trend }));
 
     const decliningItems = [...allItemTrends]
       .sort((a, b) => a.trend - b.trend)
-      .slice(0, 3)
+      .slice(0, 5)
       .map(({ name, trend }) => ({ name, trend }));
 
     return res.status(200).json({
       success: true,
       items: itemsWithTrend,
-      risingItems,
-      decliningItems,
+      data: itemsWithTrend,
+      meta: {
+        startDate: startDate || null,
+        endDate: endDate || null,
+        risingItems,
+        decliningItems,
+      },
     });
   } catch (error) {
     next(error);
@@ -278,22 +309,29 @@ const getItems = async (req, res, next) => {
 
 /**
  * GET /api/analytics/heatmap
- * Peak hour heatmap — 7 days × 18 hours (5-22)
+ * Peak hour heatmap — 7 days × 17 hours (6-22)
  */
 const getHeatmap = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
     const cafeObjectId = mongoose.Types.ObjectId.createFromHexString(cafeId);
 
+    const { startDate, endDate } = req.query;
+    const dateMatch = {};
+    if (startDate || endDate) {
+      if (startDate) dateMatch.$gte = new Date(startDate);
+      if (endDate) dateMatch.$lte = new Date(endDate);
+    }
+    const matchStage = {
+      cafeId: cafeObjectId,
+      status: 'approved',
+      hour: { $gte: 6, $lte: 22 },
+      dayOfWeek: { $gte: 0, $lte: 6 },
+      ...(Object.keys(dateMatch).length > 0 && { date: dateMatch }),
+    };
+
     const pipeline = [
-      {
-        $match: {
-          cafeId: cafeObjectId,
-          status: 'approved',
-          hour: { $gte: 5, $lte: 22 },
-          dayOfWeek: { $gte: 0, $lte: 6 },
-        },
-      },
+      { $match: matchStage },
       {
         $group: {
           _id: {
@@ -318,7 +356,7 @@ const getHeatmap = async (req, res, next) => {
 
     const rawData = await Transaction.aggregate(pipeline);
 
-    // Fill in the complete 7x18 grid with zeros for missing slots
+    // Fill in the complete 7x17 grid with zeros for missing slots
     const dataMap = {};
     for (const entry of rawData) {
       dataMap[`${entry.dayOfWeek}-${entry.hour}`] = entry;
@@ -326,7 +364,7 @@ const getHeatmap = async (req, res, next) => {
 
     const heatmap = [];
     for (let day = 0; day <= 6; day++) {
-      for (let hour = 5; hour <= 22; hour++) {
+      for (let hour = 6; hour <= 22; hour++) {
         const key = `${day}-${hour}`;
         if (dataMap[key]) {
           heatmap.push(dataMap[key]);
@@ -339,124 +377,8 @@ const getHeatmap = async (req, res, next) => {
     return res.status(200).json({
       success: true,
       heatmap,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * GET /api/analytics/accuracy
- * Predicted vs actual for the last 30 days
- */
-const getAccuracy = async (req, res, next) => {
-  try {
-    const cafeId = req.user.cafeId;
-    const cafeObjectId = mongoose.Types.ObjectId.createFromHexString(cafeId);
-
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    thirtyDaysAgo.setHours(0, 0, 0, 0);
-
-    const now = new Date();
-    now.setHours(23, 59, 59, 999);
-
-    // Get forecasts for the last 30 days
-    const forecasts = await Forecast.find({
-      cafeId,
-      date: { $gte: thirtyDaysAgo, $lte: now },
-    })
-      .sort({ date: 1 })
-      .lean();
-
-    if (forecasts.length === 0) {
-      return res.status(200).json({
-        success: true,
-        data: [],
-        overallAccuracy: null,
-      });
-    }
-
-    // Get actual item quantities from transactions, grouped by date + item name
-    const actualsPipeline = [
-      {
-        $match: {
-          cafeId: cafeObjectId,
-          status: 'approved',
-          date: { $gte: thirtyDaysAgo, $lte: now },
-        },
-      },
-      { $unwind: '$items' },
-      {
-        $group: {
-          _id: {
-            date: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
-            name: '$items.name',
-          },
-          actual: { $sum: '$items.quantity' },
-        },
-      },
-    ];
-
-    const actualsRaw = await Transaction.aggregate(actualsPipeline);
-
-    // Build lookup: { "2025-01-15": { "Flat White": 42, ... } }
-    const actualsMap = {};
-    for (const entry of actualsRaw) {
-      const dateKey = entry._id.date;
-      if (!actualsMap[dateKey]) actualsMap[dateKey] = {};
-      actualsMap[dateKey][entry._id.name] = entry.actual;
-    }
-
-    // Join forecasts with actuals
-    let totalPredicted = 0;
-    let totalActual = 0;
-    let totalAbsError = 0;
-
-    const data = forecasts.map((forecast) => {
-      const dateKey = new Date(forecast.date).toISOString().split('T')[0];
-      const dayActuals = actualsMap[dateKey] || {};
-
-      const items = (forecast.items || []).map((fi) => {
-        const predicted = fi.predictedQty || 0;
-        const actual = dayActuals[fi.itemName] || fi.actualQty || 0;
-
-        totalPredicted += predicted;
-        totalActual += actual;
-        totalAbsError += Math.abs(predicted - actual);
-
-        return {
-          name: fi.itemName,
-          predicted,
-          actual,
-        };
-      });
-
-      // Per-day accuracy: 1 - (totalAbsError / totalPredicted) for this day
-      const dayPredicted = items.reduce((s, i) => s + i.predicted, 0);
-      const dayAbsError = items.reduce((s, i) => s + Math.abs(i.predicted - i.actual), 0);
-      const dayAccuracy =
-        dayPredicted > 0
-          ? parseFloat(((1 - dayAbsError / dayPredicted) * 100).toFixed(1))
-          : null;
-
-      return {
-        date: dateKey,
-        items,
-        overallAccuracy: dayAccuracy,
-      };
-    });
-
-    // Overall accuracy across all days
-    const overallAccuracy =
-      totalPredicted > 0
-        ? parseFloat(((1 - totalAbsError / totalPredicted) * 100).toFixed(1))
-        : null;
-
-    return res.status(200).json({
-      success: true,
-      data,
-      overallAccuracy,
+      data: heatmap,
+      meta: { startDate: startDate || null, endDate: endDate || null },
     });
   } catch (error) {
     next(error);
@@ -472,13 +394,20 @@ const getCustomers = async (req, res, next) => {
     const cafeId = req.user.cafeId;
     const cafeObjectId = mongoose.Types.ObjectId.createFromHexString(cafeId);
 
+    const { startDate, endDate } = req.query;
+    const dateMatch = {};
+    if (startDate || endDate) {
+      if (startDate) dateMatch.$gte = new Date(startDate);
+      if (endDate) dateMatch.$lte = new Date(endDate);
+    }
+    const matchStage = {
+      cafeId: cafeObjectId,
+      status: 'approved',
+      ...(Object.keys(dateMatch).length > 0 && { date: dateMatch }),
+    };
+
     const pipeline = [
-      {
-        $match: {
-          cafeId: cafeObjectId,
-          status: 'approved',
-        },
-      },
+      { $match: matchStage },
       {
         $group: {
           _id: null,
@@ -534,15 +463,18 @@ const getCustomers = async (req, res, next) => {
     const result = await Transaction.aggregate(pipeline);
 
     if (result.length === 0) {
+      const emptyInsights = {
+        avgTransactionValue: 0,
+        avgItemsPerTransaction: 0,
+        cashVsCardRatio: null,
+        tippingRate: 0,
+        avgTip: 0,
+      };
       return res.status(200).json({
         success: true,
-        insights: {
-          avgTransactionValue: 0,
-          avgItemsPerTransaction: 0,
-          cashVsCardRatio: null,
-          tippingRate: 0,
-          avgTip: 0,
-        },
+        insights: emptyInsights,
+        data: emptyInsights,
+        meta: { startDate: startDate || null, endDate: endDate || null },
       });
     }
 
@@ -576,15 +508,19 @@ const getCustomers = async (req, res, next) => {
         ? parseFloat((stats.totalTip / stats.tippedTransactions).toFixed(2))
         : 0;
 
+    const insights = {
+      avgTransactionValue,
+      avgItemsPerTransaction,
+      cashVsCardRatio,
+      tippingRate,
+      avgTip,
+    };
+
     return res.status(200).json({
       success: true,
-      insights: {
-        avgTransactionValue,
-        avgItemsPerTransaction,
-        cashVsCardRatio,
-        tippingRate,
-        avgTip,
-      },
+      insights,
+      data: insights,
+      meta: { startDate: startDate || null, endDate: endDate || null },
     });
   } catch (error) {
     next(error);
@@ -601,9 +537,136 @@ const getWaste = async (req, res, next) => {
       success: true,
       message: 'Waste tracking coming soon',
       data: [],
+      meta: { startDate: null, endDate: null },
     });
   } catch (error) {
     next(error);
+  }
+};
+
+/**
+ * GET /api/analytics/combos
+ * Frequently-bought-together item pairs
+ */
+const getCombos = async (req, res, next) => {
+  try {
+    const cafeId = req.user.cafeId;
+    const { startDate, endDate } = req.query;
+    const dateMatch = {};
+    if (startDate) dateMatch.$gte = new Date(startDate);
+    if (endDate) dateMatch.$lte = new Date(endDate);
+
+    const matchStage = {
+      cafeId: new mongoose.Types.ObjectId(cafeId),
+      status: 'approved',
+      ...(Object.keys(dateMatch).length > 0 && { date: dateMatch }),
+    };
+
+    // Take the top 20 item-pair co-occurrences across all transactions with 2+ items.
+    const combos = await Transaction.aggregate([
+      { $match: matchStage },
+      { $match: { 'items.1': { $exists: true } } },           // ≥2 items
+      {
+        $project: {
+          itemNames: {
+            $sortArray: { input: '$items.name', sortBy: 1 },
+          },
+        },
+      },
+      // Generate unordered pairs
+      {
+        $project: {
+          pairs: {
+            $reduce: {
+              input: { $range: [0, { $size: '$itemNames' }] },
+              initialValue: [],
+              in: {
+                $concatArrays: [
+                  '$$value',
+                  {
+                    $map: {
+                      input: { $range: [{ $add: ['$$this', 1] }, { $size: '$itemNames' }] },
+                      as: 'j',
+                      in: [
+                        { $arrayElemAt: ['$itemNames', '$$this'] },
+                        { $arrayElemAt: ['$itemNames', '$$j'] },
+                      ],
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        },
+      },
+      { $unwind: '$pairs' },
+      { $group: { _id: '$pairs', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 20 },
+      {
+        $project: {
+          _id: 0,
+          pair: '$_id',
+          count: 1,
+        },
+      },
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      data: combos,
+      meta: { startDate: startDate || null, endDate: endDate || null },
+    });
+  } catch (error) {
+    // If $sortArray is not available (older MongoDB), fall back to JS-side pair generation
+    if (error.message && error.message.includes('sortArray')) {
+      try {
+        const cafeId = req.user.cafeId;
+        const { startDate, endDate } = req.query;
+        const dateMatch = {};
+        if (startDate) dateMatch.$gte = new Date(startDate);
+        if (endDate) dateMatch.$lte = new Date(endDate);
+
+        const matchStage = {
+          cafeId: new mongoose.Types.ObjectId(cafeId),
+          status: 'approved',
+          ...(Object.keys(dateMatch).length > 0 && { date: dateMatch }),
+        };
+
+        const transactions = await Transaction.find({
+          ...matchStage,
+          'items.1': { $exists: true },
+        })
+          .select('items.name')
+          .lean();
+
+        const pairCounts = {};
+        for (const tx of transactions) {
+          const names = [...new Set(tx.items.map((i) => i.name))].sort();
+          for (let i = 0; i < names.length; i++) {
+            for (let j = i + 1; j < names.length; j++) {
+              const key = JSON.stringify([names[i], names[j]]);
+              pairCounts[key] = (pairCounts[key] || 0) + 1;
+            }
+          }
+        }
+
+        const combos = Object.entries(pairCounts)
+          .map(([key, count]) => ({ pair: JSON.parse(key), count }))
+          .sort((a, b) => b.count - a.count)
+          .slice(0, 20);
+
+        return res.status(200).json({
+          success: true,
+          data: combos,
+          meta: { startDate: startDate || null, endDate: endDate || null },
+        });
+      } catch (fallbackError) {
+        next(fallbackError);
+      }
+    } else {
+      next(error);
+    }
   }
 };
 
@@ -611,7 +674,7 @@ module.exports = {
   getRevenue,
   getItems,
   getHeatmap,
-  getAccuracy,
   getCustomers,
   getWaste,
+  getCombos,
 };

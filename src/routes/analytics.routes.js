@@ -8,8 +8,8 @@ router.use(authMiddleware);
 router.get('/revenue', analytics.getRevenue);
 router.get('/items', analytics.getItems);
 router.get('/heatmap', analytics.getHeatmap);
-router.get('/accuracy', analytics.getAccuracy);
 router.get('/customers', analytics.getCustomers);
 router.get('/waste', analytics.getWaste);
+router.get('/combos', analytics.getCombos);
 
 module.exports = router;
