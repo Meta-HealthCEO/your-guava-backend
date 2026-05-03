@@ -105,24 +105,29 @@ const groupByWeekAndItem = (transactions, targetDate) => {
 
 /**
  * Computes weighted moving average for an item's weekly quantity history.
+ * Uses the actual populated bucket indices, sorted from most recent (smallest) to oldest,
+ * making the algorithm robust to historical data even when recent weeks are empty.
  * @param {{ [bucketIndex: number]: number }} buckets
- * @param {number} totalWeeks - total number of weeks of data available
  * @returns {number}
  */
-const weightedAverage = (buckets, totalWeeks) => {
-  const numWeeks = Math.min(totalWeeks, 8);
+const weightedAverage = (buckets) => {
+  // Use the ACTUAL populated bucket indices, sorted from most recent (smallest) to oldest.
+  const sortedKeys = Object.keys(buckets)
+    .map(Number)
+    .sort((a, b) => a - b)
+    .slice(0, 8); // cap at 8 weeks
+  const numWeeks = sortedKeys.length;
   if (numWeeks === 0) return 0;
 
-  // Redistribute weights based on available data
+  // Build weights for the available buckets
   let weights;
   if (numWeeks === 1) {
     weights = [1.0];
   } else if (numWeeks === 2) {
     weights = [0.6, 0.4];
   } else {
-    // 3+ weeks: use standard weights with remainder split across older weeks
-    const remainingWeight = 1.0 - WEIGHTS[0] - WEIGHTS[1] - WEIGHTS[2]; // 0.20
-    const olderWeeks = Math.max(numWeeks - 3, 0);
+    const remainingWeight = 1.0 - WEIGHTS[0] - WEIGHTS[1] - WEIGHTS[2];
+    const olderWeeks = numWeeks - 3;
     const olderWeightPerWeek = olderWeeks > 0 ? remainingWeight / olderWeeks : 0;
     weights = [];
     for (let i = 0; i < numWeeks; i++) {
@@ -132,10 +137,10 @@ const weightedAverage = (buckets, totalWeeks) => {
 
   let total = 0;
   for (let i = 0; i < numWeeks; i++) {
-    const qty = buckets[i] || 0;
-    total += qty * (weights[i] || 0);
+    const bucketKey = sortedKeys[i];
+    const qty = buckets[bucketKey] || 0;
+    total += qty * weights[i];
   }
-
   return total;
 };
 
@@ -177,13 +182,6 @@ const generateForecast = async (cafeId, targetDate) => {
   // Group transactions by week and item
   const itemWeekMap = groupByWeekAndItem(transactions, target);
 
-  // Determine how many distinct weeks we actually have data for
-  const allBuckets = new Set();
-  for (const buckets of itemWeekMap.values()) {
-    Object.keys(buckets).forEach((k) => allBuckets.add(Number(k)));
-  }
-  const totalWeeks = allBuckets.size || 1;
-
   // Get top 15 items by total historical frequency
   const itemTotals = [];
   for (const [name, buckets] of itemWeekMap.entries()) {
@@ -208,7 +206,7 @@ const generateForecast = async (cafeId, targetDate) => {
 
   for (const name of topItems) {
     const buckets = itemWeekMap.get(name) || {};
-    const baseQty = weightedAverage(buckets, totalWeeks);
+    const baseQty = weightedAverage(buckets);
     const category = categoryMap.get(name) || 'other';
     const weatherMod = weatherModifier(category, weather);
 

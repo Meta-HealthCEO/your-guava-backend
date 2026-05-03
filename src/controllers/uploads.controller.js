@@ -1,10 +1,21 @@
 const Upload = require('../models/Upload.model');
 const Transaction = require('../models/Transaction.model');
 const Cafe = require('../models/Cafe.model');
+const Forecast = require('../models/Forecast.model');
 const r2 = require('../services/r2.service');
 const ingestion = require('../services/ingestion.service');
 
 const REQUIRED = ['date', 'items', 'total'];
+
+const localDownload = async (req, res, next) => {
+  try {
+    const { key, expires, sig } = req.query;
+    const filePath = r2.getLocalDownloadPath(String(key || ''), String(expires || ''), String(sig || ''));
+    return res.download(filePath);
+  } catch (error) {
+    return next(error);
+  }
+};
 
 const confirm = async (req, res, next) => {
   try {
@@ -49,6 +60,9 @@ const confirm = async (req, res, next) => {
       upload.dateRange = result.dateRange;
       upload.completedAt = new Date();
       await upload.save();
+
+      // Invalidate cached forecasts so they regenerate with fresh data
+      await Forecast.deleteMany({ cafeId });
 
       // Persist mapping for next time, only when wizard route was used
       if (upload.posType === 'wizard') {
@@ -205,6 +219,9 @@ const remap = async (req, res, next) => {
       upload.errorMessage = undefined;
       await upload.save();
 
+      // Invalidate cached forecasts so they regenerate with fresh data
+      await Forecast.deleteMany({ cafeId });
+
       return res.status(200).json({
         success: true,
         uploadId: upload._id,
@@ -231,6 +248,7 @@ const remove = async (req, res, next) => {
     }
 
     await Transaction.deleteMany({ cafeId, uploadId: upload._id });
+    await Forecast.deleteMany({ cafeId });
     try { await r2.deleteFile(upload.r2Key); } catch (err) {
       console.error('[uploads] r2 delete failed:', err.message);
     }
@@ -243,4 +261,4 @@ const remove = async (req, res, next) => {
   }
 };
 
-module.exports = { confirm, list, detail, rows, remap, remove };
+module.exports = { localDownload, confirm, list, detail, rows, remap, remove };

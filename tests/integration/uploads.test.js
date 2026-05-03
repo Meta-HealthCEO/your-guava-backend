@@ -267,4 +267,47 @@ describe('Uploads API', () => {
       expect(u.status).toBe('deleted');
     });
   });
+
+  describe('Forecast invalidation', () => {
+    it('deletes cached forecasts on successful confirm', async () => {
+      const Forecast = require('../../src/models/Forecast.model');
+      // Get cafeId from the registered user
+      const u = await createTestUser({ email: 'd@yourguava.com', cafeName: 'Cafe D', orgName: 'Org D' });
+      const cafeId = u.user?.cafeIds?.[0];
+      if (!cafeId) return; // skip if shape doesn't expose cafeId
+
+      // Pre-create a stale forecast for this cafe
+      await Forecast.create({
+        cafeId,
+        date: new Date(),
+        generatedAt: new Date(),
+        items: [],
+        signals: {
+          weather: { temp: 20, condition: 'clear', humidity: 60 },
+          loadSheddingStage: 0,
+          isPublicHoliday: false,
+          isSchoolHoliday: false,
+          isPayday: false,
+          dayOfWeek: 0,
+          events: [],
+        },
+        totalPredictedRevenue: 0,
+      });
+
+      const stale = await Forecast.find({ cafeId }).lean();
+      expect(stale.length).toBeGreaterThan(0);
+
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${u.token}`)
+        .attach('file', yocoFixture);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${u.token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      const after = await Forecast.find({ cafeId }).lean();
+      expect(after.length).toBe(0);
+    });
+  });
 });
