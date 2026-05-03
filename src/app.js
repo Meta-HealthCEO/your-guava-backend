@@ -15,6 +15,7 @@ const analyticsRoutes = require('./routes/analytics.routes');
 const staffRoutes = require('./routes/staff.routes');
 const shiftsRoutes = require('./routes/shifts.routes');
 const leaveRoutes = require('./routes/leave.routes');
+const uploadsRoutes = require('./routes/uploads.routes');
 const errorMiddleware = require('./middleware/error.middleware');
 
 const app = express();
@@ -44,6 +45,7 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/staff', staffRoutes);
 app.use('/api/shifts', shiftsRoutes);
 app.use('/api/leave', leaveRoutes);
+app.use('/api/uploads', uploadsRoutes);
 
 // Health check
 app.get('/api/health', (_req, res) => {

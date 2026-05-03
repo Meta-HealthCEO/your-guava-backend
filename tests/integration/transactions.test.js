@@ -55,14 +55,18 @@ describe('Transactions API', () => {
   });
 
   // re-enabled after /uploads/:id/confirm exists (Task 11)
-  describe.skip('GET /api/transactions', () => {
+  describe('GET /api/transactions', () => {
     it('returns paginated list of transactions', async () => {
       // Upload some data first
       const csvPath = path.join(__dirname, '..', 'fixtures', 'test-transactions.csv');
-      await request
+      const stage = await request
         .post('/api/transactions/upload')
         .set('Authorization', `Bearer ${token}`)
         .attach('file', csvPath);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
 
       const res = await request
         .get('/api/transactions')
@@ -89,13 +93,17 @@ describe('Transactions API', () => {
   });
 
   // re-enabled after /uploads/:id/confirm exists (Task 11)
-  describe.skip('GET /api/transactions/stats', () => {
+  describe('GET /api/transactions/stats', () => {
     it('returns correct stats after upload', async () => {
       const csvPath = path.join(__dirname, '..', 'fixtures', 'test-transactions.csv');
-      await request
+      const stage = await request
         .post('/api/transactions/upload')
         .set('Authorization', `Bearer ${token}`)
         .attach('file', csvPath);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
 
       const res = await request
         .get('/api/transactions/stats')
