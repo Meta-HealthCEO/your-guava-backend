@@ -1,5 +1,4 @@
 const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
 const Transaction = require('../models/Transaction.model');
 const Cafe = require('../models/Cafe.model');
@@ -17,7 +16,6 @@ const upload = async (req, res, next) => {
     const userId = req.user.id;
     const filePath = req.file.path;
     const fileName = req.file.originalname;
-    const fileExt = path.extname(fileName).toLowerCase().slice(1);
     const buffer = fs.readFileSync(filePath);
 
     // Validate size
