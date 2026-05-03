@@ -48,6 +48,7 @@ const cafeSchema = new mongoose.Schema(
           discount: { type: String },
           paymentMethod: { type: String },
           status: { type: String },
+          quantity: { type: String },
           itemsMode: { type: String, enum: ['packed', 'line-per-row'] },
         },
         { _id: false }

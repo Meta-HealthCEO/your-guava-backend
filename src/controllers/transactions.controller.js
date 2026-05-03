@@ -1,4 +1,5 @@
 const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
 const Transaction = require('../models/Transaction.model');
 const Cafe = require('../models/Cafe.model');
@@ -6,6 +7,8 @@ const Upload = require('../models/Upload.model');
 const r2 = require('../services/r2.service');
 const ingestion = require('../services/ingestion.service');
 const { proposeColumnMapping } = require('../services/anthropic.service');
+
+const REQUIRED_UPLOAD_MAPPING = ['date', 'items', 'total'];
 
 const upload = async (req, res, next) => {
   try {
@@ -15,7 +18,8 @@ const upload = async (req, res, next) => {
     const cafeId = req.user.cafeId;
     const userId = req.user.id;
     const filePath = req.file.path;
-    const fileName = req.file.originalname;
+    const fileName = path.basename(req.file.originalname);
+    const ext = path.extname(fileName).toLowerCase().slice(1);
     const buffer = fs.readFileSync(filePath);
 
     // Validate size
@@ -26,7 +30,7 @@ const upload = async (req, res, next) => {
     }
 
     // Preview headers + sample rows
-    const { headers, sampleRows } = await ingestion.previewBuffer(buffer);
+    const { headers, sampleRows } = await ingestion.previewBuffer(buffer, ext);
     if (!headers || headers.length === 0) {
       try { fs.unlinkSync(filePath); } catch {}
       return res.status(400).json({ success: false, message: 'Could not parse CSV headers' });
@@ -79,6 +83,8 @@ const upload = async (req, res, next) => {
       status: 'pending_mapping',
     });
 
+    const hasRequiredMapping = REQUIRED_UPLOAD_MAPPING.every((field) => Boolean(columnMapping?.[field]));
+
     return res.status(200).json({
       success: true,
       uploadId: uploadDoc._id,
@@ -87,7 +93,7 @@ const upload = async (req, res, next) => {
       itemsMode,
       headers,
       preview: sampleRows,
-      needsConfirmation: posType !== 'yoco',
+      needsConfirmation: posType !== 'yoco' && !hasRequiredMapping,
     });
   } catch (error) {
     next(error);

@@ -11,6 +11,7 @@ const columnMappingSchema = new mongoose.Schema(
     discount: { type: String },
     paymentMethod: { type: String },
     status: { type: String },
+    quantity: { type: String },
   },
   { _id: false }
 );

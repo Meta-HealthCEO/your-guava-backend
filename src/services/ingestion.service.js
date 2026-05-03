@@ -1,5 +1,8 @@
 const fs = require('fs');
 const path = require('path');
+const csv = require('csv-parser');
+const { Readable } = require('stream');
+const XLSX = require('xlsx');
 const Transaction = require('../models/Transaction.model');
 const Item = require('../models/Item.model');
 const { parseBuffer } = require('./parser.service');
@@ -40,9 +43,18 @@ const yocoMapping = () => ({
  * @param {Buffer} buffer
  * @returns {Promise<string[]>}
  */
-const extractHeaders = async (buffer) => {
-  const csv = require('csv-parser');
-  const { Readable } = require('stream');
+const previewWorkbook = (buffer) => {
+  const wb = XLSX.read(buffer, { type: 'buffer' });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+  const headers = rows[0] ? Object.keys(rows[0]) : [];
+  return { headers, sampleRows: rows.slice(0, 5) };
+};
+
+const extractHeaders = async (buffer, fileExt = 'csv') => {
+  if (fileExt === 'xlsx' || fileExt === 'xls') {
+    return previewWorkbook(buffer).headers;
+  }
   return new Promise((resolve, reject) => {
     let captured = false;
     const stream = Readable.from(buffer).pipe(csv());
@@ -61,9 +73,10 @@ const extractHeaders = async (buffer) => {
 /**
  * Returns headers + first 5 rows for AI/preset analysis.
  */
-const previewBuffer = async (buffer) => {
-  const csv = require('csv-parser');
-  const { Readable } = require('stream');
+const previewBuffer = async (buffer, fileExt = 'csv') => {
+  if (fileExt === 'xlsx' || fileExt === 'xls') {
+    return previewWorkbook(buffer);
+  }
   return new Promise((resolve, reject) => {
     const rows = [];
     let headers = [];

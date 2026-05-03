@@ -2,7 +2,6 @@ const Forecast = require('../models/Forecast.model');
 const {
   generateForecast,
   generateWeekForecast,
-  updateForecastActuals,
 } = require('../services/forecast.service');
 const { generateInsights } = require('../services/anthropic.service');
 

@@ -56,8 +56,8 @@ describe('parser.service', () => {
       expect(result.rows).toHaveLength(2);
       const r100 = result.rows.find((r) => r.receiptId === 'R100');
       expect(r100.items).toEqual([
-        { name: 'Flat White', quantity: 2 },
-        { name: 'Muffin', quantity: 1 },
+        { name: 'Flat White', quantity: 2, unitPrice: 25 },
+        { name: 'Muffin', quantity: 1, unitPrice: 25 },
       ]);
       expect(r100.total).toBe(75);
     });

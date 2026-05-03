@@ -48,10 +48,54 @@ const validateMapping = (mapping) => {
   }
 };
 
+const parseTimeParts = (timeStr) => {
+  if (!timeStr) return null;
+  if (timeStr instanceof Date) {
+    return {
+      hours: timeStr.getHours(),
+      minutes: timeStr.getMinutes(),
+      seconds: timeStr.getSeconds(),
+    };
+  }
+  if (typeof timeStr === 'number') {
+    const totalSeconds = Math.round(timeStr * 24 * 60 * 60);
+    return {
+      hours: Math.floor(totalSeconds / 3600) % 24,
+      minutes: Math.floor((totalSeconds % 3600) / 60),
+      seconds: totalSeconds % 60,
+    };
+  }
+  const match = String(timeStr).trim().match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!match) return null;
+  return {
+    hours: parseInt(match[1], 10),
+    minutes: parseInt(match[2], 10),
+    seconds: parseInt(match[3] || '0', 10),
+  };
+};
+
 const parseDate = (dateStr, timeStr) => {
   if (!dateStr) return null;
+  if (dateStr instanceof Date) {
+    const date = new Date(dateStr);
+    const time = parseTimeParts(timeStr);
+    if (time) date.setHours(time.hours, time.minutes, time.seconds, 0);
+    return isNaN(date.getTime()) ? null : date;
+  }
+  if (typeof dateStr === 'number') {
+    const parsedSerial = XLSX.SSF.parse_date_code(dateStr);
+    if (parsedSerial) {
+      const date = new Date(parsedSerial.y, parsedSerial.m - 1, parsedSerial.d);
+      const time = parseTimeParts(timeStr);
+      if (time) date.setHours(time.hours, time.minutes, time.seconds, 0);
+      return isNaN(date.getTime()) ? null : date;
+    }
+  }
   const normalised = String(dateStr).replace(/\//g, '-').trim();
-  const dt = timeStr ? `${normalised}T${String(timeStr).trim()}` : normalised;
+  const time = parseTimeParts(timeStr);
+  const dt = time
+    ? `${normalised}T${String(time.hours).padStart(2, '0')}:${String(time.minutes).padStart(2, '0')}:${String(time.seconds).padStart(2, '0')}`
+    : normalised;
   const parsed = new Date(dt);
   return isNaN(parsed.getTime()) ? null : parsed;
 };
@@ -108,7 +152,15 @@ const groupLinePerRow = (rawRows, mapping) => {
       errors++;
     }
   }
-  return { rows: [...groups.values()], errors };
+  const rows = [...groups.values()].map((row) => {
+    const totalQty = row.items.reduce((sum, item) => sum + item.quantity, 0);
+    const unitPrice = totalQty > 0 ? parseFloat((row.total / totalQty).toFixed(2)) : 0;
+    return {
+      ...row,
+      items: row.items.map((item) => ({ ...item, unitPrice })),
+    };
+  });
+  return { rows, errors };
 };
 
 /**
