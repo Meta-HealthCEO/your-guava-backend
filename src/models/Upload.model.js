@@ -1,0 +1,69 @@
+const mongoose = require('mongoose');
+
+const columnMappingSchema = new mongoose.Schema(
+  {
+    receiptId: { type: String },
+    date: { type: String },
+    time: { type: String },
+    items: { type: String },
+    total: { type: String },
+    tip: { type: String },
+    discount: { type: String },
+    paymentMethod: { type: String },
+    status: { type: String },
+  },
+  { _id: false }
+);
+
+const uploadSchema = new mongoose.Schema(
+  {
+    cafeId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Cafe',
+      required: true,
+      index: true,
+    },
+    uploadedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+    },
+    fileName: { type: String, required: true },
+    fileSize: { type: Number, required: true },
+    r2Key: { type: String, required: true },
+    posType: {
+      type: String,
+      enum: ['yoco', 'wizard'],
+      required: true,
+    },
+    columnMapping: { type: columnMappingSchema, default: {} },
+    itemsMode: {
+      type: String,
+      enum: ['packed', 'line-per-row'],
+      default: 'packed',
+    },
+    status: {
+      type: String,
+      enum: ['pending_mapping', 'parsing', 'completed', 'failed', 'deleted'],
+      default: 'pending_mapping',
+      index: true,
+    },
+    stats: {
+      imported: { type: Number, default: 0 },
+      skipped: { type: Number, default: 0 },
+      errors: { type: Number, default: 0 },
+      totalRows: { type: Number, default: 0 },
+    },
+    dateRange: {
+      firstDate: { type: Date },
+      lastDate: { type: Date },
+    },
+    errorMessage: { type: String },
+    completedAt: { type: Date },
+  },
+  { timestamps: true }
+);
+
+uploadSchema.index({ cafeId: 1, createdAt: -1 });
+
+module.exports = mongoose.model('Upload', uploadSchema);
