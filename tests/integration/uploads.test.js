@@ -147,4 +147,25 @@ describe('Uploads API', () => {
       expect(res.status).toBe(404);
     });
   });
+
+  describe('GET /api/uploads/:id/rows', () => {
+    it('returns paginated transactions linked to this upload', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      const res = await request
+        .get(`/api/uploads/${stage.body.uploadId}/rows`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.transactions).toHaveLength(4);
+      expect(res.body.transactions[0].uploadId).toBe(stage.body.uploadId);
+    });
+  });
 });

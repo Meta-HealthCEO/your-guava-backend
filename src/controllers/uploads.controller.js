@@ -1,4 +1,5 @@
 const Upload = require('../models/Upload.model');
+const Transaction = require('../models/Transaction.model');
 const Cafe = require('../models/Cafe.model');
 const r2 = require('../services/r2.service');
 const ingestion = require('../services/ingestion.service');
@@ -119,4 +120,33 @@ const detail = async (req, res, next) => {
   }
 };
 
-module.exports = { confirm, list, detail };
+const rows = async (req, res, next) => {
+  try {
+    const cafeId = req.user.cafeId;
+    const upload = await Upload.findOne({ _id: req.params.id, cafeId }).lean();
+    if (!upload) return res.status(404).json({ success: false, message: 'Upload not found' });
+
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const skip = (page - 1) * limit;
+
+    const [transactions, total] = await Promise.all([
+      Transaction.find({ cafeId, uploadId: upload._id })
+        .sort({ date: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Transaction.countDocuments({ cafeId, uploadId: upload._id }),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      transactions,
+      pagination: { total, page, limit, pages: Math.ceil(total / limit) },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { confirm, list, detail, rows };
