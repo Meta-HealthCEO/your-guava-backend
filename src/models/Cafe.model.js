@@ -36,6 +36,24 @@ const cafeSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    savedColumnMapping: {
+      type: new mongoose.Schema(
+        {
+          receiptId: { type: String },
+          date: { type: String },
+          time: { type: String },
+          items: { type: String },
+          total: { type: String },
+          tip: { type: String },
+          discount: { type: String },
+          paymentMethod: { type: String },
+          status: { type: String },
+          itemsMode: { type: String, enum: ['packed', 'line-per-row'] },
+        },
+        { _id: false }
+      ),
+      default: undefined,
+    },
     lastSyncAt: {
       type: Date,
     },
