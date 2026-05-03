@@ -150,4 +150,89 @@ const buildSummaryStats = (transactions) => {
   };
 };
 
-module.exports = { generateInsights };
+const crypto = require('crypto');
+
+const mappingCache = new Map(); // sha1(headers) -> mapping
+
+/**
+ * Asks Claude Haiku to propose a column mapping for an unknown CSV format.
+ *
+ * @param {string[]} headers
+ * @param {object[]} sampleRows up to 5 rows for context
+ * @returns {Promise<{mapping: object, itemsMode: 'packed'|'line-per-row'}>}
+ */
+const proposeColumnMapping = async (headers, sampleRows) => {
+  const cacheKey = crypto.createHash('sha1').update(headers.join('|')).digest('hex');
+  if (mappingCache.has(cacheKey)) {
+    return mappingCache.get(cacheKey);
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return { mapping: {}, itemsMode: 'packed' };
+  }
+
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+  const prompt = `You are mapping CSV columns from a coffee-shop POS export to a canonical schema.
+
+Canonical fields (target keys):
+- receiptId (optional): unique transaction/receipt ID
+- date (REQUIRED): transaction date
+- time (optional): transaction time
+- items (REQUIRED): item description column. May be packed like "1 x Flat White,2 x Muffin", or one row per line item.
+- total (REQUIRED): total amount paid
+- tip, discount, paymentMethod, status (optional)
+- quantity (optional, only for line-per-row mode): item quantity column
+
+Headers: ${JSON.stringify(headers)}
+
+Sample rows:
+${JSON.stringify(sampleRows.slice(0, 5), null, 2)}
+
+Return ONLY valid JSON with this exact shape, no markdown, no preamble:
+{
+  "mapping": {
+    "receiptId": "<source header or null>",
+    "date": "<source header>",
+    "time": "<source header or null>",
+    "items": "<source header>",
+    "total": "<source header>",
+    "tip": "<source header or null>",
+    "discount": "<source header or null>",
+    "paymentMethod": "<source header or null>",
+    "status": "<source header or null>",
+    "quantity": "<source header or null>"
+  },
+  "itemsMode": "packed" | "line-per-row"
+}
+
+Use null for fields you cannot confidently identify. Choose itemsMode "line-per-row" if each row appears to be a single line item rather than a full receipt.`;
+
+  let result = { mapping: {}, itemsMode: 'packed' };
+  try {
+    const message = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 512,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const text = (message.content[0]?.text || '').replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(text);
+    const cleaned = {};
+    for (const [k, v] of Object.entries(parsed.mapping || {})) {
+      if (v && headers.includes(v)) cleaned[k] = v;
+    }
+    result = {
+      mapping: cleaned,
+      itemsMode: parsed.itemsMode === 'line-per-row' ? 'line-per-row' : 'packed',
+    };
+  } catch (err) {
+    console.error('[anthropic] proposeColumnMapping failed:', err.message);
+  }
+
+  mappingCache.set(cacheKey, result);
+  return result;
+};
+
+const _resetMappingCache = () => mappingCache.clear();
+
+module.exports = { generateInsights, proposeColumnMapping, _resetMappingCache };
