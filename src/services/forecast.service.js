@@ -145,6 +145,55 @@ const weightedAverage = (buckets) => {
 };
 
 /**
+ * Computes a suggested stock quantity for a given item based on historical forecast bias.
+ * Uses the last 30 days of forecast docs where actualQty was recorded.
+ *
+ * @param {string|ObjectId} cafeId
+ * @param {string} itemName
+ * @param {number} predictedQty
+ * @returns {Promise<number>}
+ */
+const computeSuggestedStock = async (cafeId, itemName, predictedQty) => {
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  thirtyDaysAgo.setHours(0, 0, 0, 0);
+
+  const pastForecasts = await Forecast.find({
+    cafeId,
+    date: { $gte: thirtyDaysAgo },
+    'items.itemName': itemName,
+    'items.actualQty': { $gt: 0 },
+  })
+    .select('items')
+    .lean();
+
+  // Extract matched item pairs (predicted vs actual)
+  const pairs = [];
+  for (const doc of pastForecasts) {
+    for (const item of doc.items || []) {
+      if (item.itemName === itemName && item.actualQty > 0 && item.predictedQty != null) {
+        pairs.push({ predicted: item.predictedQty, actual: item.actualQty });
+      }
+    }
+  }
+
+  const SAFETY_MARGIN = 1.10;
+
+  if (pairs.length >= 3) {
+    const avgBias = pairs.reduce((sum, p) => {
+      const bias = (p.actual - p.predicted) / Math.max(p.predicted, 1);
+      return sum + Math.max(-0.5, Math.min(0.5, bias));
+    }, 0) / pairs.length;
+
+    const biasAdjusted = Math.round(predictedQty * (1 + avgBias) * SAFETY_MARGIN);
+    return Math.max(predictedQty, biasAdjusted);
+  }
+
+  // Cold start: just apply the safety margin
+  return Math.round(predictedQty * SAFETY_MARGIN);
+};
+
+/**
  * Generates a sales forecast for a cafe on a specific target date.
  *
  * @param {string|ObjectId} cafeId
@@ -221,6 +270,7 @@ const generateForecast = async (cafeId, targetDate) => {
       itemName: name,
       predictedQty: finalQty,
       actualQty: 0,
+      suggestedStock: await computeSuggestedStock(cafeId, name, finalQty),
     });
   }
 

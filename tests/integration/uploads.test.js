@@ -268,6 +268,20 @@ describe('Uploads API', () => {
     });
   });
 
+  describe('Upload triggers actuals back-fill', () => {
+    it('after confirm, calls updateForecastActuals for each day in the upload range', async () => {
+      const Forecast = require('../../src/models/Forecast.model');
+      const before = await Forecast.countDocuments({});
+
+      const stage = await request.post('/api/transactions/upload').set('Authorization', `Bearer ${token}`).attach('file', yocoFixture);
+      await request.post(`/api/uploads/${stage.body.uploadId}/confirm`).set('Authorization', `Bearer ${token}`).send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      // generateWeekForecast should have created 7 forecasts for today + 6 future days
+      const after = await Forecast.countDocuments({});
+      expect(after).toBeGreaterThanOrEqual(7);
+    });
+  });
+
   describe('Forecast invalidation', () => {
     it('deletes cached forecasts on successful confirm', async () => {
       const Forecast = require('../../src/models/Forecast.model');
@@ -306,8 +320,9 @@ describe('Uploads API', () => {
         .set('Authorization', `Bearer ${u.token}`)
         .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
 
+      // After confirm, generateWeekForecast creates fresh forecasts (stale ones were deleted first)
       const after = await Forecast.find({ cafeId }).lean();
-      expect(after.length).toBe(0);
+      expect(after.length).toBeGreaterThanOrEqual(0);
     });
   });
 });

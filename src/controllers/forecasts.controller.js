@@ -126,4 +126,25 @@ const getTomorrow = async (req, res, next) => {
   }
 };
 
-module.exports = { getToday, getTomorrow, getWeek, generate, getAccuracy, getInsights };
+const getRecent = async (req, res, next) => {
+  try {
+    const cafeId = req.user.cafeId;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const sevenDaysAgo = new Date(today);
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    const forecasts = await Forecast.find({
+      cafeId,
+      date: { $gte: sevenDaysAgo, $lt: today },
+    })
+      .sort({ date: 1 })
+      .lean();
+
+    return res.status(200).json({ success: true, forecasts });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { getToday, getTomorrow, getWeek, generate, getAccuracy, getInsights, getRecent };

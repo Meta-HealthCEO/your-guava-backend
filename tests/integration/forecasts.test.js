@@ -86,4 +86,28 @@ describe('Forecasts API', () => {
       expect(res.body.success).toBe(true);
     });
   });
+
+  describe('GET /api/forecasts/recent', () => {
+    it('returns forecasts from the past 7 days', async () => {
+      const Forecast = require('../../src/models/Forecast.model');
+      const Cafe = require('../../src/models/Cafe.model');
+      const cafe = await Cafe.findOne({});
+      // Create one past forecast (3 days ago)
+      const date = new Date();
+      date.setDate(date.getDate() - 3);
+      date.setHours(0, 0, 0, 0);
+      await Forecast.create({
+        cafeId: cafe._id,
+        date,
+        generatedAt: new Date(),
+        items: [],
+        signals: { weather: { temp: 20, condition: 'clear', humidity: 60 }, loadSheddingStage: 0, isPublicHoliday: false, isSchoolHoliday: false, isPayday: false, dayOfWeek: 0, events: [] },
+        totalPredictedRevenue: 100,
+      });
+
+      const res = await request.get('/api/forecasts/recent').set('Authorization', `Bearer ${token}`);
+      expect(res.status).toBe(200);
+      expect(res.body.forecasts).toHaveLength(1);
+    });
+  });
 });

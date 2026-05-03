@@ -4,8 +4,26 @@ const Cafe = require('../models/Cafe.model');
 const Forecast = require('../models/Forecast.model');
 const r2 = require('../services/r2.service');
 const ingestion = require('../services/ingestion.service');
+const { updateForecastActuals, generateWeekForecast } = require('../services/forecast.service');
 
 const REQUIRED = ['date', 'items', 'total'];
+
+const fillActualsForRange = async (cafeId, dateRange) => {
+  if (!dateRange?.firstDate || !dateRange?.lastDate) return;
+  const start = new Date(dateRange.firstDate);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(dateRange.lastDate);
+  end.setHours(0, 0, 0, 0);
+  const cursor = new Date(start);
+  while (cursor <= end) {
+    try {
+      await updateForecastActuals(cafeId, new Date(cursor));
+    } catch (err) {
+      console.error('[uploads] updateForecastActuals failed for', cursor.toISOString(), err.message);
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+};
 
 const localDownload = async (req, res, next) => {
   try {
@@ -63,6 +81,11 @@ const confirm = async (req, res, next) => {
 
       // Invalidate cached forecasts so they regenerate with fresh data
       await Forecast.deleteMany({ cafeId });
+
+      // Re-generate fresh forecasts for the next 7 days using the new data,
+      // and back-fill actuals for any forecast dates the upload covers.
+      await generateWeekForecast(cafeId).catch((err) => console.error('[uploads] week regen failed:', err.message));
+      await fillActualsForRange(cafeId, result.dateRange);
 
       // Persist mapping for next time, only when wizard route was used
       if (upload.posType === 'wizard') {
@@ -221,6 +244,11 @@ const remap = async (req, res, next) => {
 
       // Invalidate cached forecasts so they regenerate with fresh data
       await Forecast.deleteMany({ cafeId });
+
+      // Re-generate fresh forecasts for the next 7 days using the new data,
+      // and back-fill actuals for any forecast dates the upload covers.
+      await generateWeekForecast(cafeId).catch((err) => console.error('[uploads] week regen failed:', err.message));
+      await fillActualsForRange(cafeId, result.dateRange);
 
       return res.status(200).json({
         success: true,

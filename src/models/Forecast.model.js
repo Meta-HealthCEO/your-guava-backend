@@ -20,6 +20,7 @@ const forecastSchema = new mongoose.Schema(
         itemName: { type: String },
         predictedQty: { type: Number },
         actualQty: { type: Number, default: 0 },
+        suggestedStock: { type: Number },
       },
     ],
     signals: {
