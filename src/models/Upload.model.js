@@ -59,6 +59,8 @@ const uploadSchema = new mongoose.Schema(
       lastDate: { type: Date },
     },
     errorMessage: { type: String },
+    headers: [{ type: String }],
+    sampleRows: [{ type: mongoose.Schema.Types.Mixed }],
     completedAt: { type: Date },
   },
   { timestamps: true }

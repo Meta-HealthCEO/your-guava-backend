@@ -74,6 +74,8 @@ const upload = async (req, res, next) => {
       posType,
       columnMapping,
       itemsMode,
+      headers,
+      sampleRows,
       status: 'pending_mapping',
     });
 
