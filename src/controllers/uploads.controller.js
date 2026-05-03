@@ -1,5 +1,4 @@
 const Upload = require('../models/Upload.model');
-const Transaction = require('../models/Transaction.model');
 const Cafe = require('../models/Cafe.model');
 const r2 = require('../services/r2.service');
 const ingestion = require('../services/ingestion.service');
