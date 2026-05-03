@@ -194,6 +194,40 @@ describe('Uploads API', () => {
       expect(after).toHaveLength(4);
     });
 
+    it('preserves transactions when re-parse fails (atomicity)', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      const beforeTxns = await Transaction.find({ uploadId: stage.body.uploadId }).lean();
+      expect(beforeTxns).toHaveLength(4);
+
+      // Inject a parse failure via spy so we bypass the 400 guard
+      const parserService = require('../../src/services/parser.service');
+      const spy = jest.spyOn(parserService, 'parseBuffer').mockRejectedValueOnce(
+        new Error('injected parse failure')
+      );
+
+      const res = await request
+        .patch(`/api/uploads/${stage.body.uploadId}/mapping`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      spy.mockRestore();
+
+      // The request should have failed
+      expect(res.status).toBeGreaterThanOrEqual(500);
+
+      // Original transactions must still exist — atomicity preserved
+      const afterTxns = await Transaction.find({ uploadId: stage.body.uploadId }).lean();
+      expect(afterTxns).toHaveLength(4);
+    });
+
     it('returns 409 when status is parsing', async () => {
       const stage = await request
         .post('/api/transactions/upload')

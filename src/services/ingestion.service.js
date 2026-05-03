@@ -79,20 +79,17 @@ const previewBuffer = async (buffer) => {
 };
 
 /**
- * Phase 2: parses a buffer using the given mapping and writes transactions.
+ * Persistence-only half of ingestion: takes an already-parsed result object and
+ * writes transactions + item upserts to the database. Does NOT touch R2 or the
+ * file system. Safe to call after a successful parseBuffer call.
  *
- * @param {Buffer} buffer
+ * @param {object} parsed  — the object returned by parseBuffer
  * @param {object} opts
  * @param {string} opts.cafeId
  * @param {string} opts.uploadId
- * @param {object} opts.columnMapping
- * @param {'packed'|'line-per-row'} opts.itemsMode
- * @param {string} [opts.fileExt='csv']
  * @returns {Promise<{imported: number, skipped: number, errors: number, totalRows: number, dateRange: object}>}
  */
-const ingestParsedRows = async (buffer, { cafeId, uploadId, columnMapping, itemsMode, fileExt = 'csv' }) => {
-  const parsed = await parseBuffer(buffer, { columnMapping, itemsMode, fileExt });
-
+const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
   let imported = 0;
   let skipped = 0;
   let errors = parsed.errors;
@@ -189,6 +186,23 @@ const ingestParsedRows = async (buffer, { cafeId, uploadId, columnMapping, items
 };
 
 /**
+ * Phase 2: parses a buffer using the given mapping and writes transactions.
+ *
+ * @param {Buffer} buffer
+ * @param {object} opts
+ * @param {string} opts.cafeId
+ * @param {string} opts.uploadId
+ * @param {object} opts.columnMapping
+ * @param {'packed'|'line-per-row'} opts.itemsMode
+ * @param {string} [opts.fileExt='csv']
+ * @returns {Promise<{imported: number, skipped: number, errors: number, totalRows: number, dateRange: object}>}
+ */
+const ingestParsedRows = async (buffer, { cafeId, uploadId, columnMapping, itemsMode, fileExt = 'csv' }) => {
+  const parsed = await parseBuffer(buffer, { columnMapping, itemsMode, fileExt });
+  return persistParsedRows(parsed, { cafeId, uploadId });
+};
+
+/**
  * Legacy file-path API. Reads a local file and ingests using the Yoco preset.
  * Preserved so the existing transactions.controller.upload tests still pass while
  * the new two-phase flow is being built up.
@@ -206,6 +220,7 @@ const parseYocoCSV = ingestFile;
 module.exports = {
   ingestFile,
   ingestParsedRows,
+  persistParsedRows,
   isYocoFormat,
   yocoMapping,
   extractHeaders,

@@ -174,16 +174,23 @@ const remap = async (req, res, next) => {
     await upload.save();
 
     try {
-      await Transaction.deleteMany({ cafeId, uploadId: upload._id });
-
+      // 1. Parse first (read-only — can fail without any side effects)
       const buffer = await r2.downloadFile(upload.r2Key);
       const ext = upload.fileName.split('.').pop().toLowerCase();
-      const result = await ingestion.ingestParsedRows(buffer, {
-        cafeId,
-        uploadId: upload._id,
+      const { parseBuffer } = require('../services/parser.service');
+      const parsed = await parseBuffer(buffer, {
         columnMapping,
         itemsMode: upload.itemsMode,
         fileExt: ext,
+      });
+
+      // 2. Parse succeeded — now safe to delete existing transactions
+      await Transaction.deleteMany({ cafeId, uploadId: upload._id });
+
+      // 3. Persist the already-parsed rows (no second parse)
+      const result = await ingestion.persistParsedRows(parsed, {
+        cafeId,
+        uploadId: upload._id,
       });
 
       upload.status = 'completed';
