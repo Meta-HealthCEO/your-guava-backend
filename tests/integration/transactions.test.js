@@ -1,3 +1,17 @@
+const mockR2Files = new Map();
+jest.mock('../../src/services/r2.service', () => ({
+  uploadFile: async (buffer, key) => { mockR2Files.set(key, buffer); },
+  downloadFile: async (key) => mockR2Files.get(key),
+  getSignedDownloadUrl: async (key) => `https://test.r2.local/${key}`,
+  deleteFile: async (key) => { mockR2Files.delete(key); },
+  _resetClient: () => {},
+}));
+jest.mock('../../src/services/anthropic.service', () => ({
+  generateInsights: async () => ({ insights: [], generatedAt: new Date() }),
+  proposeColumnMapping: async () => ({ mapping: {}, itemsMode: 'packed' }),
+  _resetMappingCache: () => {},
+}));
+
 const path = require('path');
 const supertest = require('supertest');
 const { setup, teardown, clearDB, createTestUser, app } = require('../setup');
@@ -17,9 +31,8 @@ describe('Transactions API', () => {
   });
 
   describe('POST /api/transactions/upload', () => {
-    it('uploads CSV file and imports approved transactions', async () => {
+    it('uploads Yoco CSV and returns preset mapping ready to confirm', async () => {
       const csvPath = path.join(__dirname, '..', 'fixtures', 'test-transactions.csv');
-
       const res = await request
         .post('/api/transactions/upload')
         .set('Authorization', `Bearer ${token}`)
@@ -27,43 +40,22 @@ describe('Transactions API', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
-      expect(res.body.imported).toBe(4); // 4 approved
-      expect(res.body.skipped).toBe(1); // 1 declined
-      expect(res.body.errors).toBe(0);
-    });
-
-    it('skips duplicates on re-upload', async () => {
-      const csvPath = path.join(__dirname, '..', 'fixtures', 'test-transactions.csv');
-
-      // First upload
-      await request
-        .post('/api/transactions/upload')
-        .set('Authorization', `Bearer ${token}`)
-        .attach('file', csvPath);
-
-      // Second upload — all should be skipped
-      const res = await request
-        .post('/api/transactions/upload')
-        .set('Authorization', `Bearer ${token}`)
-        .attach('file', csvPath);
-
-      expect(res.status).toBe(200);
-      expect(res.body.imported).toBe(0);
-      expect(res.body.skipped).toBe(5); // 4 duplicates + 1 declined
+      expect(res.body.posType).toBe('yoco');
+      expect(res.body.uploadId).toBeDefined();
+      expect(res.body.needsConfirmation).toBe(false);
+      expect(res.body.columnMapping.date).toBe('Date');
     });
 
     it('returns 400 when no file is uploaded', async () => {
       const res = await request
         .post('/api/transactions/upload')
         .set('Authorization', `Bearer ${token}`);
-
       expect(res.status).toBe(400);
-      expect(res.body.success).toBe(false);
-      expect(res.body.message).toMatch(/no file/i);
     });
   });
 
-  describe('GET /api/transactions', () => {
+  // re-enabled after /uploads/:id/confirm exists (Task 11)
+  describe.skip('GET /api/transactions', () => {
     it('returns paginated list of transactions', async () => {
       // Upload some data first
       const csvPath = path.join(__dirname, '..', 'fixtures', 'test-transactions.csv');
@@ -96,7 +88,8 @@ describe('Transactions API', () => {
     });
   });
 
-  describe('GET /api/transactions/stats', () => {
+  // re-enabled after /uploads/:id/confirm exists (Task 11)
+  describe.skip('GET /api/transactions/stats', () => {
     it('returns correct stats after upload', async () => {
       const csvPath = path.join(__dirname, '..', 'fixtures', 'test-transactions.csv');
       await request

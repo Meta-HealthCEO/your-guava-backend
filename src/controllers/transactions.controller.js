@@ -1,41 +1,93 @@
 const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 const Transaction = require('../models/Transaction.model');
 const Cafe = require('../models/Cafe.model');
-const { ingestFile } = require('../services/ingestion.service');
+const Upload = require('../models/Upload.model');
+const r2 = require('../services/r2.service');
+const ingestion = require('../services/ingestion.service');
+const { proposeColumnMapping } = require('../services/anthropic.service');
 
 const upload = async (req, res, next) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
-
     const cafeId = req.user.cafeId;
+    const userId = req.user.id;
     const filePath = req.file.path;
+    const fileName = req.file.originalname;
+    const fileExt = path.extname(fileName).toLowerCase().slice(1);
+    const buffer = fs.readFileSync(filePath);
 
-    const result = await ingestFile(filePath, cafeId);
+    // Validate size
+    const maxBytes = parseInt(process.env.UPLOAD_MAX_BYTES || '10485760', 10);
+    if (buffer.length > maxBytes) {
+      try { fs.unlinkSync(filePath); } catch {}
+      return res.status(400).json({ success: false, message: `File exceeds ${maxBytes} bytes` });
+    }
 
-    // Clean up uploaded file
-    try { fs.unlinkSync(filePath); } catch (_) {}
+    // Preview headers + sample rows
+    const { headers, sampleRows } = await ingestion.previewBuffer(buffer);
+    if (!headers || headers.length === 0) {
+      try { fs.unlinkSync(filePath); } catch {}
+      return res.status(400).json({ success: false, message: 'Could not parse CSV headers' });
+    }
 
-    // Update cafe metadata
-    await Cafe.findByIdAndUpdate(cafeId, {
-      $set: { dataUploaded: true, lastSyncAt: new Date() },
+    // Stage to R2
+    const r2Key = `uploads/${cafeId}/${Date.now()}-${crypto.randomBytes(6).toString('hex')}-${fileName}`;
+    try {
+      await r2.uploadFile(buffer, r2Key, req.file.mimetype || 'text/csv');
+    } catch (err) {
+      try { fs.unlinkSync(filePath); } catch {}
+      return res.status(503).json({ success: false, message: 'File storage unavailable, please retry' });
+    }
+    try { fs.unlinkSync(filePath); } catch {}
+
+    // Detect format
+    let posType, columnMapping, itemsMode;
+    if (ingestion.isYocoFormat(headers)) {
+      const y = ingestion.yocoMapping();
+      posType = 'yoco';
+      columnMapping = y.mapping;
+      itemsMode = y.itemsMode;
+    } else {
+      posType = 'wizard';
+      // Try cafe-saved mapping first
+      const cafe = await Cafe.findById(cafeId).lean();
+      if (cafe?.savedColumnMapping) {
+        const saved = cafe.savedColumnMapping;
+        columnMapping = { ...saved };
+        delete columnMapping.itemsMode;
+        itemsMode = saved.itemsMode || 'packed';
+      } else {
+        const proposal = await proposeColumnMapping(headers, sampleRows);
+        columnMapping = proposal.mapping;
+        itemsMode = proposal.itemsMode;
+      }
+    }
+
+    const uploadDoc = await Upload.create({
+      cafeId,
+      uploadedBy: userId,
+      fileName,
+      fileSize: buffer.length,
+      r2Key,
+      posType,
+      columnMapping,
+      itemsMode,
+      status: 'pending_mapping',
     });
-
-    // Get date range for response
-    const dateRange = await Transaction.aggregate([
-      { $match: { cafeId: require('mongoose').Types.ObjectId.createFromHexString(cafeId) } },
-      { $group: { _id: null, firstDate: { $min: '$date' }, lastDate: { $max: '$date' } } },
-    ]);
 
     return res.status(200).json({
       success: true,
-      imported: result.imported,
-      skipped: result.skipped,
-      errors: result.errors,
-      total: result.imported + result.skipped + result.errors,
-      firstDate: dateRange[0]?.firstDate || null,
-      lastDate: dateRange[0]?.lastDate || null,
+      uploadId: uploadDoc._id,
+      posType,
+      columnMapping,
+      itemsMode,
+      headers,
+      preview: sampleRows,
+      needsConfirmation: posType !== 'yoco',
     });
   } catch (error) {
     next(error);
