@@ -5,6 +5,7 @@ const uploads = require('../controllers/uploads.controller');
 const router = express.Router();
 
 router.get('/', authMiddleware, uploads.list);
+router.get('/:id', authMiddleware, uploads.detail);
 router.post('/:id/confirm', authMiddleware, uploads.confirm);
 
 module.exports = router;

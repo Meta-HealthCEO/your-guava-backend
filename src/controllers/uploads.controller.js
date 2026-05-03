@@ -104,4 +104,19 @@ const list = async (req, res, next) => {
   }
 };
 
-module.exports = { confirm, list };
+const detail = async (req, res, next) => {
+  try {
+    const upload = await Upload.findOne({ _id: req.params.id, cafeId: req.user.cafeId })
+      .populate('uploadedBy', 'name email')
+      .lean();
+    if (!upload || upload.status === 'deleted') {
+      return res.status(404).json({ success: false, message: 'Upload not found' });
+    }
+    const downloadUrl = await r2.getSignedDownloadUrl(upload.r2Key, 900);
+    return res.status(200).json({ success: true, upload, downloadUrl });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { confirm, list, detail };

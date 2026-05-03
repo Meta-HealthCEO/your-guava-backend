@@ -113,4 +113,38 @@ describe('Uploads API', () => {
       expect(res.body.uploads).toHaveLength(0);
     });
   });
+
+  describe('GET /api/uploads/:id', () => {
+    it('returns the upload record with a signed download URL', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      const res = await request
+        .get(`/api/uploads/${stage.body.uploadId}`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.upload._id).toBe(stage.body.uploadId);
+      expect(res.body.upload.status).toBe('completed');
+      expect(res.body.downloadUrl).toMatch(/^https:\/\//);
+    });
+
+    it("returns 404 for another cafe's upload", async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      const other = await createTestUser({ email: 'c@yourguava.com', cafeName: 'Cafe C', orgName: 'Org C' });
+      const res = await request
+        .get(`/api/uploads/${stage.body.uploadId}`)
+        .set('Authorization', `Bearer ${other.token}`);
+      expect(res.status).toBe(404);
+    });
+  });
 });
