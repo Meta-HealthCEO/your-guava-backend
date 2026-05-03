@@ -8,29 +8,22 @@ const transactionSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
-    receiptId: {
-      type: String,
-      required: true,
-    },
-    date: {
-      type: Date,
-      required: true,
+    uploadId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Upload',
       index: true,
     },
-    hour: {
-      type: Number, // 0-23
-    },
-    dayOfWeek: {
-      type: Number, // 0=Sunday, 6=Saturday
-    },
+    receiptId: { type: String },
+    dedupKey: { type: String },
+    date: { type: Date, required: true, index: true },
+    hour: { type: Number },
+    dayOfWeek: { type: Number },
     status: {
       type: String,
       enum: ['approved', 'declined', 'error', 'aborted'],
       default: 'approved',
     },
-    paymentMethod: {
-      type: String,
-    },
+    paymentMethod: { type: String },
     items: [
       {
         name: { type: String, required: true },
@@ -38,17 +31,9 @@ const transactionSchema = new mongoose.Schema(
         unitPrice: { type: Number },
       },
     ],
-    total: {
-      type: Number,
-    },
-    tip: {
-      type: Number,
-      default: 0,
-    },
-    discount: {
-      type: Number,
-      default: 0,
-    },
+    total: { type: Number },
+    tip: { type: Number, default: 0 },
+    discount: { type: Number, default: 0 },
     source: {
       type: String,
       enum: ['csv', 'api', 'manual'],
@@ -58,9 +43,15 @@ const transactionSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Compound unique index to prevent duplicate imports
-transactionSchema.index({ cafeId: 1, receiptId: 1 }, { unique: true });
-// Query index for date range lookups
+// Sparse-unique compound indexes — at most one of receiptId/dedupKey should be set per row.
+transactionSchema.index(
+  { cafeId: 1, receiptId: 1 },
+  { unique: true, partialFilterExpression: { receiptId: { $type: 'string' } } }
+);
+transactionSchema.index(
+  { cafeId: 1, dedupKey: 1 },
+  { unique: true, partialFilterExpression: { dedupKey: { $type: 'string' } } }
+);
 transactionSchema.index({ cafeId: 1, date: -1 });
 
 module.exports = mongoose.model('Transaction', transactionSchema);
