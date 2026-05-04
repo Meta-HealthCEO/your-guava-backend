@@ -72,15 +72,31 @@ const exchangeCodeForTokens = async (code, providerExtras = {}) => {
   });
 
   const data = response.data;
+  const accessToken = data.access_token;
 
-  // Xero returns id_token but the tenant GUID is fetched separately via
-  // GET https://api.xero.com/connections — for now we accept it from the
-  // frontend via providerExtras.tenantId (set after the redirect).
+  // Fetch the tenant ID from the Xero connections endpoint.
+  // Xero does not include tenantId in the token response — it must be
+  // retrieved separately from GET https://api.xero.com/connections.
+  let tenantId = providerExtras.tenantId || null;
+  if (!tenantId) {
+    try {
+      const connectionsRes = await axios.get('https://api.xero.com/connections', {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const connections = connectionsRes.data;
+      if (Array.isArray(connections) && connections.length > 0) {
+        tenantId = connections[0].tenantId || null;
+      }
+    } catch (err) {
+      console.warn('[xero] Could not fetch tenantId from /connections:', err?.message);
+    }
+  }
+
   return {
-    accessToken: data.access_token,
+    accessToken,
     refreshToken: data.refresh_token,
     expiresIn: data.expires_in,
-    tenantId: providerExtras.tenantId || null,
+    tenantId,
   };
 };
 
