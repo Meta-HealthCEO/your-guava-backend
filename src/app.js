@@ -16,6 +16,9 @@ const staffRoutes = require('./routes/staff.routes');
 const shiftsRoutes = require('./routes/shifts.routes');
 const leaveRoutes = require('./routes/leave.routes');
 const uploadsRoutes = require('./routes/uploads.routes');
+const insightChatsRoutes = require('./routes/insightChats.routes');
+const accountRoutes = require('./routes/account.routes');
+const integrationsRoutes = require('./routes/integrations.routes');
 const errorMiddleware = require('./middleware/error.middleware');
 
 const app = express();
@@ -46,6 +49,9 @@ app.use('/api/staff', staffRoutes);
 app.use('/api/shifts', shiftsRoutes);
 app.use('/api/leave', leaveRoutes);
 app.use('/api/uploads', uploadsRoutes);
+app.use('/api/insight-chats', insightChatsRoutes);
+app.use('/api/account', accountRoutes);
+app.use('/api/integrations', integrationsRoutes);
 
 // Health check
 app.get('/api/health', (_req, res) => {

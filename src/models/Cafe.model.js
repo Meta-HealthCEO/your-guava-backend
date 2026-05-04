@@ -58,6 +58,41 @@ const cafeSchema = new mongoose.Schema(
     lastSyncAt: {
       type: Date,
     },
+    accountingIntegrations: {
+      xero: {
+        connected: { type: Boolean, default: false },
+        accessToken: { type: String },
+        refreshToken: { type: String },
+        tenantId: { type: String },
+        expiresAt: { type: Date },
+        connectedAt: { type: Date },
+        lastSyncAt: { type: Date },
+        lastSyncStatus: { type: String, enum: ['success', 'failed', null], default: null },
+        lastSyncError: { type: String },
+      },
+      quickbooks: {
+        connected: { type: Boolean, default: false },
+        accessToken: { type: String },
+        refreshToken: { type: String },
+        realmId: { type: String },
+        expiresAt: { type: Date },
+        connectedAt: { type: Date },
+        lastSyncAt: { type: Date },
+        lastSyncStatus: { type: String, enum: ['success', 'failed', null], default: null },
+        lastSyncError: { type: String },
+      },
+      sage: {
+        connected: { type: Boolean, default: false },
+        accessToken: { type: String },
+        refreshToken: { type: String },
+        businessId: { type: String },
+        expiresAt: { type: Date },
+        connectedAt: { type: Date },
+        lastSyncAt: { type: Date },
+        lastSyncStatus: { type: String, enum: ['success', 'failed', null], default: null },
+        lastSyncError: { type: String },
+      },
+    },
   },
   { timestamps: true }
 );

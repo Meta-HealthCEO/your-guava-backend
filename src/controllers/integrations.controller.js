@@ -1,0 +1,244 @@
+const Cafe = require('../models/Cafe.model');
+
+const xeroService = require('../services/integrations/xero.service');
+const quickbooksService = require('../services/integrations/quickbooks.service');
+const sageService = require('../services/integrations/sage.service');
+
+/** Map provider name → service module. Returns null for unknown providers. */
+const getService = (provider) => {
+  const services = {
+    xero: xeroService,
+    quickbooks: quickbooksService,
+    sage: sageService,
+  };
+  return services[provider] || null;
+};
+
+/**
+ * GET /api/integrations
+ * Returns connection status for all 3 providers. Tokens are never included.
+ */
+const list = async (req, res, next) => {
+  try {
+    const cafe = await Cafe.findById(req.user.cafeId).lean();
+    const providers = ['xero', 'quickbooks', 'sage'];
+    const status = {};
+    for (const p of providers) {
+      const integ = cafe?.accountingIntegrations?.[p] || {};
+      status[p] = {
+        connected: integ.connected || false,
+        connectedAt: integ.connectedAt || null,
+        lastSyncAt: integ.lastSyncAt || null,
+        lastSyncStatus: integ.lastSyncStatus || null,
+        lastSyncError: integ.lastSyncError || null,
+      };
+    }
+    return res.status(200).json({ success: true, data: status });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * GET /api/integrations/:provider/auth
+ * Returns the provider's OAuth authorize URL. The frontend should redirect
+ * the user to this URL to begin the OAuth flow.
+ */
+const getAuthUrl = async (req, res, next) => {
+  try {
+    const { provider } = req.params;
+    const service = getService(provider);
+    if (!service) return res.status(400).json({ success: false, message: 'Unknown provider' });
+
+    // Encode cafeId + provider in state so the callback can validate the origin
+    const state = Buffer.from(
+      JSON.stringify({ cafeId: req.user.cafeId, provider })
+    ).toString('base64url');
+
+    const url = service.buildAuthorizeUrl(state);
+    return res.status(200).json({ success: true, url });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * POST /api/integrations/:provider/callback
+ * Body: { code, state, [tenantId|realmId|businessId] }
+ *
+ * The frontend calls this after the provider redirects back with an auth code.
+ * We exchange the code for tokens and store them on the cafe document.
+ *
+ * Xero note: the tenantId (Xero org GUID) is obtained by the frontend after
+ * the redirect by calling GET https://api.xero.com/connections with the new
+ * access token, then passed back here.
+ *
+ * QuickBooks note: Intuit appends `realmId` to the redirect URL as a query
+ * param — the frontend must extract it and pass it in this request body.
+ *
+ * Sage note: the businessId can be fetched from
+ * GET https://api.accounting.sage.com/v3.1/business after token exchange.
+ */
+const callback = async (req, res, next) => {
+  try {
+    const { provider } = req.params;
+    const { code, state, ...providerExtras } = req.body;
+    const service = getService(provider);
+    if (!service) return res.status(400).json({ success: false, message: 'Unknown provider' });
+
+    // Verify state contains this user's cafeId to prevent CSRF
+    let stateData;
+    try {
+      stateData = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
+    } catch {
+      return res.status(400).json({ success: false, message: 'Invalid state' });
+    }
+    if (stateData.cafeId !== req.user.cafeId.toString()) {
+      return res.status(403).json({ success: false, message: 'State mismatch' });
+    }
+
+    const tokens = await service.exchangeCodeForTokens(code, providerExtras);
+    const expiresAt = new Date(Date.now() + (tokens.expiresIn || 1800) * 1000);
+
+    const update = {
+      [`accountingIntegrations.${provider}.connected`]: true,
+      [`accountingIntegrations.${provider}.accessToken`]: tokens.accessToken,
+      [`accountingIntegrations.${provider}.refreshToken`]: tokens.refreshToken,
+      [`accountingIntegrations.${provider}.expiresAt`]: expiresAt,
+      [`accountingIntegrations.${provider}.connectedAt`]: new Date(),
+    };
+    if (tokens.tenantId) update[`accountingIntegrations.${provider}.tenantId`] = tokens.tenantId;
+    if (tokens.realmId) update[`accountingIntegrations.${provider}.realmId`] = tokens.realmId;
+    if (tokens.businessId) update[`accountingIntegrations.${provider}.businessId`] = tokens.businessId;
+
+    await Cafe.findByIdAndUpdate(req.user.cafeId, { $set: update });
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ success: false, message: error.message || 'OAuth callback failed' });
+  }
+};
+
+/**
+ * POST /api/integrations/:provider/sync
+ * Aggregates the last 7 days of approved transactions and pushes a summary
+ * to the accounting provider. Token refresh is handled automatically.
+ */
+const sync = async (req, res, next) => {
+  try {
+    const { provider } = req.params;
+    const service = getService(provider);
+    if (!service) return res.status(400).json({ success: false, message: 'Unknown provider' });
+
+    const cafe = await Cafe.findById(req.user.cafeId);
+    const integ = cafe?.accountingIntegrations?.[provider];
+    if (!integ?.connected) {
+      return res.status(400).json({ success: false, message: 'Not connected' });
+    }
+
+    // Proactively refresh if the token is within 60 s of expiry
+    if (service.isTokenExpired(integ.expiresAt)) {
+      try {
+        const refreshed = await service.refreshAccessToken(integ.refreshToken);
+        const newExpiresAt = new Date(Date.now() + (refreshed.expiresIn || 1800) * 1000);
+        await Cafe.findByIdAndUpdate(req.user.cafeId, {
+          $set: {
+            [`accountingIntegrations.${provider}.accessToken`]: refreshed.accessToken,
+            [`accountingIntegrations.${provider}.refreshToken`]:
+              refreshed.refreshToken || integ.refreshToken,
+            [`accountingIntegrations.${provider}.expiresAt`]: newExpiresAt,
+          },
+        });
+        integ.accessToken = refreshed.accessToken;
+      } catch (err) {
+        return res
+          .status(401)
+          .json({ success: false, message: 'Token refresh failed: ' + err.message });
+      }
+    }
+
+    // Build last-7-days sales summary
+    const Transaction = require('../models/Transaction.model');
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    const txns = await Transaction.find({
+      cafeId: req.user.cafeId,
+      status: 'approved',
+      date: { $gte: sevenDaysAgo },
+    }).lean();
+
+    const summary = {
+      cafeName: cafe.name,
+      periodStart: sevenDaysAgo,
+      periodEnd: new Date(),
+      transactionCount: txns.length,
+      totalRevenue: txns.reduce((s, t) => s + (t.total || 0), 0),
+      totalTip: txns.reduce((s, t) => s + (t.tip || 0), 0),
+      itemBreakdown: {},
+    };
+
+    for (const tx of txns) {
+      for (const item of tx.items || []) {
+        summary.itemBreakdown[item.name] =
+          (summary.itemBreakdown[item.name] || 0) + (item.unitPrice || 0) * item.quantity;
+      }
+    }
+
+    const result = await service.pushSalesSummary(
+      { ...cafe.toObject(), accessToken: integ.accessToken },
+      summary
+    );
+
+    const updateFields = {
+      [`accountingIntegrations.${provider}.lastSyncAt`]: new Date(),
+      [`accountingIntegrations.${provider}.lastSyncStatus`]: result.ok ? 'success' : 'failed',
+      [`accountingIntegrations.${provider}.lastSyncError`]: result.ok
+        ? null
+        : result.error || 'Unknown error',
+    };
+    await Cafe.findByIdAndUpdate(req.user.cafeId, { $set: updateFields });
+
+    return res.status(result.ok ? 200 : 500).json({
+      success: result.ok,
+      providerRef: result.providerRef,
+      summary: {
+        ...summary,
+        periodStart: summary.periodStart.toISOString(),
+        periodEnd: summary.periodEnd.toISOString(),
+      },
+      message: result.ok
+        ? `Sales summary sent to ${provider}`
+        : `Sync failed: ${result.error}`,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/integrations/:provider/disconnect
+ * Clears stored tokens and marks the provider as disconnected.
+ */
+const disconnect = async (req, res, next) => {
+  try {
+    const { provider } = req.params;
+    if (!['xero', 'quickbooks', 'sage'].includes(provider)) {
+      return res.status(400).json({ success: false, message: 'Unknown provider' });
+    }
+    await Cafe.findByIdAndUpdate(req.user.cafeId, {
+      $set: {
+        [`accountingIntegrations.${provider}.connected`]: false,
+        [`accountingIntegrations.${provider}.accessToken`]: null,
+        [`accountingIntegrations.${provider}.refreshToken`]: null,
+        [`accountingIntegrations.${provider}.expiresAt`]: null,
+      },
+    });
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { list, getAuthUrl, callback, sync, disconnect };
