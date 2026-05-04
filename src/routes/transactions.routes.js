@@ -8,6 +8,7 @@ const {
   upload,
   getTransactions,
   getStats,
+  getDataStatus,
 } = require('../controllers/transactions.controller');
 
 // Ensure uploads directory exists
@@ -48,7 +49,8 @@ const multerUpload = multer({
 router.use(authMiddleware);
 
 router.post('/upload', multerUpload.single('file'), upload);
-router.get('/', getTransactions);
+router.get('/status', getDataStatus);
 router.get('/stats', getStats);
+router.get('/', getTransactions);
 
 module.exports = router;

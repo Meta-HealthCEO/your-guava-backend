@@ -205,4 +205,56 @@ const getStats = async (req, res, next) => {
   }
 };
 
-module.exports = { upload, getTransactions, getStats };
+const getDataStatus = async (req, res, next) => {
+  try {
+    const cafeId = req.user.cafeId;
+
+    // Find the latest transaction date (most recent data the user has)
+    const latest = await Transaction.findOne({ cafeId }).sort({ date: -1 }).select('date').lean();
+    const earliest = await Transaction.findOne({ cafeId }).sort({ date: 1 }).select('date').lean();
+    const totalCount = await Transaction.countDocuments({ cafeId });
+
+    // Coverage: count distinct dates with transactions in the last 30 days.
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setHours(0, 0, 0, 0);
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const coverage = await Transaction.aggregate([
+      { $match: { cafeId: new (require('mongoose')).Types.ObjectId(cafeId), date: { $gte: thirtyDaysAgo } } },
+      {
+        $group: {
+          _id: {
+            $dateToString: { format: '%Y-%m-%d', date: '$date' },
+          },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]);
+
+    // Number of days since latest data
+    let daysSinceLatest = null;
+    if (latest) {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const latestDay = new Date(latest.date);
+      latestDay.setHours(0, 0, 0, 0);
+      daysSinceLatest = Math.max(0, Math.floor((today - latestDay) / 86400000));
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        latestDataDate: latest?.date || null,
+        earliestDataDate: earliest?.date || null,
+        daysSinceLatest,
+        totalTransactions: totalCount,
+        coverage30d: coverage.map((c) => ({ date: c._id, count: c.count })),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { upload, getTransactions, getStats, getDataStatus };
