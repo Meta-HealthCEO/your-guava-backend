@@ -7,6 +7,7 @@ const {
   listTeam,
   removeMember,
   updateMemberCafes,
+  updateMember,
   switchCafe,
   addCafe,
 } = require('../controllers/team.controller');
@@ -20,6 +21,7 @@ router.post('/switch-cafe', switchCafe);
 router.get('/', ownerOnly, listTeam);
 router.post('/invite', ownerOnly, inviteManager);
 router.delete('/:userId', ownerOnly, removeMember);
+router.patch('/:userId', ownerOnly, updateMember);
 router.put('/:userId/cafes', ownerOnly, updateMemberCafes);
 router.post('/add-cafe', ownerOnly, addCafe);
 

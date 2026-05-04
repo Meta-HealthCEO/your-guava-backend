@@ -7,6 +7,8 @@ const {
   generate,
   getAccuracy,
   getInsights,
+  chatInsights,
+  streamChatInsights,
   getRecent,
 } = require('../controllers/forecasts.controller');
 
@@ -19,5 +21,7 @@ router.get('/recent', getRecent);
 router.post('/generate', generate);
 router.get('/accuracy', getAccuracy);
 router.get('/insights', getInsights);
+router.post('/insights/chat', chatInsights);
+router.post('/insights/chat/stream', streamChatInsights);
 
 module.exports = router;

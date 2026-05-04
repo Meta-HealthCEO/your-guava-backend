@@ -44,7 +44,7 @@ const list = async (req, res, next) => {
  * Returns the provider's OAuth authorize URL. The frontend should redirect
  * the user to this URL to begin the OAuth flow.
  */
-const getAuthUrl = async (req, res, next) => {
+const getAuthUrl = async (req, res, _next) => {
   try {
     const { provider } = req.params;
     const service = getService(provider);
@@ -79,7 +79,7 @@ const getAuthUrl = async (req, res, next) => {
  * Sage note: the businessId can be fetched from
  * GET https://api.accounting.sage.com/v3.1/business after token exchange.
  */
-const callback = async (req, res, next) => {
+const callback = async (req, res, _next) => {
   try {
     const { provider } = req.params;
     const { code, state, ...providerExtras } = req.body;

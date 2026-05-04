@@ -3,7 +3,12 @@ const {
   generateForecast,
   generateWeekForecast,
 } = require('../services/forecast.service');
-const { generateInsights } = require('../services/anthropic.service');
+const {
+  generateInsights,
+  generateBusinessChatResponse,
+  streamBusinessChatResponse,
+} = require('../services/anthropic.service');
+const { consumeAiCredits } = require('../services/aiUsage.service');
 
 const getToday = async (req, res, next) => {
   try {
@@ -106,6 +111,78 @@ const getInsights = async (req, res, next) => {
   }
 };
 
+const chatInsights = async (req, res, next) => {
+  try {
+    const cafeId = req.user.cafeId;
+    const orgId = req.user.orgId;
+    const { messages, question } = req.body;
+
+    const conversation = Array.isArray(messages)
+      ? messages
+      : question
+        ? [{ role: 'user', content: question }]
+        : [];
+
+    const aiCredits = process.env.ANTHROPIC_API_KEY
+      ? await consumeAiCredits(orgId, 1)
+      : null;
+    const result = await generateBusinessChatResponse({ cafeId, orgId, messages: conversation });
+    return res.status(200).json({ success: true, ...result, aiCredits });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const writeStreamEvent = (res, event, data) => {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+};
+
+const streamChatInsights = async (req, res, next) => {
+  try {
+    const cafeId = req.user.cafeId;
+    const orgId = req.user.orgId;
+    const { messages, question } = req.body;
+
+    const conversation = Array.isArray(messages)
+      ? messages
+      : question
+        ? [{ role: 'user', content: question }]
+        : [];
+
+    const aiCredits = process.env.ANTHROPIC_API_KEY
+      ? await consumeAiCredits(orgId, 1)
+      : null;
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+
+    const result = await streamBusinessChatResponse({
+      cafeId,
+      orgId,
+      messages: conversation,
+      onDelta: (text) => writeStreamEvent(res, 'delta', { text }),
+    });
+
+    writeStreamEvent(res, 'done', {
+      generatedAt: result.generatedAt,
+      contextStats: result.contextStats,
+      aiCredits,
+    });
+    res.end();
+  } catch (error) {
+    if (res.headersSent) {
+      writeStreamEvent(res, 'error', { message: error.message || 'AI chat failed' });
+      return res.end();
+    }
+    return next(error);
+  }
+};
+
 const getTomorrow = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
@@ -146,4 +223,14 @@ const getRecent = async (req, res, next) => {
   }
 };
 
-module.exports = { getToday, getTomorrow, getWeek, generate, getAccuracy, getInsights, getRecent };
+module.exports = {
+  getToday,
+  getTomorrow,
+  getWeek,
+  generate,
+  getAccuracy,
+  getInsights,
+  chatInsights,
+  streamChatInsights,
+  getRecent,
+};

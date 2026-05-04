@@ -22,10 +22,10 @@ const AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2';
 const TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
 const SCOPES = 'com.intuit.quickbooks.accounting';
 
-const apiBase = (env) =>
-  env === 'production'
-    ? 'https://quickbooks.api.intuit.com/v3/company/'
-    : 'https://sandbox-quickbooks.api.intuit.com/v3/company/';
+// API base — used by pushSalesSummary when implemented:
+//   process.env.QUICKBOOKS_ENV === 'production'
+//     ? 'https://quickbooks.api.intuit.com/v3/company/'
+//     : 'https://sandbox-quickbooks.api.intuit.com/v3/company/'
 
 /** Return the OAuth 2 authorization URL. */
 const buildAuthorizeUrl = (state) => {
@@ -143,11 +143,10 @@ const isTokenExpired = (expiresAt) => {
  * The `cafe` object passed here will have `accessToken` and `realmId`
  * populated from the stored integration fields.
  */
-const pushSalesSummary = async (cafe, summaryData) => {
-  // TODO: push to QuickBooks — POST /salesreceipt or /invoice
+const pushSalesSummary = async (_cafe, summaryData) => {
+  // TODO: push to QuickBooks — POST {apiBase}/v3/company/{realmId}/salesreceipt
   // Doc: https://developer.intuit.com/app/developer/qbo/docs/api/accounting/all-entities/salesreceipt
-  const env = process.env.QUICKBOOKS_ENV || 'sandbox';
-  const base = apiBase(env); // eslint-disable-line no-unused-vars — used when real implementation replaces this stub
+  // When implementing: use _cafe.accessToken + _cafe.realmId; pick apiBase via process.env.QUICKBOOKS_ENV.
   console.log('[quickbooks] would push sales summary:', summaryData);
   return { ok: true, providerRef: 'stub-quickbooks-' + Date.now() };
 };

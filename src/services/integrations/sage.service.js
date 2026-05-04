@@ -134,9 +134,10 @@ const isTokenExpired = (expiresAt) => {
  * The `cafe` object passed here will have `accessToken` and `businessId`
  * populated from the stored integration fields.
  */
-const pushSalesSummary = async (cafe, summaryData) => {
+const pushSalesSummary = async (_cafe, summaryData) => {
   // TODO: push to Sage — POST /sales_invoices or /sales_quick_entries
   // Doc: https://developer.sage.com/accounting/reference/sales-invoices/
+  // When implementing: use _cafe.accessToken + _cafe.businessId in the request headers.
   console.log('[sage] would push sales summary:', summaryData);
   return { ok: true, providerRef: 'stub-sage-' + Date.now() };
 };

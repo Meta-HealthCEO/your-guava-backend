@@ -1,8 +1,28 @@
+const jwt = require('jsonwebtoken');
 const User = require('../models/User.model');
 const Cafe = require('../models/Cafe.model');
 const Organization = require('../models/Organization.model');
+const { getPlan } = require('../services/billingPlans.service');
 
-// POST /api/team/invite — Owner invites a manager
+const buildSeatSummary = async (orgId) => {
+  const org = await Organization.findById(orgId).lean();
+  const used = await User.countDocuments({ orgId });
+  const plan = getPlan(org?.plan);
+  return {
+    plan: plan.id,
+    used,
+    included: plan.includedSeats,
+    remaining: Math.max(0, plan.includedSeats - used),
+  };
+};
+
+const validateCafeAccess = async (orgId, cafeIds = []) => {
+  const orgCafes = await Cafe.find({ orgId }).select('_id');
+  const orgCafeIds = orgCafes.map((cafe) => cafe._id.toString());
+  return cafeIds.filter((id) => orgCafeIds.includes(id));
+};
+
+// POST /api/team/invite - Owner adds a manager seat to the organisation.
 const inviteManager = async (req, res, next) => {
   try {
     const { email, name, password, cafeIds } = req.body;
@@ -11,28 +31,30 @@ const inviteManager = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Email, name, and password are required' });
     }
 
-    // Verify requester is owner
     const owner = await User.findById(req.user.id);
     if (!owner || owner.role !== 'owner') {
-      return res.status(403).json({ success: false, message: 'Only owners can invite managers' });
+      return res.status(403).json({ success: false, message: 'Only owners can add team members' });
     }
 
-    // Check email not taken
+    const seats = await buildSeatSummary(owner.orgId);
+    if (seats.remaining <= 0) {
+      return res.status(402).json({
+        success: false,
+        message: `Seat limit reached on the ${seats.plan} plan. Upgrade your plan or remove a member.`,
+        seats,
+      });
+    }
+
     const existing = await User.findOne({ email: email.toLowerCase().trim() });
     if (existing) {
       return res.status(409).json({ success: false, message: 'Email already registered' });
     }
 
-    // Validate cafeIds belong to owner's org
-    const orgCafes = await Cafe.find({ orgId: owner.orgId }).select('_id');
-    const orgCafeIds = orgCafes.map((c) => c._id.toString());
-    const validCafeIds = (cafeIds || []).filter((id) => orgCafeIds.includes(id));
-
+    const validCafeIds = await validateCafeAccess(owner.orgId, cafeIds || []);
     if (validCafeIds.length === 0) {
       return res.status(400).json({ success: false, message: 'At least one valid cafe must be assigned' });
     }
 
-    // Create manager user
     const manager = await User.create({
       email,
       name,
@@ -43,22 +65,26 @@ const inviteManager = async (req, res, next) => {
       activeCafeId: validCafeIds[0],
     });
 
+    const updatedSeats = await buildSeatSummary(owner.orgId);
+
     return res.status(201).json({
       success: true,
       manager: {
         id: manager._id,
+        _id: manager._id,
         email: manager.email,
         name: manager.name,
         role: manager.role,
         cafeIds: manager.cafeIds,
       },
+      seats: updatedSeats,
     });
   } catch (error) {
     next(error);
   }
 };
 
-// GET /api/team — List all team members in the org
+// GET /api/team - List all team members in the organisation.
 const listTeam = async (req, res, next) => {
   try {
     const user = await User.findById(req.user.id);
@@ -66,14 +92,15 @@ const listTeam = async (req, res, next) => {
       .select('name email role cafeIds activeCafeId createdAt')
       .populate('cafeIds', 'name')
       .lean();
+    const seats = await buildSeatSummary(user.orgId);
 
-    return res.status(200).json({ success: true, members });
+    return res.status(200).json({ success: true, members, seats });
   } catch (error) {
     next(error);
   }
 };
 
-// DELETE /api/team/:userId — Owner removes a manager
+// DELETE /api/team/:userId - Owner removes a manager from the organisation.
 const removeMember = async (req, res, next) => {
   try {
     const owner = await User.findById(req.user.id);
@@ -92,14 +119,15 @@ const removeMember = async (req, res, next) => {
     }
 
     await User.findByIdAndDelete(target._id);
+    const seats = await buildSeatSummary(owner.orgId);
 
-    return res.status(200).json({ success: true, message: 'Member removed' });
+    return res.status(200).json({ success: true, message: 'Member removed', seats });
   } catch (error) {
     next(error);
   }
 };
 
-// PUT /api/team/:userId/cafes — Owner updates a manager's cafe access
+// PUT /api/team/:userId/cafes - Owner updates a manager's cafe access.
 const updateMemberCafes = async (req, res, next) => {
   try {
     const { cafeIds } = req.body;
@@ -110,11 +138,7 @@ const updateMemberCafes = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    // Validate cafeIds belong to org
-    const orgCafes = await Cafe.find({ orgId: owner.orgId }).select('_id');
-    const orgCafeIds = orgCafes.map((c) => c._id.toString());
-    const validCafeIds = (cafeIds || []).filter((id) => orgCafeIds.includes(id));
-
+    const validCafeIds = await validateCafeAccess(owner.orgId, cafeIds || []);
     target.cafeIds = validCafeIds;
     if (!validCafeIds.includes(target.activeCafeId?.toString())) {
       target.activeCafeId = validCafeIds[0] || null;
@@ -127,7 +151,50 @@ const updateMemberCafes = async (req, res, next) => {
   }
 };
 
-// POST /api/team/switch-cafe — Switch active cafe
+// PATCH /api/team/:userId - Owner updates member profile and cafe access.
+const updateMember = async (req, res, next) => {
+  try {
+    const { name, cafeIds } = req.body;
+    const owner = await User.findById(req.user.id);
+    const target = await User.findById(req.params.userId);
+
+    if (!target || target.orgId.toString() !== owner.orgId.toString()) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    if (target.role === 'owner') {
+      return res.status(403).json({ success: false, message: 'Owner details must be changed from My Account' });
+    }
+
+    if (name && name.trim().length >= 2) {
+      target.name = name.trim();
+    }
+
+    if (Array.isArray(cafeIds)) {
+      const validCafeIds = await validateCafeAccess(owner.orgId, cafeIds);
+      if (validCafeIds.length === 0) {
+        return res.status(400).json({ success: false, message: 'At least one valid cafe must be assigned' });
+      }
+      target.cafeIds = validCafeIds;
+      if (!validCafeIds.includes(target.activeCafeId?.toString())) {
+        target.activeCafeId = validCafeIds[0];
+      }
+    }
+
+    await target.save();
+
+    const member = await User.findById(target._id)
+      .select('name email role cafeIds activeCafeId createdAt')
+      .populate('cafeIds', 'name')
+      .lean();
+
+    return res.status(200).json({ success: true, member });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /api/team/switch-cafe - Switch active cafe.
 const switchCafe = async (req, res, next) => {
   try {
     const { cafeId } = req.body;
@@ -140,12 +207,10 @@ const switchCafe = async (req, res, next) => {
     user.activeCafeId = cafeId;
     await user.save();
 
-    // Generate new tokens with updated cafeId
-    const jwt = require('jsonwebtoken');
     const accessToken = jwt.sign(
       {
         id: user._id,
-        cafeId: cafeId,
+        cafeId,
         role: user.role,
         orgId: user.orgId ? user.orgId.toString() : null,
       },
@@ -159,7 +224,7 @@ const switchCafe = async (req, res, next) => {
   }
 };
 
-// POST /api/team/add-cafe — Owner adds a new cafe to the org
+// POST /api/team/add-cafe - Owner adds a new cafe location to the organisation.
 const addCafe = async (req, res, next) => {
   try {
     const { name, address, city, lat, lng } = req.body;
@@ -169,13 +234,27 @@ const addCafe = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Cafe name is required' });
     }
 
+    const org = await Organization.findById(owner.orgId);
+    const plan = getPlan(org?.plan);
+    const locationCount = await Cafe.countDocuments({ orgId: owner.orgId });
+    if (locationCount >= plan.includedLocations) {
+      return res.status(402).json({
+        success: false,
+        message: `Location limit reached on the ${plan.name} plan. Upgrade your plan to add more cafes.`,
+        locations: {
+          used: locationCount,
+          included: plan.includedLocations,
+          remaining: 0,
+        },
+      });
+    }
+
     const cafe = await Cafe.create({
       name,
       orgId: owner.orgId,
       location: { address, city: city || 'Cape Town', lat, lng },
     });
 
-    // Add to owner's cafeIds
     owner.cafeIds.push(cafe._id);
     await owner.save();
 
@@ -185,4 +264,12 @@ const addCafe = async (req, res, next) => {
   }
 };
 
-module.exports = { inviteManager, listTeam, removeMember, updateMemberCafes, switchCafe, addCafe };
+module.exports = {
+  inviteManager,
+  listTeam,
+  removeMember,
+  updateMemberCafes,
+  updateMember,
+  switchCafe,
+  addCafe,
+};

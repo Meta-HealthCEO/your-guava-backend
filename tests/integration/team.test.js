@@ -57,6 +57,25 @@ describe('Team API', () => {
       expect(res.status).toBe(403);
       expect(res.body.success).toBe(false);
     });
+
+    it('blocks invites when plan seat limit is reached', async () => {
+      const cafeId = ownerUser.activeCafeId;
+
+      await createTestManager(ownerToken, [cafeId]);
+
+      const res = await request
+        .post('/api/team/invite')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({
+          name: 'Extra Manager',
+          email: 'extra@yourguava.com',
+          password: 'password123',
+          cafeIds: [cafeId],
+        });
+
+      expect(res.status).toBe(402);
+      expect(res.body.message).toMatch(/seat limit/i);
+    });
   });
 
   describe('GET /api/team', () => {

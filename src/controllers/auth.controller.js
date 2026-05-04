@@ -53,6 +53,7 @@ const register = async (req, res, next) => {
     const org = await Organization.create({
       name: orgName || `${name}'s Organization`,
       ownerId: user._id,
+      billingEmail: email,
     });
 
     // Create first cafe

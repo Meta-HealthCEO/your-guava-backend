@@ -76,6 +76,45 @@ describe('Forecasts API', () => {
     });
   });
 
+  describe('POST /api/forecasts/insights/chat', () => {
+    it('returns AI chat fallback when Anthropic key is missing', async () => {
+      const originalKey = process.env.ANTHROPIC_API_KEY;
+      delete process.env.ANTHROPIC_API_KEY;
+
+      const res = await request
+        .post('/api/forecasts/insights/chat')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ messages: [{ role: 'user', content: 'What should I prep tomorrow?' }] });
+
+      if (originalKey) process.env.ANTHROPIC_API_KEY = originalKey;
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.answer).toMatch(/API key/i);
+      expect(res.body.generatedAt).toBeDefined();
+    });
+  });
+
+  describe('POST /api/forecasts/insights/chat/stream', () => {
+    it('streams AI chat fallback events when Anthropic key is missing', async () => {
+      const originalKey = process.env.ANTHROPIC_API_KEY;
+      delete process.env.ANTHROPIC_API_KEY;
+
+      const res = await request
+        .post('/api/forecasts/insights/chat/stream')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ messages: [{ role: 'user', content: 'What should I prep tomorrow?' }] });
+
+      if (originalKey) process.env.ANTHROPIC_API_KEY = originalKey;
+
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toMatch(/text\/event-stream/);
+      expect(res.text).toContain('event: delta');
+      expect(res.text).toContain('AI chat requires');
+      expect(res.text).toContain('event: done');
+    });
+  });
+
   describe('GET /api/forecasts/accuracy', () => {
     it('returns accuracy data (empty when no historical forecasts)', async () => {
       const res = await request
