@@ -10,6 +10,11 @@ const {
 } = require('../services/anthropic.service');
 const { consumeAiCredits } = require('../services/aiUsage.service');
 
+const needsPlanningRefresh = (forecast) => {
+  if (!forecast) return true;
+  return (forecast.items || []).some((item) => item.actualQty != null);
+};
+
 const getToday = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
@@ -18,7 +23,7 @@ const getToday = async (req, res, next) => {
 
     let forecast = await Forecast.findOne({ cafeId, date: today });
 
-    if (!forecast) {
+    if (needsPlanningRefresh(forecast)) {
       forecast = await generateForecast(cafeId, today);
     }
 
@@ -43,7 +48,7 @@ const getWeek = async (req, res, next) => {
       date: { $gte: today, $lt: nextWeek },
     }).sort({ date: 1 });
 
-    if (existing.length === 7) {
+    if (existing.length === 7 && !existing.some(needsPlanningRefresh)) {
       return res.status(200).json({ success: true, forecasts: existing });
     }
 
@@ -81,9 +86,10 @@ const getAccuracy = async (req, res, next) => {
       cafeId,
       date: { $gte: thirtyDaysAgo, $lt: new Date() },
       accuracy: { $exists: true, $ne: null },
+      actualsUpdatedAt: { $exists: true, $ne: null },
     })
       .sort({ date: -1 })
-      .select('date accuracy totalPredictedRevenue')
+      .select('date accuracy totalPredictedRevenue actualRevenue actualTransactionCount actualsUpdatedAt')
       .lean();
 
     const avgAccuracy =
@@ -192,7 +198,7 @@ const getTomorrow = async (req, res, next) => {
 
     let forecast = await Forecast.findOne({ cafeId, date: tomorrow });
 
-    if (!forecast) {
+    if (needsPlanningRefresh(forecast)) {
       forecast = await generateForecast(cafeId, tomorrow);
     }
 
@@ -213,6 +219,11 @@ const getRecent = async (req, res, next) => {
     const forecasts = await Forecast.find({
       cafeId,
       date: { $gte: sevenDaysAgo, $lt: today },
+      $or: [
+        { actualsUpdatedAt: { $exists: true, $ne: null } },
+        { actualTransactionCount: { $gt: 0 } },
+        { accuracy: { $exists: true, $ne: null } },
+      ],
     })
       .sort({ date: 1 })
       .lean();

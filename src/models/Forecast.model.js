@@ -19,7 +19,7 @@ const forecastSchema = new mongoose.Schema(
       {
         itemName: { type: String },
         predictedQty: { type: Number },
-        actualQty: { type: Number, default: 0 },
+        actualQty: { type: Number },
         suggestedStock: { type: Number },
       },
     ],
@@ -39,8 +39,24 @@ const forecastSchema = new mongoose.Schema(
     totalPredictedRevenue: {
       type: Number,
     },
+    actualRevenue: {
+      type: Number,
+    },
+    actualTransactionCount: {
+      type: Number,
+    },
+    actualsUpdatedAt: {
+      type: Date,
+    },
     accuracy: {
       type: Number, // percentage, populated after actuals come in
+    },
+    trainingData: {
+      transactionCount: { type: Number, default: 0 },
+      firstTransactionDate: { type: Date },
+      lastTransactionDate: { type: Date },
+      weeksWithSales: { type: Number, default: 0 },
+      staleDays: { type: Number },
     },
   },
   { timestamps: true }

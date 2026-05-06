@@ -26,9 +26,11 @@ const API_BASE = 'https://api.accounting.sage.com/v3.1/';
 /** Return the OAuth 2 authorization URL. */
 const buildAuthorizeUrl = (state) => {
   const clientId = process.env.SAGE_CLIENT_ID;
+  const clientSecret = process.env.SAGE_CLIENT_SECRET;
   const redirectUri = process.env.SAGE_REDIRECT_URI;
 
   if (!clientId) throw new Error('SAGE_CLIENT_ID is not set — see docs/integrations.md');
+  if (!clientSecret) throw new Error('SAGE_CLIENT_SECRET is not set — see docs/integrations.md');
   if (!redirectUri) throw new Error('SAGE_REDIRECT_URI is not set — see docs/integrations.md');
 
   const params = new URLSearchParams({

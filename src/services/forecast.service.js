@@ -9,6 +9,7 @@ const { getWeatherForecast } = require('./weather.service');
 // Weighted moving average weights (most recent first)
 const WEIGHTS = [0.35, 0.25, 0.20]; // weeks 1, 2, 3
 // Remaining weight (0.20) is split evenly across weeks 4-8
+const MS_PER_DAY = 1000 * 60 * 60 * 24;
 
 /**
  * Applies a weather modifier to a predicted quantity based on item category and weather conditions.
@@ -216,6 +217,17 @@ const generateForecast = async (cafeId, targetDate) => {
     date: { $gte: eightWeeksAgo, $lt: target },
   }).lean();
 
+  const historyDates = transactions.map((tx) => new Date(tx.date));
+  const firstTransactionDate =
+    historyDates.length > 0 ? new Date(Math.min(...historyDates.map((date) => date.getTime()))) : undefined;
+  const lastTransactionDate =
+    historyDates.length > 0 ? new Date(Math.max(...historyDates.map((date) => date.getTime()))) : undefined;
+  const weeksWithSales = new Set(
+    historyDates.map((date) => Math.floor((target - date) / MS_PER_DAY / 7))
+  ).size;
+  const staleDays =
+    lastTransactionDate != null ? Math.max(0, Math.floor((target - lastTransactionDate) / MS_PER_DAY)) : undefined;
+
   // Get cafe location for weather
   const cafe = await Cafe.findById(cafeId).lean();
   const lat = cafe?.location?.lat || -33.9249; // Cape Town default
@@ -269,7 +281,6 @@ const generateForecast = async (cafeId, targetDate) => {
     forecastItems.push({
       itemName: name,
       predictedQty: finalQty,
-      actualQty: 0,
       suggestedStock: await computeSuggestedStock(cafeId, name, finalQty),
     });
   }
@@ -295,6 +306,19 @@ const generateForecast = async (cafeId, targetDate) => {
           events: events.map((e) => ({ name: e.name, impact: e.impact })),
         },
         totalPredictedRevenue: parseFloat(totalPredictedRevenue.toFixed(2)),
+        trainingData: {
+          transactionCount: transactions.length,
+          firstTransactionDate,
+          lastTransactionDate,
+          weeksWithSales,
+          staleDays,
+        },
+      },
+      $unset: {
+        accuracy: '',
+        actualRevenue: '',
+        actualTransactionCount: '',
+        actualsUpdatedAt: '',
       },
     },
     { upsert: true, new: true }
@@ -347,9 +371,24 @@ const updateForecastActuals = async (cafeId, date) => {
     date: { $gte: target, $lt: nextDay },
   }).lean();
 
+  if (transactions.length === 0) {
+    for (const fi of forecast.items) {
+      fi.actualQty = undefined;
+    }
+    forecast.accuracy = undefined;
+    forecast.actualRevenue = undefined;
+    forecast.actualTransactionCount = undefined;
+    forecast.actualsUpdatedAt = undefined;
+    forecast.markModified('items');
+    await forecast.save();
+    return forecast;
+  }
+
   // Sum actual quantities per item
   const actualMap = new Map();
+  let actualRevenue = 0;
   for (const tx of transactions) {
+    actualRevenue += tx.total || 0;
     for (const item of tx.items || []) {
       actualMap.set(item.name, (actualMap.get(item.name) || 0) + item.quantity);
     }
@@ -372,6 +411,9 @@ const updateForecastActuals = async (cafeId, date) => {
       : null;
 
   forecast.accuracy = accuracy !== null ? parseFloat(accuracy.toFixed(1)) : undefined;
+  forecast.actualRevenue = parseFloat(actualRevenue.toFixed(2));
+  forecast.actualTransactionCount = transactions.length;
+  forecast.actualsUpdatedAt = new Date();
   await forecast.save();
 
   return forecast;

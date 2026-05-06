@@ -1,11 +1,16 @@
 const supertest = require('supertest');
 const { setup, teardown, clearDB, createTestUser, createTestManager, app } = require('../setup');
+const User = require('../../src/models/User.model');
+const emailService = require('../../src/services/email.service');
 
 const request = supertest(app);
 
 beforeAll(setup);
 afterAll(teardown);
-afterEach(clearDB);
+afterEach(async () => {
+  jest.restoreAllMocks();
+  await clearDB();
+});
 
 describe('Team API', () => {
   let ownerToken;
@@ -20,6 +25,9 @@ describe('Team API', () => {
   describe('POST /api/team/invite', () => {
     it('owner invites a manager successfully', async () => {
       const cafeId = ownerUser.activeCafeId;
+      const inviteSpy = jest
+        .spyOn(emailService, 'sendTeamInviteEmail')
+        .mockResolvedValue({ sent: true });
 
       const res = await request
         .post('/api/team/invite')
@@ -36,6 +44,25 @@ describe('Team API', () => {
       expect(res.body.manager).toBeDefined();
       expect(res.body.manager.email).toBe('manager@yourguava.com');
       expect(res.body.manager.role).toBe('manager');
+      expect(inviteSpy).toHaveBeenCalledTimes(1);
+      expect(inviteSpy).toHaveBeenCalledWith({
+        manager: expect.objectContaining({
+          email: 'manager@yourguava.com',
+          name: 'New Manager',
+        }),
+        owner: expect.objectContaining({ email: 'test@yourguava.com' }),
+        cafes: expect.arrayContaining([expect.objectContaining({ name: 'Test Cafe' })]),
+        temporaryPassword: 'password123',
+      });
+
+      const persisted = await User.findOne({ email: 'manager@yourguava.com' });
+      expect(persisted).toBeTruthy();
+      expect(persisted.role).toBe('manager');
+      expect(persisted.orgId.toString()).toBe(ownerUser.orgId.toString());
+      expect(persisted.activeCafeId.toString()).toBe(cafeId.toString());
+      expect(persisted.cafeIds.map((id) => id.toString())).toEqual([cafeId.toString()]);
+      expect(persisted.password).not.toBe('password123');
+      await expect(persisted.comparePassword('password123')).resolves.toBe(true);
     });
 
     it('manager cannot invite (403)', async () => {

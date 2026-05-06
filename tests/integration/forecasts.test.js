@@ -127,26 +127,117 @@ describe('Forecasts API', () => {
   });
 
   describe('GET /api/forecasts/recent', () => {
-    it('returns forecasts from the past 7 days', async () => {
+    it('returns only past forecasts with matched actual sales data', async () => {
       const Forecast = require('../../src/models/Forecast.model');
       const Cafe = require('../../src/models/Cafe.model');
       const cafe = await Cafe.findOne({});
-      // Create one past forecast (3 days ago)
-      const date = new Date();
-      date.setDate(date.getDate() - 3);
-      date.setHours(0, 0, 0, 0);
+
+      const unfilledDate = new Date();
+      unfilledDate.setDate(unfilledDate.getDate() - 3);
+      unfilledDate.setHours(0, 0, 0, 0);
       await Forecast.create({
         cafeId: cafe._id,
-        date,
+        date: unfilledDate,
         generatedAt: new Date(),
-        items: [],
+        items: [{ itemName: 'Flat White', predictedQty: 3 }],
         signals: { weather: { temp: 20, condition: 'clear', humidity: 60 }, loadSheddingStage: 0, isPublicHoliday: false, isSchoolHoliday: false, isPayday: false, dayOfWeek: 0, events: [] },
         totalPredictedRevenue: 100,
+      });
+
+      const matchedDate = new Date();
+      matchedDate.setDate(matchedDate.getDate() - 2);
+      matchedDate.setHours(0, 0, 0, 0);
+      await Forecast.create({
+        cafeId: cafe._id,
+        date: matchedDate,
+        generatedAt: new Date(),
+        items: [{ itemName: 'Flat White', predictedQty: 3, actualQty: 2 }],
+        signals: { weather: { temp: 20, condition: 'clear', humidity: 60 }, loadSheddingStage: 0, isPublicHoliday: false, isSchoolHoliday: false, isPayday: false, dayOfWeek: 0, events: [] },
+        totalPredictedRevenue: 100,
+        actualRevenue: 75,
+        actualTransactionCount: 1,
+        actualsUpdatedAt: new Date(),
+        accuracy: 80,
       });
 
       const res = await request.get('/api/forecasts/recent').set('Authorization', `Bearer ${token}`);
       expect(res.status).toBe(200);
       expect(res.body.forecasts).toHaveLength(1);
+      expect(res.body.forecasts[0].actualRevenue).toBe(75);
+      expect(res.body.forecasts[0].items[0].actualQty).toBe(2);
+    });
+  });
+
+  describe('updateForecastActuals', () => {
+    it('leaves actuals empty when there are no transactions for that date', async () => {
+      const Forecast = require('../../src/models/Forecast.model');
+      const Cafe = require('../../src/models/Cafe.model');
+      const { updateForecastActuals } = require('../../src/services/forecast.service');
+      const cafe = await Cafe.findOne({});
+      const date = new Date();
+      date.setDate(date.getDate() - 1);
+      date.setHours(0, 0, 0, 0);
+
+      await Forecast.create({
+        cafeId: cafe._id,
+        date,
+        generatedAt: new Date(),
+        items: [{ itemName: 'Flat White', predictedQty: 3, actualQty: 0 }],
+        signals: { weather: { temp: 20, condition: 'clear', humidity: 60 }, loadSheddingStage: 0, isPublicHoliday: false, isSchoolHoliday: false, isPayday: false, dayOfWeek: 0, events: [] },
+        totalPredictedRevenue: 100,
+      });
+
+      const updated = await updateForecastActuals(cafe._id, date);
+      const json = updated.toObject();
+
+      expect(json.actualsUpdatedAt).toBeUndefined();
+      expect(json.actualRevenue).toBeUndefined();
+      expect(json.actualTransactionCount).toBeUndefined();
+      expect(json.accuracy).toBeUndefined();
+      expect(json.items[0].actualQty).toBeUndefined();
+    });
+
+    it('stores actual revenue and item quantities when transactions exist', async () => {
+      const Forecast = require('../../src/models/Forecast.model');
+      const Transaction = require('../../src/models/Transaction.model');
+      const Cafe = require('../../src/models/Cafe.model');
+      const { updateForecastActuals } = require('../../src/services/forecast.service');
+      const cafe = await Cafe.findOne({});
+      const date = new Date();
+      date.setDate(date.getDate() - 1);
+      date.setHours(0, 0, 0, 0);
+
+      await Forecast.create({
+        cafeId: cafe._id,
+        date,
+        generatedAt: new Date(),
+        items: [
+          { itemName: 'Flat White', predictedQty: 2 },
+          { itemName: 'Brownie', predictedQty: 1 },
+        ],
+        signals: { weather: { temp: 20, condition: 'clear', humidity: 60 }, loadSheddingStage: 0, isPublicHoliday: false, isSchoolHoliday: false, isPayday: false, dayOfWeek: 0, events: [] },
+        totalPredictedRevenue: 100,
+      });
+
+      await Transaction.create({
+        cafeId: cafe._id,
+        date,
+        hour: 9,
+        dayOfWeek: date.getDay(),
+        status: 'approved',
+        items: [{ name: 'Flat White', quantity: 2, unitPrice: 24 }],
+        total: 48,
+      });
+
+      const updated = await updateForecastActuals(cafe._id, date);
+      const json = updated.toObject();
+
+      expect(json.actualRevenue).toBe(48);
+      expect(json.actualTransactionCount).toBe(1);
+      expect(json.actualsUpdatedAt).toBeDefined();
+      expect(json.items.find((item) => item.itemName === 'Flat White').actualQty).toBe(2);
+      expect(json.items.find((item) => item.itemName === 'Brownie').actualQty).toBe(0);
+      expect(json.accuracy).toBe(50);
     });
   });
 });

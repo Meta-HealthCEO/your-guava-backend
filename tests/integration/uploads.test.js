@@ -282,17 +282,24 @@ describe('Uploads API', () => {
   });
 
   describe('Forecast invalidation', () => {
-    it('deletes cached forecasts on successful confirm', async () => {
+    it('preserves historical forecasts and refreshes planning forecasts on successful confirm', async () => {
       const Forecast = require('../../src/models/Forecast.model');
       // Get cafeId from the registered user
       const u = await createTestUser({ email: 'd@yourguava.com', cafeName: 'Cafe D', orgName: 'Org D' });
       const cafeId = u.user?.cafeIds?.[0];
       if (!cafeId) return; // skip if shape doesn't expose cafeId
 
-      // Pre-create a stale forecast for this cafe
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      yesterday.setHours(0, 0, 0, 0);
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours(0, 0, 0, 0);
+
+      // Historical forecasts are needed for predicted-vs-actual review.
       await Forecast.create({
         cafeId,
-        date: new Date(),
+        date: yesterday,
         generatedAt: new Date(),
         items: [],
         signals: {
@@ -304,11 +311,28 @@ describe('Uploads API', () => {
           dayOfWeek: 0,
           events: [],
         },
-        totalPredictedRevenue: 0,
+        totalPredictedRevenue: 123,
+      });
+
+      await Forecast.create({
+        cafeId,
+        date: tomorrow,
+        generatedAt: new Date(),
+        items: [],
+        signals: {
+          weather: { temp: 20, condition: 'clear', humidity: 60 },
+          loadSheddingStage: 0,
+          isPublicHoliday: false,
+          isSchoolHoliday: false,
+          isPayday: false,
+          dayOfWeek: 0,
+          events: [],
+        },
+        totalPredictedRevenue: 999999,
       });
 
       const stale = await Forecast.find({ cafeId }).lean();
-      expect(stale.length).toBeGreaterThan(0);
+      expect(stale.length).toBe(2);
 
       const stage = await request
         .post('/api/transactions/upload')
@@ -319,9 +343,10 @@ describe('Uploads API', () => {
         .set('Authorization', `Bearer ${u.token}`)
         .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
 
-      // After confirm, generateWeekForecast creates fresh forecasts (stale ones were deleted first)
       const after = await Forecast.find({ cafeId }).lean();
-      expect(after.length).toBeGreaterThanOrEqual(0);
+      expect(after.some((forecast) => forecast.date.getTime() === yesterday.getTime())).toBe(true);
+      expect(after.some((forecast) => forecast.totalPredictedRevenue === 999999)).toBe(false);
+      expect(after.length).toBeGreaterThanOrEqual(7);
     });
   });
 });

@@ -2,6 +2,7 @@ const jwt = require('jsonwebtoken');
 const User = require('../models/User.model');
 const Cafe = require('../models/Cafe.model');
 const Organization = require('../models/Organization.model');
+const emailService = require('../services/email.service');
 
 const COOKIE_OPTIONS = {
   httpOnly: true,
@@ -71,6 +72,8 @@ const register = async (req, res, next) => {
 
     user.refreshTokens.push({ token: refreshToken });
     await user.save();
+
+    await emailService.sendWelcomeEmail({ user, org, cafe });
 
     const cookieOptions = {
       ...COOKIE_OPTIONS,

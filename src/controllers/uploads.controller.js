@@ -8,6 +8,16 @@ const { updateForecastActuals, generateWeekForecast } = require('../services/for
 
 const REQUIRED = ['date', 'items', 'total'];
 
+const startOfToday = () => {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return today;
+};
+
+const invalidatePlanningForecasts = async (cafeId) => {
+  await Forecast.deleteMany({ cafeId, date: { $gte: startOfToday() } });
+};
+
 const fillActualsForRange = async (cafeId, dateRange) => {
   if (!dateRange?.firstDate || !dateRange?.lastDate) return;
   const start = new Date(dateRange.firstDate);
@@ -79,8 +89,9 @@ const confirm = async (req, res, next) => {
       upload.completedAt = new Date();
       await upload.save();
 
-      // Invalidate cached forecasts so they regenerate with fresh data
-      await Forecast.deleteMany({ cafeId });
+      // Invalidate planning forecasts so they regenerate with fresh data.
+      // Keep historical forecasts so imported actuals can be matched to the original predictions.
+      await invalidatePlanningForecasts(cafeId);
 
       // Re-generate fresh forecasts for the next 7 days using the new data,
       // and back-fill actuals for any forecast dates the upload covers.
@@ -242,8 +253,9 @@ const remap = async (req, res, next) => {
       upload.errorMessage = undefined;
       await upload.save();
 
-      // Invalidate cached forecasts so they regenerate with fresh data
-      await Forecast.deleteMany({ cafeId });
+      // Invalidate planning forecasts so they regenerate with fresh data.
+      // Keep historical forecasts so imported actuals can be matched to the original predictions.
+      await invalidatePlanningForecasts(cafeId);
 
       // Re-generate fresh forecasts for the next 7 days using the new data,
       // and back-fill actuals for any forecast dates the upload covers.
@@ -275,8 +287,10 @@ const remove = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Upload not found' });
     }
 
+    const dateRange = upload.dateRange;
     await Transaction.deleteMany({ cafeId, uploadId: upload._id });
-    await Forecast.deleteMany({ cafeId });
+    await invalidatePlanningForecasts(cafeId);
+    await fillActualsForRange(cafeId, dateRange);
     try { await r2.deleteFile(upload.r2Key); } catch (err) {
       console.error('[uploads] r2 delete failed:', err.message);
     }

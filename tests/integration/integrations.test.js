@@ -41,7 +41,7 @@ describe('Integrations API', () => {
     expect(res.body.data.sage.connected).toBe(false);
   });
 
-  it('GET /api/integrations/:provider/auth returns 500 with clear error when env vars missing', async () => {
+  it('GET /api/integrations/:provider/auth returns 503 with clear error when env vars missing', async () => {
     // Ensure env vars are absent
     const savedId = process.env.XERO_CLIENT_ID;
     delete process.env.XERO_CLIENT_ID;
@@ -50,7 +50,8 @@ describe('Integrations API', () => {
       .get('/api/integrations/xero/auth')
       .set('Authorization', `Bearer ${token}`);
 
-    expect(res.status).toBe(500);
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe('INTEGRATION_NOT_CONFIGURED');
     expect(res.body.message).toMatch(/XERO_CLIENT_ID/);
 
     if (savedId) process.env.XERO_CLIENT_ID = savedId;

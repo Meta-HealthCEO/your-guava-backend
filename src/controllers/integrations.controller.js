@@ -14,6 +14,9 @@ const getService = (provider) => {
   return services[provider] || null;
 };
 
+const isConfigError = (error) =>
+  /CLIENT_ID|CLIENT_SECRET|REDIRECT_URI|is not set/i.test(error?.message || '');
+
 /**
  * GET /api/integrations
  * Returns connection status for all 3 providers. Tokens are never included.
@@ -58,7 +61,11 @@ const getAuthUrl = async (req, res, _next) => {
     const url = service.buildAuthorizeUrl(state);
     return res.status(200).json({ success: true, url });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    return res.status(isConfigError(error) ? 503 : 500).json({
+      success: false,
+      code: isConfigError(error) ? 'INTEGRATION_NOT_CONFIGURED' : 'INTEGRATION_AUTH_URL_FAILED',
+      message: error.message,
+    });
   }
 };
 

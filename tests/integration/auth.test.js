@@ -1,15 +1,23 @@
 const supertest = require('supertest');
 const { setup, teardown, clearDB, app } = require('../setup');
+const emailService = require('../../src/services/email.service');
 
 const request = supertest(app);
 
 beforeAll(setup);
 afterAll(teardown);
-afterEach(clearDB);
+afterEach(async () => {
+  jest.restoreAllMocks();
+  await clearDB();
+});
 
 describe('Auth API', () => {
   describe('POST /api/auth/register', () => {
     it('creates user, org, and cafe, returns token', async () => {
+      const welcomeSpy = jest
+        .spyOn(emailService, 'sendWelcomeEmail')
+        .mockResolvedValue({ sent: true });
+
       const res = await request.post('/api/auth/register').send({
         name: 'Test Owner',
         email: 'test@yourguava.com',
@@ -27,6 +35,15 @@ describe('Auth API', () => {
       expect(res.body.user.role).toBe('owner');
       expect(res.body.user.orgId).toBeDefined();
       expect(res.body.user.activeCafeId).toBeDefined();
+      expect(welcomeSpy).toHaveBeenCalledTimes(1);
+      expect(welcomeSpy).toHaveBeenCalledWith({
+        user: expect.objectContaining({
+          email: 'test@yourguava.com',
+          name: 'Test Owner',
+        }),
+        org: expect.objectContaining({ name: 'Test Org' }),
+        cafe: expect.objectContaining({ name: 'Test Cafe' }),
+      });
     });
 
     it('returns 409 for duplicate email', async () => {

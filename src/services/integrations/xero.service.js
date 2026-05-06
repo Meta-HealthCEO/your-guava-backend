@@ -27,9 +27,11 @@ const SCOPES = 'openid profile email accounting.transactions accounting.contacts
  *  the backend uses to match the callback to the originating cafe. */
 const buildAuthorizeUrl = (state) => {
   const clientId = process.env.XERO_CLIENT_ID;
+  const clientSecret = process.env.XERO_CLIENT_SECRET;
   const redirectUri = process.env.XERO_REDIRECT_URI;
 
   if (!clientId) throw new Error('XERO_CLIENT_ID is not set — see docs/integrations.md');
+  if (!clientSecret) throw new Error('XERO_CLIENT_SECRET is not set — see docs/integrations.md');
   if (!redirectUri) throw new Error('XERO_REDIRECT_URI is not set — see docs/integrations.md');
 
   const params = new URLSearchParams({

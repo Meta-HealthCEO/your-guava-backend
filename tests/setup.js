@@ -7,6 +7,9 @@ process.env.JWT_REFRESH_SECRET = 'test-jwt-refresh-secret-key-12345';
 process.env.JWT_EXPIRES_IN = '15m';
 process.env.JWT_REFRESH_EXPIRES_IN = '7d';
 process.env.NODE_ENV = 'test';
+delete process.env.RESEND_API_KEY;
+delete process.env.RESEND_FROM_EMAIL;
+delete process.env.RESEND_REPLY_TO;
 
 const app = require('../src/app');
 

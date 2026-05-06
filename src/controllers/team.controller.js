@@ -3,6 +3,7 @@ const User = require('../models/User.model');
 const Cafe = require('../models/Cafe.model');
 const Organization = require('../models/Organization.model');
 const { getPlan } = require('../services/billingPlans.service');
+const emailService = require('../services/email.service');
 
 const buildSeatSummary = async (orgId) => {
   const org = await Organization.findById(orgId).lean();
@@ -63,6 +64,14 @@ const inviteManager = async (req, res, next) => {
       orgId: owner.orgId,
       cafeIds: validCafeIds,
       activeCafeId: validCafeIds[0],
+    });
+
+    const assignedCafes = await Cafe.find({ _id: { $in: validCafeIds } }).select('name').lean();
+    await emailService.sendTeamInviteEmail({
+      manager,
+      owner,
+      cafes: assignedCafes,
+      temporaryPassword: password,
     });
 
     const updatedSeats = await buildSeatSummary(owner.orgId);
