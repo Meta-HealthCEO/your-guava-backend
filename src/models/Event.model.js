@@ -17,10 +17,31 @@ const eventSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    type: {
+      type: String,
+      enum: ['event', 'closure', 'partial_closure'],
+      default: 'event',
+      index: true,
+    },
+    closureWindow: {
+      type: new mongoose.Schema(
+        {
+          startTime: { type: String },
+          endTime: { type: String },
+        },
+        { _id: false }
+      ),
+      default: undefined,
+    },
     impact: {
       type: String,
       enum: ['low', 'medium', 'high'],
       default: 'medium',
+    },
+    impactPct: {
+      type: Number,
+      min: -90,
+      max: 200,
     },
     notes: {
       type: String,

@@ -9,29 +9,46 @@ const DEFAULT_WEATHER = {
   condition: 'Clear',
   humidity: 60,
   isRain: false,
+  precipMm: 0,
+  chanceOfRain: 0,
 };
 
+const toDateKey = (date) => {
+  const d = new Date(date);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+const startOfDay = (date) => {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
+
+const isPastDate = (date) => startOfDay(date).getTime() < startOfDay(new Date()).getTime();
+
 /**
- * Fetches the weather forecast for a given lat/lng and date.
- * Uses WeatherAPI.com /forecast.json endpoint (up to 7 days ahead).
+ * Fetches the weather forecast/history for a given lat/lng and date.
+ * Uses WeatherAPI.com /history.json for past dates and /forecast.json otherwise.
  * Falls back to defaults on any error.
  *
  * @param {number} lat
  * @param {number} lng
  * @param {Date|string} date
- * @returns {Promise<{ temp: number, condition: string, humidity: number, isRain: boolean }>}
+ * @returns {Promise<{ temp: number, condition: string, humidity: number, isRain: boolean, precipMm: number, chanceOfRain: number }>}
  */
 const getWeatherForecast = async (lat, lng, date) => {
   const apiKey = process.env.WEATHER_API_KEY;
   const baseUrl = process.env.WEATHER_API_URL;
 
   if (!apiKey || !baseUrl) {
-    console.warn('[weather] WEATHER_API_KEY or WEATHER_API_URL not set, using defaults');
+    if (process.env.NODE_ENV !== 'test') {
+      console.warn('[weather] WEATHER_API_KEY or WEATHER_API_URL not set, using defaults');
+    }
     return { ...DEFAULT_WEATHER };
   }
 
   const targetDate = new Date(date);
-  const dateStr = targetDate.toISOString().split('T')[0]; // YYYY-MM-DD
+  const dateStr = toDateKey(targetDate);
   const cacheKey = `${lat},${lng},${dateStr}`;
 
   const cached = weatherCache.get(cacheKey);
@@ -40,12 +57,19 @@ const getWeatherForecast = async (lat, lng, date) => {
   }
 
   try {
-    const response = await axios.get(`${baseUrl}/forecast.json`, {
-      params: {
-        key: apiKey,
-        q: `${lat},${lng}`,
-        days: 7,
-      },
+    const useHistory = isPastDate(targetDate);
+    const response = await axios.get(`${baseUrl}/${useHistory ? 'history.json' : 'forecast.json'}`, {
+      params: useHistory
+        ? {
+            key: apiKey,
+            q: `${lat},${lng}`,
+            dt: dateStr,
+          }
+        : {
+            key: apiKey,
+            q: `${lat},${lng}`,
+            days: 7,
+          },
       timeout: 8000,
     });
 
@@ -60,13 +84,17 @@ const getWeatherForecast = async (lat, lng, date) => {
     const conditionText = day.condition?.text || 'Clear';
     const isRain = conditionText.toLowerCase().includes('rain') ||
       conditionText.toLowerCase().includes('drizzle') ||
-      conditionText.toLowerCase().includes('shower');
+      conditionText.toLowerCase().includes('shower') ||
+      Number(day.totalprecip_mm || 0) > 0 ||
+      Number(day.daily_chance_of_rain || 0) >= 50;
 
     const result = {
       temp: day.avgtemp_c ?? DEFAULT_WEATHER.temp,
       condition: conditionText,
       humidity: day.avghumidity ?? DEFAULT_WEATHER.humidity,
       isRain,
+      precipMm: Number(day.totalprecip_mm ?? DEFAULT_WEATHER.precipMm),
+      chanceOfRain: Number(day.daily_chance_of_rain ?? DEFAULT_WEATHER.chanceOfRain),
     };
 
     weatherCache.set(cacheKey, { data: result, fetchedAt: Date.now() });

@@ -13,7 +13,12 @@ const cafeSchema = new mongoose.Schema(
     },
     location: {
       address: { type: String },
+      addressLine2: { type: String },
+      suburb: { type: String },
       city: { type: String, default: 'Cape Town' },
+      postalCode: { type: String },
+      province: { type: String },
+      country: { type: String, default: 'South Africa' },
       lat: { type: Number },
       lng: { type: Number },
     },
@@ -31,6 +36,20 @@ const cafeSchema = new mongoose.Schema(
     timezone: {
       type: String,
       default: 'Africa/Johannesburg',
+    },
+    tradingHours: {
+      type: [
+        new mongoose.Schema(
+          {
+            dayOfWeek: { type: Number, required: true, min: 0, max: 6 },
+            isOpen: { type: Boolean, default: true },
+            openTime: { type: String, default: '07:00' },
+            closeTime: { type: String, default: '17:00' },
+          },
+          { _id: false }
+        ),
+      ],
+      default: undefined,
     },
     dataUploaded: {
       type: Boolean,
@@ -53,6 +72,10 @@ const cafeSchema = new mongoose.Schema(
         },
         { _id: false }
       ),
+      default: undefined,
+    },
+    forecastSettings: {
+      type: mongoose.Schema.Types.Mixed,
       default: undefined,
     },
     lastSyncAt: {

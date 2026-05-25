@@ -38,9 +38,10 @@ const organizationSchema = new mongoose.Schema(
       brand: { type: String, default: 'visa' },
       last4: { type: String, default: '4242' },
       expiresAt: { type: String, default: '12/30' },
+      provider: { type: String, default: 'mock' },
     },
     aiCredits: {
-      included: { type: Number, default: 150 },
+      included: { type: Number, default: 400 },
       bonus: { type: Number, default: 0 },
       used: { type: Number, default: 0 },
       resetAt: {

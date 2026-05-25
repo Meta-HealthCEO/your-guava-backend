@@ -2,19 +2,26 @@ const express = require('express');
 const authMiddleware = require('../middleware/auth.middleware');
 const { ownerOnly } = require('../middleware/rbac.middleware');
 const {
+  checkout,
   getAccount,
+  getPaymentStatus,
+  handleOneGateReturn,
+  handleOneGateWebhook,
   updateProfile,
-  mockCheckout,
   buyAiCredits,
 } = require('../controllers/account.controller');
 
 const router = express.Router();
 
+router.post('/payments/onegate/notify', handleOneGateWebhook);
+router.get('/payments/onegate/return', handleOneGateReturn);
+
 router.use(authMiddleware);
 
 router.get('/', getAccount);
 router.patch('/profile', updateProfile);
-router.post('/checkout', ownerOnly, mockCheckout);
+router.post('/checkout', ownerOnly, checkout);
 router.post('/ai-credits', ownerOnly, buyAiCredits);
+router.get('/payments/:reference', getPaymentStatus);
 
 module.exports = router;

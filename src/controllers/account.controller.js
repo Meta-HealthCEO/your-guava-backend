@@ -7,7 +7,18 @@ const {
   normalisePlanId,
   nextCreditResetDate,
 } = require('../services/billingPlans.service');
-const { creditSnapshot, ensureFreshCreditWindow } = require('../services/aiUsage.service');
+const {
+  createHostedPaymentSession,
+  getCreditPack,
+  invalidateFutureForecastsForOrg,
+  reconcileOneGatePayment,
+} = require('../services/billingPayments.service');
+const {
+  creditSnapshot,
+  ensureFreshCreditWindow,
+  usageSummary,
+} = require('../services/usage.service');
+const oneGate = require('../services/onegate.service');
 
 const buildAccountPayload = async (userId) => {
   const user = await User.findById(userId).select('-password -refreshTokens').lean();
@@ -34,6 +45,7 @@ const buildAccountPayload = async (userId) => {
 
   const plan = getPlan(org.plan);
   const credits = creditSnapshot(org);
+  const usageLedger = await usageSummary(org._id);
 
   return {
     user: {
@@ -69,6 +81,8 @@ const buildAccountPayload = async (userId) => {
         remaining: Math.max(0, plan.includedLocations - locationCount),
       },
       aiCredits: credits,
+      guavaCredits: credits,
+      creditLedger: usageLedger,
     },
     plans: getPlans(),
   };
@@ -109,7 +123,44 @@ const updateProfile = async (req, res, next) => {
   }
 };
 
-const mockCheckout = async (req, res, next) => {
+const mockCheckout = async ({ req, org, selectedPlan, billingCycle, paymentMethod }) => {
+  const planChanged = org.plan !== selectedPlan.id;
+  org.plan = selectedPlan.id;
+  org.billingCycle = billingCycle === 'annual' ? 'annual' : 'monthly';
+  org.billingStatus = 'active';
+  org.mockCustomerId = org.mockCustomerId || `mock_cus_${org._id.toString().slice(-8)}`;
+  org.paymentMethod = {
+    brand: paymentMethod?.brand || 'visa',
+    last4: paymentMethod?.last4 || '4242',
+    expiresAt: paymentMethod?.expiresAt || '12/30',
+    provider: 'mock',
+  };
+  org.aiCredits = {
+    included: selectedPlan.includedGuavaCredits ?? selectedPlan.includedAiCredits,
+    bonus: org.aiCredits?.bonus || 0,
+    used: 0,
+    resetAt: nextCreditResetDate(),
+  };
+  await org.save();
+
+  if (planChanged) {
+    await invalidateFutureForecastsForOrg(org._id);
+  }
+
+  const account = await buildAccountPayload(req.user.id);
+  return {
+    checkout: {
+      provider: 'mock',
+      receiptId: `mock_rcpt_${Date.now()}`,
+      amount: org.billingCycle === 'annual' ? selectedPlan.priceAnnual : selectedPlan.priceMonthly,
+      currency: 'ZAR',
+      status: 'paid',
+    },
+    account,
+  };
+};
+
+const checkout = async (req, res, next) => {
   try {
     const { plan, billingCycle = 'monthly', paymentMethod } = req.body;
     const selectedPlan = getPlan(plan);
@@ -119,32 +170,45 @@ const mockCheckout = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Organization not found' });
     }
 
-    org.plan = selectedPlan.id;
-    org.billingCycle = billingCycle === 'annual' ? 'annual' : 'monthly';
-    org.billingStatus = 'active';
-    org.mockCustomerId = org.mockCustomerId || `mock_cus_${org._id.toString().slice(-8)}`;
-    org.paymentMethod = {
-      brand: paymentMethod?.brand || 'visa',
-      last4: paymentMethod?.last4 || '4242',
-      expiresAt: paymentMethod?.expiresAt || '12/30',
-    };
-    org.aiCredits = {
-      included: selectedPlan.includedAiCredits,
-      bonus: org.aiCredits?.bonus || 0,
-      used: 0,
-      resetAt: nextCreditResetDate(),
-    };
-    await org.save();
+    if (oneGate.isOneGateEnabled()) {
+      const cycle = billingCycle === 'annual' ? 'annual' : 'monthly';
+      const amount = cycle === 'annual' ? selectedPlan.priceAnnual : selectedPlan.priceMonthly;
+      const session = await createHostedPaymentSession({
+        org,
+        userId: req.user.id,
+        kind: 'plan',
+        plan: selectedPlan.id,
+        billingCycle: cycle,
+        amount,
+      });
 
-    const account = await buildAccountPayload(req.user.id);
+      const account = await buildAccountPayload(req.user.id);
+      return res.status(200).json({
+        success: true,
+        checkout: {
+          provider: 'onegate',
+          reference: session.reference,
+          paymentKey: session.providerPaymentKey,
+          redirectUrl: session.checkoutUrl,
+          amount: session.amount,
+          currency: session.currency,
+          status: session.status,
+        },
+        account,
+      });
+    }
+
+    const { checkout: mock, account } = await mockCheckout({
+      req,
+      org,
+      selectedPlan,
+      billingCycle,
+      paymentMethod,
+    });
+
     return res.status(200).json({
       success: true,
-      checkout: {
-        provider: 'mock',
-        receiptId: `mock_rcpt_${Date.now()}`,
-        amount: org.billingCycle === 'annual' ? selectedPlan.priceAnnual : selectedPlan.priceMonthly,
-        currency: 'ZAR',
-      },
+      checkout: mock,
       account,
     });
   } catch (error) {
@@ -155,15 +219,42 @@ const mockCheckout = async (req, res, next) => {
 const buyAiCredits = async (req, res, next) => {
   try {
     const { credits = 250 } = req.body;
-    const amount = Math.max(50, Math.min(Number(credits) || 250, 10000));
 
     const org = await Organization.findById(req.user.orgId);
     if (!org) {
       return res.status(404).json({ success: false, message: 'Organization not found' });
     }
 
+    const pack = getCreditPack(org, credits);
+
+    if (oneGate.isOneGateEnabled()) {
+      const session = await createHostedPaymentSession({
+        org,
+        userId: req.user.id,
+        kind: 'credits',
+        credits: pack.credits,
+        amount: pack.price,
+      });
+
+      const account = await buildAccountPayload(req.user.id);
+      return res.status(200).json({
+        success: true,
+        purchase: {
+          provider: 'onegate',
+          reference: session.reference,
+          paymentKey: session.providerPaymentKey,
+          redirectUrl: session.checkoutUrl,
+          credits: pack.credits,
+          amount: session.amount,
+          currency: session.currency,
+          status: session.status,
+        },
+        account,
+      });
+    }
+
     ensureFreshCreditWindow(org);
-    org.aiCredits.bonus = (org.aiCredits?.bonus || 0) + amount;
+    org.aiCredits.bonus = (org.aiCredits?.bonus || 0) + pack.credits;
     await org.save();
 
     const account = await buildAccountPayload(req.user.id);
@@ -171,9 +262,11 @@ const buyAiCredits = async (req, res, next) => {
       success: true,
       purchase: {
         provider: 'mock',
-        receiptId: `mock_ai_${Date.now()}`,
-        credits: amount,
+        receiptId: `mock_guava_${Date.now()}`,
+        credits: pack.credits,
+        amount: pack.price,
         currency: 'ZAR',
+        status: 'paid',
       },
       account,
     });
@@ -182,4 +275,74 @@ const buyAiCredits = async (req, res, next) => {
   }
 };
 
-module.exports = { getAccount, updateProfile, mockCheckout, buyAiCredits };
+const oneGateReferenceFromRequest = (req) =>
+  req.body?.merchant_reference || req.body?.reference || req.query?.reference;
+
+const handleOneGateWebhook = async (req, res, next) => {
+  try {
+    const reference = oneGateReferenceFromRequest(req);
+    if (!reference) {
+      return res.status(400).json({ success: false, message: 'Missing payment reference' });
+    }
+
+    await reconcileOneGatePayment(reference, req.body);
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    if (error.statusCode === 202) {
+      return res.status(202).json({ success: false, message: error.message });
+    }
+    next(error);
+  }
+};
+
+const handleOneGateReturn = async (req, res) => {
+  const reference = req.query.reference;
+  const requestedResult = req.query.result;
+  let status = requestedResult === 'cancel' ? 'cancelled' : 'pending';
+
+  if (reference) {
+    try {
+      const session = await reconcileOneGatePayment(reference);
+      status = session.status === 'paid' ? 'paid' : session.status;
+    } catch (_error) {
+      status = requestedResult === 'error' ? 'failed' : status;
+    }
+  }
+
+  return res.redirect(oneGate.hostedCheckoutReturnUrl(status, reference));
+};
+
+const getPaymentStatus = async (req, res, next) => {
+  try {
+    const { reference } = req.params;
+    const session = await reconcileOneGatePayment(reference).catch(async () => null);
+    if (!session || String(session.orgId) !== String(req.user.orgId)) {
+      return res.status(404).json({ success: false, message: 'Payment session not found' });
+    }
+
+    return res.status(200).json({
+      success: true,
+      payment: {
+        reference: session.reference,
+        provider: session.provider,
+        kind: session.kind,
+        status: session.status,
+        amount: session.amount,
+        currency: session.currency,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = {
+  buyAiCredits,
+  checkout,
+  getAccount,
+  getPaymentStatus,
+  handleOneGateReturn,
+  handleOneGateWebhook,
+  mockCheckout: checkout,
+  updateProfile,
+};

@@ -1,7 +1,10 @@
 const axios = require('axios');
 const Cafe = require('../models/Cafe.model');
 const Transaction = require('../models/Transaction.model');
-const Item = require('../models/Item.model');
+const {
+  rebuildItemsForCafe,
+  reconcileTransactionItems,
+} = require('./menuItems.service');
 
 // --- OAuth ---
 
@@ -136,7 +139,7 @@ async function fetchAllOrders(accessToken, startDate, endDate) {
 
 /**
  * Convert Yoco orders to Transaction documents and upsert them.
- * Also updates the Item catalog.
+ * Also updates menu item totals.
  * @param {string} cafeId
  * @param {object[]} orders – raw Yoco order objects
  * @returns {Promise<{imported: number, skipped: number, errors: number}>}
@@ -145,7 +148,6 @@ async function syncOrders(cafeId, orders) {
   let imported = 0;
   let skipped = 0;
   let errors = 0;
-  const itemNamesSeen = new Map();
 
   for (const order of orders) {
     try {
@@ -171,6 +173,7 @@ async function syncOrders(cafeId, orders) {
         skipped++;
         continue;
       }
+      const reconciledItems = await reconcileTransactionItems(cafeId, items);
 
       const total = order.amounts?.gross_amount ? order.amounts.gross_amount.amount / 100 : 0;
       const tip = order.amounts?.tip_amount ? order.amounts.tip_amount.amount / 100 : 0;
@@ -194,7 +197,7 @@ async function syncOrders(cafeId, orders) {
             dayOfWeek,
             status: 'approved',
             paymentMethod,
-            items,
+            items: reconciledItems,
             total,
             tip,
             discount,
@@ -209,14 +212,6 @@ async function syncOrders(cafeId, orders) {
       } else {
         skipped++;
       }
-
-      // Track items for catalog upsert
-      for (const item of items) {
-        const current = itemNamesSeen.get(item.name) || { totalQty: 0, totalRevenue: 0 };
-        current.totalQty += item.quantity;
-        current.totalRevenue += item.unitPrice * item.quantity;
-        itemNamesSeen.set(item.name, current);
-      }
     } catch (err) {
       if (err.code === 11000) {
         skipped++;
@@ -227,27 +222,7 @@ async function syncOrders(cafeId, orders) {
     }
   }
 
-  // Upsert Item catalog
-  for (const [name, stats] of itemNamesSeen.entries()) {
-    try {
-      await Item.findOneAndUpdate(
-        { cafeId, name },
-        {
-          $inc: { totalSold: stats.totalQty },
-          $set: {
-            avgPrice:
-              stats.totalQty > 0
-                ? parseFloat((stats.totalRevenue / stats.totalQty).toFixed(2))
-                : 0,
-          },
-          $setOnInsert: { cafeId, name },
-        },
-        { upsert: true, new: true }
-      );
-    } catch (err) {
-      console.error(`[yoco sync] Item upsert error for "${name}":`, err.message);
-    }
-  }
+  await rebuildItemsForCafe(cafeId);
 
   return { imported, skipped, errors };
 }

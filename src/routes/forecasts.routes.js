@@ -5,7 +5,10 @@ const {
   getToday,
   getWeek,
   generate,
+  getFactors,
+  updateFactors,
   getAccuracy,
+  getHistory,
   getInsights,
   chatInsights,
   streamChatInsights,
@@ -18,6 +21,9 @@ router.get('/today', getToday);
 router.get('/tomorrow', require('../controllers/forecasts.controller').getTomorrow);
 router.get('/week', getWeek);
 router.get('/recent', getRecent);
+router.get('/history', getHistory);
+router.get('/factors', getFactors);
+router.put('/factors', updateFactors);
 router.post('/generate', generate);
 router.get('/accuracy', getAccuracy);
 router.get('/insights', getInsights);

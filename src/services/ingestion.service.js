@@ -4,9 +4,12 @@ const csv = require('csv-parser');
 const { Readable } = require('stream');
 const XLSX = require('xlsx');
 const Transaction = require('../models/Transaction.model');
-const Item = require('../models/Item.model');
 const { parseBuffer } = require('./parser.service');
 const { computeDedupKey } = require('../utils/dedupKey');
+const {
+  rebuildItemsForCafe,
+  reconcileTransactionItems,
+} = require('./menuItems.service');
 
 const YOCO_HEADERS = [
   'Receipt', 'Date', 'Time', 'Status', 'Payment Method', 'Order Number',
@@ -107,8 +110,6 @@ const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
   let skipped = 0;
   let errors = parsed.errors;
 
-  const itemNamesSeen = new Map();
-
   for (const row of parsed.rows) {
     try {
       const status = (row.status || 'approved').toLowerCase();
@@ -134,6 +135,8 @@ const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
         continue;
       }
 
+      const reconciledItems = await reconcileTransactionItems(cafeId, row.items);
+
       await Transaction.create({
         cafeId,
         uploadId,
@@ -144,20 +147,13 @@ const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
         dayOfWeek: row.dayOfWeek,
         status: 'approved',
         paymentMethod: row.paymentMethod,
-        items: row.items,
+        items: reconciledItems,
         total: row.total,
         tip: row.tip,
         discount: row.discount,
         source: 'csv',
       });
       imported++;
-
-      for (const item of row.items) {
-        const cur = itemNamesSeen.get(item.name) || { totalQty: 0, totalRevenue: 0 };
-        cur.totalQty += item.quantity;
-        cur.totalRevenue += (item.unitPrice || 0) * item.quantity;
-        itemNamesSeen.set(item.name, cur);
-      }
     } catch (err) {
       if (err.code === 11000) {
         skipped++;
@@ -168,26 +164,7 @@ const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
     }
   }
 
-  // Item upserts
-  for (const [name, stats] of itemNamesSeen.entries()) {
-    try {
-      await Item.findOneAndUpdate(
-        { cafeId, name },
-        {
-          $inc: { totalSold: stats.totalQty },
-          $set: {
-            avgPrice: stats.totalQty > 0
-              ? parseFloat((stats.totalRevenue / stats.totalQty).toFixed(2))
-              : 0,
-          },
-          $setOnInsert: { cafeId, name },
-        },
-        { upsert: true, new: true }
-      );
-    } catch (err) {
-      console.error(`[ingestion] item upsert error "${name}":`, err.message);
-    }
-  }
+  await rebuildItemsForCafe(cafeId);
 
   return {
     imported,
@@ -238,5 +215,6 @@ module.exports = {
   yocoMapping,
   extractHeaders,
   previewBuffer,
+  rebuildItemsForCafe,
   parseYocoCSV,
 };

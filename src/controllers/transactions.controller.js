@@ -9,15 +9,41 @@ const ingestion = require('../services/ingestion.service');
 const { proposeColumnMapping } = require('../services/anthropic.service');
 
 const REQUIRED_UPLOAD_MAPPING = ['date', 'items', 'total'];
+const MIN_HEADER_COUNT = 2;
+
+const cleanupLocalFile = (filePath) => {
+  if (!filePath) return;
+  try { fs.unlinkSync(filePath); } catch {}
+};
+
+const cleanColumnMapping = (mapping = {}, headers = []) => {
+  const headerSet = new Set(headers);
+  const cleaned = {};
+  for (const [key, value] of Object.entries(mapping || {})) {
+    if (typeof value === 'string' && headerSet.has(value)) {
+      cleaned[key] = value;
+    }
+  }
+  return cleaned;
+};
+
+const hasRequiredHeaderMapping = (mapping = {}, headers = []) =>
+  REQUIRED_UPLOAD_MAPPING.every((field) => {
+    const mappedHeader = mapping?.[field];
+    return typeof mappedHeader === 'string' && headers.includes(mappedHeader);
+  });
 
 const upload = async (req, res, next) => {
+  let filePath;
+  let stagedR2Key = null;
+  let uploadDocCreated = false;
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
     const cafeId = req.user.cafeId;
     const userId = req.user.id;
-    const filePath = req.file.path;
+    filePath = req.file.path;
     const fileName = path.basename(req.file.originalname);
     const ext = path.extname(fileName).toLowerCase().slice(1);
     const buffer = fs.readFileSync(filePath);
@@ -25,14 +51,14 @@ const upload = async (req, res, next) => {
     // Validate size
     const maxBytes = parseInt(process.env.UPLOAD_MAX_BYTES || '10485760', 10);
     if (buffer.length > maxBytes) {
-      try { fs.unlinkSync(filePath); } catch {}
+      cleanupLocalFile(filePath);
       return res.status(400).json({ success: false, message: `File exceeds ${maxBytes} bytes` });
     }
 
     // Preview headers + sample rows
     const { headers, sampleRows } = await ingestion.previewBuffer(buffer, ext);
-    if (!headers || headers.length === 0) {
-      try { fs.unlinkSync(filePath); } catch {}
+    if (!headers || headers.length < MIN_HEADER_COUNT) {
+      cleanupLocalFile(filePath);
       return res.status(400).json({ success: false, message: 'Could not parse CSV headers' });
     }
 
@@ -40,31 +66,37 @@ const upload = async (req, res, next) => {
     const r2Key = `uploads/${cafeId}/${Date.now()}-${crypto.randomBytes(6).toString('hex')}-${fileName}`;
     try {
       await r2.uploadFile(buffer, r2Key, req.file.mimetype || 'text/csv');
+      stagedR2Key = r2Key;
     } catch (err) {
-      try { fs.unlinkSync(filePath); } catch {}
+      cleanupLocalFile(filePath);
       return res.status(503).json({ success: false, message: 'File storage unavailable, please retry' });
     }
-    try { fs.unlinkSync(filePath); } catch {}
+    cleanupLocalFile(filePath);
 
     // Detect format
     let posType, columnMapping, itemsMode;
-    if (ingestion.isYocoFormat(headers)) {
-      const y = ingestion.yocoMapping();
+    let usedSavedMapping = false;
+    const yoco = ingestion.yocoMapping();
+    if (ingestion.isYocoFormat(headers) && hasRequiredHeaderMapping(yoco.mapping, headers)) {
       posType = 'yoco';
-      columnMapping = y.mapping;
-      itemsMode = y.itemsMode;
+      columnMapping = cleanColumnMapping(yoco.mapping, headers);
+      itemsMode = yoco.itemsMode;
     } else {
       posType = 'wizard';
       // Try cafe-saved mapping first
       const cafe = await Cafe.findById(cafeId).lean();
       if (cafe?.savedColumnMapping) {
         const saved = cafe.savedColumnMapping;
-        columnMapping = { ...saved };
-        delete columnMapping.itemsMode;
+        columnMapping = cleanColumnMapping(saved, headers);
         itemsMode = saved.itemsMode || 'packed';
+        usedSavedMapping = true;
       } else {
-        const proposal = await proposeColumnMapping(headers, sampleRows);
-        columnMapping = proposal.mapping;
+        const proposal = await proposeColumnMapping(headers, sampleRows, {
+          orgId: req.user.orgId,
+          cafeId,
+          userId,
+        });
+        columnMapping = cleanColumnMapping(proposal.mapping, headers);
         itemsMode = proposal.itemsMode;
       }
     }
@@ -82,8 +114,9 @@ const upload = async (req, res, next) => {
       sampleRows,
       status: 'pending_mapping',
     });
+    uploadDocCreated = true;
 
-    const hasRequiredMapping = REQUIRED_UPLOAD_MAPPING.every((field) => Boolean(columnMapping?.[field]));
+    const hasRequiredMapping = hasRequiredHeaderMapping(columnMapping, headers);
 
     return res.status(200).json({
       success: true,
@@ -93,9 +126,13 @@ const upload = async (req, res, next) => {
       itemsMode,
       headers,
       preview: sampleRows,
-      needsConfirmation: posType !== 'yoco' && !hasRequiredMapping,
+      needsConfirmation: posType !== 'yoco' && !(usedSavedMapping && hasRequiredMapping),
     });
   } catch (error) {
+    cleanupLocalFile(filePath);
+    if (stagedR2Key && !uploadDocCreated) {
+      try { await r2.deleteFile(stagedR2Key); } catch {}
+    }
     next(error);
   }
 };
@@ -173,9 +210,12 @@ const getStats = async (req, res, next) => {
     const dates = transactions.map((tx) => new Date(tx.date).getTime());
     const firstDate = new Date(Math.min(...dates));
     const lastDate = new Date(Math.max(...dates));
-    const daysDiff =
-      Math.max((lastDate - firstDate) / (1000 * 60 * 60 * 24), 1);
-    const avgDailyRevenue = totalRevenue / daysDiff;
+    const firstDay = new Date(firstDate);
+    firstDay.setHours(0, 0, 0, 0);
+    const lastDay = new Date(lastDate);
+    lastDay.setHours(0, 0, 0, 0);
+    const dayCount = Math.max(Math.floor((lastDay - firstDay) / (1000 * 60 * 60 * 24)) + 1, 1);
+    const avgDailyRevenue = totalRevenue / dayCount;
 
     // Top 5 items
     const itemCounts = {};

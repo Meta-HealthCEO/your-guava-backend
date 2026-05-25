@@ -1,5 +1,143 @@
 const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction.model');
+const Cafe = require('../models/Cafe.model');
+const { isWeekdayHourOpen } = require('../utils/tradingHours');
+
+const DEFAULT_TIMEZONE = 'Africa/Johannesburg';
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+const safeTimezone = (timezone) => {
+  try {
+    Intl.DateTimeFormat('en-ZA', { timeZone: timezone }).format(new Date());
+    return timezone;
+  } catch {
+    return DEFAULT_TIMEZONE;
+  }
+};
+
+const getCafeTimezone = async (cafeId) => {
+  const cafe = await Cafe.findById(cafeId).select('timezone').lean();
+  return safeTimezone(cafe?.timezone || DEFAULT_TIMEZONE);
+};
+
+const getTimeZoneOffsetMs = (date, timezone) => {
+  const parts = new Intl.DateTimeFormat('en-ZA', {
+    timeZone: timezone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(date);
+
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const asUtc = Date.UTC(
+    Number(values.year),
+    Number(values.month) - 1,
+    Number(values.day),
+    Number(values.hour),
+    Number(values.minute),
+    Number(values.second)
+  );
+
+  return asUtc + date.getUTCMilliseconds() - date.getTime();
+};
+
+const zonedTimeToUtc = ({ year, month, day, hour = 0, minute = 0, second = 0, ms = 0 }, timezone) => {
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute, second, ms);
+  const firstOffset = getTimeZoneOffsetMs(new Date(utcGuess), timezone);
+  const firstUtc = utcGuess - firstOffset;
+  const secondOffset = getTimeZoneOffsetMs(new Date(firstUtc), timezone);
+  return new Date(utcGuess - secondOffset);
+};
+
+const getLocalDateParts = (date, timezone) => {
+  const parts = new Intl.DateTimeFormat('en-ZA', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return {
+    year: Number(values.year),
+    month: Number(values.month),
+    day: Number(values.day),
+  };
+};
+
+const addLocalDays = ({ year, month, day }, days) => {
+  const date = new Date(Date.UTC(year, month - 1, day + days));
+  return {
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+  };
+};
+
+const localDayBoundaryUtc = (date, timezone, boundary = 'start', deltaDays = 0) => {
+  const parts = addLocalDays(getLocalDateParts(date, timezone), deltaDays);
+  return zonedTimeToUtc({
+    ...parts,
+    hour: boundary === 'end' ? 23 : 0,
+    minute: boundary === 'end' ? 59 : 0,
+    second: boundary === 'end' ? 59 : 0,
+    ms: boundary === 'end' ? 999 : 0,
+  }, timezone);
+};
+
+const localDayOrdinal = (date, timezone) => {
+  const parts = getLocalDateParts(date, timezone);
+  return Math.floor(Date.UTC(parts.year, parts.month - 1, parts.day) / MS_PER_DAY);
+};
+
+const inclusiveLocalDayCount = (startDate, endDate, timezone) =>
+  Math.max(localDayOrdinal(endDate, timezone) - localDayOrdinal(startDate, timezone) + 1, 1);
+
+const parseDateBoundary = (value, timezone, boundary = 'start') => {
+  if (!value) return null;
+  const str = String(value).trim();
+  const match = str.match(DATE_ONLY_RE);
+
+  if (match) {
+    return zonedTimeToUtc({
+      year: Number(match[1]),
+      month: Number(match[2]),
+      day: Number(match[3]),
+      hour: boundary === 'end' ? 23 : 0,
+      minute: boundary === 'end' ? 59 : 0,
+      second: boundary === 'end' ? 59 : 0,
+      ms: boundary === 'end' ? 999 : 0,
+    }, timezone);
+  }
+
+  const parsed = new Date(str);
+  if (Number.isNaN(parsed.getTime())) {
+    const error = new Error(`Invalid ${boundary === 'end' ? 'endDate' : 'startDate'}`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return parsed;
+};
+
+const buildDateMatch = (query, timezone) => {
+  const dateMatch = {};
+  if (query.startDate) dateMatch.$gte = parseDateBoundary(query.startDate, timezone, 'start');
+  if (query.endDate) dateMatch.$lte = parseDateBoundary(query.endDate, timezone, 'end');
+  return dateMatch;
+};
+
+const dateToString = (format, timezone) => ({
+  $dateToString: {
+    format,
+    date: '$date',
+    timezone,
+  },
+});
 
 /**
  * GET /api/analytics/revenue
@@ -9,37 +147,23 @@ const getRevenue = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
     const cafeObjectId = mongoose.Types.ObjectId.createFromHexString(cafeId);
+    const timezone = await getCafeTimezone(cafeId);
 
     const { period = 'daily' } = req.query;
-    const endDate = req.query.endDate ? new Date(req.query.endDate) : new Date();
+    const endDate = req.query.endDate ? parseDateBoundary(req.query.endDate, timezone, 'end') : new Date();
     const startDate = req.query.startDate
-      ? new Date(req.query.startDate)
+      ? parseDateBoundary(req.query.startDate, timezone, 'start')
       : new Date(endDate.getTime() - 30 * 24 * 60 * 60 * 1000);
 
     // Build date grouping expression based on period
     let dateGroup;
     if (period === 'weekly') {
-      dateGroup = {
-        $dateToString: {
-          format: '%G-W%V',
-          date: '$date',
-        },
-      };
+      dateGroup = dateToString('%G-W%V', timezone);
     } else if (period === 'monthly') {
-      dateGroup = {
-        $dateToString: {
-          format: '%Y-%m',
-          date: '$date',
-        },
-      };
+      dateGroup = dateToString('%Y-%m', timezone);
     } else {
       // daily (default)
-      dateGroup = {
-        $dateToString: {
-          format: '%Y-%m-%d',
-          date: '$date',
-        },
-      };
+      dateGroup = dateToString('%Y-%m-%d', timezone);
     }
 
     const pipeline = [
@@ -143,13 +267,10 @@ const getItems = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
     const cafeObjectId = mongoose.Types.ObjectId.createFromHexString(cafeId);
+    const timezone = await getCafeTimezone(cafeId);
 
     const { startDate, endDate } = req.query;
-    const dateMatch = {};
-    if (startDate || endDate) {
-      if (startDate) dateMatch.$gte = new Date(startDate);
-      if (endDate) dateMatch.$lte = new Date(endDate);
-    }
+    const dateMatch = buildDateMatch(req.query, timezone);
     const matchStage = {
       cafeId: cafeObjectId,
       status: 'approved',
@@ -185,10 +306,9 @@ const getItems = async (req, res, next) => {
     }
 
     const { minDate, maxDate } = rangeResult[0];
-    const totalDays = Math.max(
-      (maxDate.getTime() - minDate.getTime()) / (1000 * 60 * 60 * 24),
-      1
-    );
+    const rangeStart = dateMatch.$gte || minDate;
+    const rangeEnd = dateMatch.$lte || maxDate;
+    const totalDays = inclusiveLocalDayCount(rangeStart, rangeEnd, timezone);
 
     // Top 20 items overall
     const itemsPipeline = [
@@ -218,17 +338,17 @@ const getItems = async (req, res, next) => {
 
     const items = await Transaction.aggregate(itemsPipeline);
 
-    // Trend: last 7 days vs previous 7 days
-    const now = new Date();
-    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-    const fourteenDaysAgo = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+    // Trend: latest 7 local trading days in the selected data vs previous 7 days.
+    const trendEnd = localDayBoundaryUtc(maxDate, timezone, 'end');
+    const currentStart = localDayBoundaryUtc(maxDate, timezone, 'start', -6);
+    const previousStart = localDayBoundaryUtc(maxDate, timezone, 'start', -13);
 
     const trendPipeline = [
       {
         $match: {
           cafeId: cafeObjectId,
           status: 'approved',
-          date: { $gte: fourteenDaysAgo, $lte: now },
+          date: { $gte: previousStart, $lte: trendEnd },
         },
       },
       { $unwind: '$items' },
@@ -237,7 +357,7 @@ const getItems = async (req, res, next) => {
           _id: {
             name: '$items.name',
             period: {
-              $cond: [{ $gte: ['$date', sevenDaysAgo] }, 'current', 'previous'],
+              $cond: [{ $gte: ['$date', currentStart] }, 'current', 'previous'],
             },
           },
           totalQty: { $sum: '$items.quantity' },
@@ -282,11 +402,13 @@ const getItems = async (req, res, next) => {
       .filter((i) => i.currentQty > 0 || i.previousQty > 0);
 
     const risingItems = [...allItemTrends]
+      .filter((item) => item.trend > 0)
       .sort((a, b) => b.trend - a.trend)
       .slice(0, 5)
       .map(({ name, trend }) => ({ name, trend }));
 
     const decliningItems = [...allItemTrends]
+      .filter((item) => item.trend < 0)
       .sort((a, b) => a.trend - b.trend)
       .slice(0, 5)
       .map(({ name, trend }) => ({ name, trend }));
@@ -315,31 +437,50 @@ const getHeatmap = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
     const cafeObjectId = mongoose.Types.ObjectId.createFromHexString(cafeId);
+    const cafe = await Cafe.findById(cafeId).select('timezone tradingHours').lean();
+    const timezone = safeTimezone(cafe?.timezone);
 
     const { startDate, endDate } = req.query;
-    const dateMatch = {};
-    if (startDate || endDate) {
-      if (startDate) dateMatch.$gte = new Date(startDate);
-      if (endDate) dateMatch.$lte = new Date(endDate);
-    }
-    const matchStage = {
+    const dateMatch = buildDateMatch(req.query, timezone);
+    const baseMatchStage = {
       cafeId: cafeObjectId,
       status: 'approved',
-      hour: { $gte: 6, $lte: 22 },
       dayOfWeek: { $gte: 0, $lte: 6 },
       ...(Object.keys(dateMatch).length > 0 && { date: dateMatch }),
     };
+    const heatmapMatchStage = {
+      ...baseMatchStage,
+      hour: { $gte: 6, $lte: 22 },
+    };
 
-    const pipeline = [
-      { $match: matchStage },
+    const dayCountPipeline = [
+      { $match: baseMatchStage },
+      {
+        $group: {
+          _id: {
+            dayOfWeek: '$dayOfWeek',
+            date: dateToString('%Y-%m-%d', timezone),
+          },
+        },
+      },
+      {
+        $group: {
+          _id: '$_id.dayOfWeek',
+          observedDays: { $sum: 1 },
+        },
+      },
+    ];
+
+    const hourlyTotalsPipeline = [
+      { $match: heatmapMatchStage },
       {
         $group: {
           _id: {
             dayOfWeek: '$dayOfWeek',
             hour: '$hour',
           },
-          revenue: { $sum: '$total' },
-          transactions: { $sum: 1 },
+          totalRevenue: { $sum: '$total' },
+          totalTransactions: { $sum: 1 },
         },
       },
       {
@@ -347,19 +488,35 @@ const getHeatmap = async (req, res, next) => {
           _id: 0,
           dayOfWeek: '$_id.dayOfWeek',
           hour: '$_id.hour',
-          revenue: { $round: ['$revenue', 2] },
-          transactions: 1,
+          totalRevenue: { $round: ['$totalRevenue', 2] },
+          totalTransactions: 1,
         },
       },
       { $sort: { dayOfWeek: 1, hour: 1 } },
     ];
 
-    const rawData = await Transaction.aggregate(pipeline);
+    const [dayCounts, rawData] = await Promise.all([
+      Transaction.aggregate(dayCountPipeline),
+      Transaction.aggregate(hourlyTotalsPipeline),
+    ]);
+    const observedDaysByWeekday = new Map(
+      dayCounts.map((entry) => [entry._id, entry.observedDays])
+    );
 
     // Fill in the complete 7x17 grid with zeros for missing slots
     const dataMap = {};
     for (const entry of rawData) {
-      dataMap[`${entry.dayOfWeek}-${entry.hour}`] = entry;
+      const observedDays = observedDaysByWeekday.get(entry.dayOfWeek) || 1;
+      dataMap[`${entry.dayOfWeek}-${entry.hour}`] = {
+        dayOfWeek: entry.dayOfWeek,
+        hour: entry.hour,
+        revenue: parseFloat((entry.totalRevenue / observedDays).toFixed(2)),
+        transactions: parseFloat((entry.totalTransactions / observedDays).toFixed(1)),
+        totalRevenue: entry.totalRevenue,
+        totalTransactions: entry.totalTransactions,
+        observedDays,
+        isOpen: isWeekdayHourOpen(entry.dayOfWeek, entry.hour, cafe),
+      };
     }
 
     const heatmap = [];
@@ -369,7 +526,16 @@ const getHeatmap = async (req, res, next) => {
         if (dataMap[key]) {
           heatmap.push(dataMap[key]);
         } else {
-          heatmap.push({ dayOfWeek: day, hour, revenue: 0, transactions: 0 });
+          heatmap.push({
+            dayOfWeek: day,
+            hour,
+            revenue: 0,
+            transactions: 0,
+            totalRevenue: 0,
+            totalTransactions: 0,
+            observedDays: observedDaysByWeekday.get(day) || 0,
+            isOpen: isWeekdayHourOpen(day, hour, cafe),
+          });
         }
       }
     }
@@ -378,7 +544,11 @@ const getHeatmap = async (req, res, next) => {
       success: true,
       heatmap,
       data: heatmap,
-      meta: { startDate: startDate || null, endDate: endDate || null },
+      meta: {
+        startDate: startDate || null,
+        endDate: endDate || null,
+        metric: 'average_per_observed_weekday',
+      },
     });
   } catch (error) {
     next(error);
@@ -393,13 +563,10 @@ const getCustomers = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
     const cafeObjectId = mongoose.Types.ObjectId.createFromHexString(cafeId);
+    const timezone = await getCafeTimezone(cafeId);
 
     const { startDate, endDate } = req.query;
-    const dateMatch = {};
-    if (startDate || endDate) {
-      if (startDate) dateMatch.$gte = new Date(startDate);
-      if (endDate) dateMatch.$lte = new Date(endDate);
-    }
+    const dateMatch = buildDateMatch(req.query, timezone);
     const matchStage = {
       cafeId: cafeObjectId,
       status: 'approved',
@@ -551,10 +718,9 @@ const getWaste = async (_req, res, next) => {
 const getCombos = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
+    const timezone = await getCafeTimezone(cafeId);
     const { startDate, endDate } = req.query;
-    const dateMatch = {};
-    if (startDate) dateMatch.$gte = new Date(startDate);
-    if (endDate) dateMatch.$lte = new Date(endDate);
+    const dateMatch = buildDateMatch(req.query, timezone);
 
     const matchStage = {
       cafeId: new mongoose.Types.ObjectId(cafeId),
@@ -569,7 +735,7 @@ const getCombos = async (req, res, next) => {
       {
         $project: {
           itemNames: {
-            $sortArray: { input: '$items.name', sortBy: 1 },
+            $sortArray: { input: { $setUnion: ['$items.name', []] }, sortBy: 1 },
           },
         },
       },
@@ -622,10 +788,9 @@ const getCombos = async (req, res, next) => {
     if (error.message && error.message.includes('sortArray')) {
       try {
         const cafeId = req.user.cafeId;
+        const timezone = await getCafeTimezone(cafeId);
         const { startDate, endDate } = req.query;
-        const dateMatch = {};
-        if (startDate) dateMatch.$gte = new Date(startDate);
-        if (endDate) dateMatch.$lte = new Date(endDate);
+        const dateMatch = buildDateMatch(req.query, timezone);
 
         const matchStage = {
           cafeId: new mongoose.Types.ObjectId(cafeId),

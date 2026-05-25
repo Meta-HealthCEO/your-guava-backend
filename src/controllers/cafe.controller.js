@@ -1,5 +1,6 @@
 const Cafe = require('../models/Cafe.model');
 const User = require('../models/User.model');
+const { normalizeTradingHours, defaultTradingHours } = require('../utils/tradingHours');
 
 // GET /api/cafe/list — all cafes the user can access
 const listCafes = async (req, res, next) => {
@@ -26,9 +27,12 @@ const listCafes = async (req, res, next) => {
 
 const getMe = async (req, res, next) => {
   try {
-    const cafe = await Cafe.findById(req.user.cafeId);
+    const cafe = await Cafe.findById(req.user.cafeId).lean();
     if (!cafe) {
       return res.status(404).json({ success: false, message: 'Cafe not found' });
+    }
+    if (!Array.isArray(cafe.tradingHours) || cafe.tradingHours.length !== 7) {
+      cafe.tradingHours = defaultTradingHours();
     }
     return res.status(200).json({ success: true, cafe });
   } catch (error) {
@@ -38,11 +42,14 @@ const getMe = async (req, res, next) => {
 
 const updateMe = async (req, res, next) => {
   try {
-    const { name, location } = req.body;
+    const { name, location, tradingHours } = req.body;
 
     const updates = {};
     if (name) updates.name = name;
     if (location) updates.location = location;
+    if (tradingHours !== undefined) {
+      updates.tradingHours = normalizeTradingHours(tradingHours);
+    }
 
     const cafe = await Cafe.findByIdAndUpdate(
       req.user.cafeId,

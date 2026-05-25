@@ -19,6 +19,7 @@ const uploadsRoutes = require('./routes/uploads.routes');
 const insightChatsRoutes = require('./routes/insightChats.routes');
 const accountRoutes = require('./routes/account.routes');
 const integrationsRoutes = require('./routes/integrations.routes');
+const itemsRoutes = require('./routes/items.routes');
 const errorMiddleware = require('./middleware/error.middleware');
 
 const app = express();
@@ -52,6 +53,7 @@ app.use('/api/uploads', uploadsRoutes);
 app.use('/api/insight-chats', insightChatsRoutes);
 app.use('/api/account', accountRoutes);
 app.use('/api/integrations', integrationsRoutes);
+app.use('/api/items', itemsRoutes);
 
 // Health check
 app.get('/api/health', (_req, res) => {

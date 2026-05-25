@@ -11,6 +11,8 @@ const {
   getDataStatus,
 } = require('../controllers/transactions.controller');
 
+const uploadMaxBytes = () => parseInt(process.env.UPLOAD_MAX_BYTES || '10485760', 10);
+
 // Ensure uploads directory exists
 const uploadsDir = path.join(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadsDir)) {
@@ -35,20 +37,41 @@ const fileFilter = (_req, file, cb) => {
   if (allowedExts.includes(ext)) {
     cb(null, true);
   } else {
-    cb(new Error('Only CSV and XLSX files are allowed'), false);
+    const err = new Error('Only CSV, XLS, and XLSX files are allowed');
+    err.statusCode = 400;
+    cb(err, false);
   }
 };
 
 const multerUpload = multer({
   storage,
   fileFilter,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  limits: { fileSize: uploadMaxBytes() },
 });
+
+const handleMulterUpload = (req, res, next) => {
+  multerUpload.single('file')(req, res, (err) => {
+    if (!err) return next();
+
+    if (req.file?.path) {
+      fs.rm(req.file.path, { force: true }, () => {});
+    }
+
+    const isMulterError = err instanceof multer.MulterError;
+    const statusCode = err.statusCode || (isMulterError ? 400 : 500);
+    const message =
+      err.code === 'LIMIT_FILE_SIZE'
+        ? `File exceeds ${uploadMaxBytes()} bytes`
+        : err.message || 'File upload failed';
+
+    return res.status(statusCode).json({ success: false, message });
+  });
+};
 
 // All routes are protected
 router.use(authMiddleware);
 
-router.post('/upload', multerUpload.single('file'), upload);
+router.post('/upload', handleMulterUpload, upload);
 router.get('/status', getDataStatus);
 router.get('/stats', getStats);
 router.get('/', getTransactions);

@@ -83,6 +83,47 @@ describe('Uploads API', () => {
         .send({ columnMapping: { date: 'Date' }, itemsMode: 'packed' });
       expect(res.status).toBe(400);
     });
+
+    it('returns 400 when a mapped column is not present in the staged file', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+
+      const res = await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          columnMapping: {
+            ...stage.body.columnMapping,
+            total: 'Definitely Not A Column',
+          },
+          itemsMode: 'packed',
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/not in this file/i);
+    });
+
+    it('returns 400 when the file has headers but no transaction rows', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', Buffer.from('Date,Items,Total\n'), 'empty.csv');
+
+      expect(stage.status).toBe(200);
+
+      const res = await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          columnMapping: { date: 'Date', items: 'Items', total: 'Total' },
+          itemsMode: 'packed',
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/no transaction rows/i);
+    });
   });
 
   describe('GET /api/uploads', () => {
@@ -228,6 +269,91 @@ describe('Uploads API', () => {
       expect(afterTxns).toHaveLength(4);
     });
 
+    it('preserves transactions when re-map parses no valid rows', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      const beforeTxns = await Transaction.find({ uploadId: stage.body.uploadId }).lean();
+      expect(beforeTxns).toHaveLength(4);
+
+      const res = await request
+        .patch(`/api/uploads/${stage.body.uploadId}/mapping`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          columnMapping: {
+            ...stage.body.columnMapping,
+            date: 'Payment Method',
+          },
+          itemsMode: stage.body.itemsMode,
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/no valid transaction rows/i);
+
+      const afterTxns = await Transaction.find({ uploadId: stage.body.uploadId }).lean();
+      expect(afterTxns).toHaveLength(4);
+    });
+
+    it('preserves transactions when re-map would duplicate another upload', async () => {
+      const csv = Buffer.from([
+        'Receipt,Date,Time,Items,Total',
+        'R900,2026-04-01,08:30,1 x Flat White,35.00',
+      ].join('\n'));
+      const mappingWithoutReceipt = {
+        date: 'Date',
+        time: 'Time',
+        items: 'Items',
+        total: 'Total',
+      };
+      const mappingWithReceipt = {
+        receiptId: 'Receipt',
+        ...mappingWithoutReceipt,
+      };
+
+      const firstStage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', csv, 'receiptless.csv');
+      await request
+        .post(`/api/uploads/${firstStage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: mappingWithoutReceipt, itemsMode: 'packed' });
+
+      const secondStage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', csv, 'receipted.csv');
+      await request
+        .post(`/api/uploads/${secondStage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: mappingWithReceipt, itemsMode: 'packed' });
+
+      const beforeTxns = await Transaction.find({ uploadId: firstStage.body.uploadId }).lean();
+      expect(beforeTxns).toHaveLength(1);
+
+      const res = await request
+        .patch(`/api/uploads/${firstStage.body.uploadId}/mapping`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: mappingWithReceipt, itemsMode: 'packed' });
+
+      expect(res.status).toBe(409);
+      expect(res.body.message).toMatch(/leave this upload empty/i);
+
+      const afterTxns = await Transaction.find({ uploadId: firstStage.body.uploadId }).lean();
+      expect(afterTxns).toHaveLength(1);
+
+      const Upload = require('../../src/models/Upload.model');
+      const upload = await Upload.findById(firstStage.body.uploadId).lean();
+      expect(upload.status).toBe('completed');
+      expect(upload.columnMapping.receiptId).toBeUndefined();
+    });
+
     it('returns 409 when status is parsing', async () => {
       const stage = await request
         .post('/api/transactions/upload')
@@ -245,6 +371,7 @@ describe('Uploads API', () => {
 
   describe('DELETE /api/uploads/:id', () => {
     it('owner soft-deletes upload, removing transactions and R2 object', async () => {
+      const Item = require('../../src/models/Item.model');
       const stage = await request
         .post('/api/transactions/upload')
         .set('Authorization', `Bearer ${token}`)
@@ -253,6 +380,9 @@ describe('Uploads API', () => {
         .post(`/api/uploads/${stage.body.uploadId}/confirm`)
         .set('Authorization', `Bearer ${token}`)
         .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      const brownieBefore = await Item.findOne({ name: 'Brownie' }).lean();
+      expect(brownieBefore.totalSold).toBe(4);
 
       const res = await request
         .delete(`/api/uploads/${stage.body.uploadId}`)
@@ -265,6 +395,9 @@ describe('Uploads API', () => {
       const Upload = require('../../src/models/Upload.model');
       const u = await Upload.findById(stage.body.uploadId).lean();
       expect(u.status).toBe('deleted');
+
+      const brownieAfter = await Item.findOne({ name: 'Brownie' }).lean();
+      expect(brownieAfter.totalSold).toBe(0);
     });
   });
 

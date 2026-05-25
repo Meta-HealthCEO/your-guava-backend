@@ -5,6 +5,7 @@ const Cafe = require('../models/Cafe.model');
 const Event = require('../models/Event.model');
 const Item = require('../models/Item.model');
 const Organization = require('../models/Organization.model');
+const { meterGuavaCredits } = require('./usage.service');
 
 // In-memory cache: cafeId -> { insights, generatedAt }
 const insightsCache = new Map();
@@ -192,7 +193,8 @@ const buildBusinessContext = async ({ cafeId, orgId }) => {
     hourPattern,
     paymentStats,
     recentTransactions,
-    itemCatalog,
+    menuItems,
+    menuItemIssues,
     forecasts,
     upcomingEvents,
   ] = await Promise.all([
@@ -292,7 +294,20 @@ const buildBusinessContext = async ({ cafeId, orgId }) => {
     Item.find({ cafeId: { $in: cafeIds }, isActive: true })
       .sort({ totalSold: -1 })
       .limit(30)
-      .select('cafeId name category avgPrice totalSold')
+      .select('cafeId name category avgPrice totalSold expectedPrice reviewStatus aliases priceMismatchCount lastPriceMismatchAt observedPriceMin observedPriceMax')
+      .lean(),
+    Item.find({
+      cafeId: { $in: cafeIds },
+      isActive: { $ne: false },
+      $or: [
+        { reviewStatus: 'needs_review' },
+        { priceMismatchCount: { $gt: 0 } },
+        { lastPriceMismatchAt: { $ne: null } },
+      ],
+    })
+      .sort({ reviewStatus: -1, lastPriceMismatchAt: -1, totalSold: -1 })
+      .limit(20)
+      .select('cafeId name category avgPrice totalSold expectedPrice reviewStatus aliases priceMismatchCount lastPriceMismatchAt observedPriceMin observedPriceMax')
       .lean(),
     Forecast.find({ cafeId, date: { $gte: now, $lt: nextWeek } })
       .sort({ date: 1 })
@@ -370,12 +385,33 @@ const buildBusinessContext = async ({ cafeId, orgId }) => {
       transactions: row.transactions,
       revenue: roundMoney(row.revenue),
     })),
-    itemCatalog: itemCatalog.map((item) => ({
+    menuItems: menuItems.map((item) => ({
       location: cafeNameById.get(item.cafeId.toString()) || item.cafeId,
       name: item.name,
       category: item.category,
       avgPrice: item.avgPrice,
       totalSold: item.totalSold,
+      expectedPrice: item.expectedPrice,
+      reviewStatus: item.reviewStatus,
+      aliases: item.aliases || [],
+      priceMismatchCount: item.priceMismatchCount || 0,
+      lastPriceMismatchAt: item.lastPriceMismatchAt,
+      observedPriceMin: item.observedPriceMin,
+      observedPriceMax: item.observedPriceMax,
+    })),
+    menuItemIssues: menuItemIssues.map((item) => ({
+      location: cafeNameById.get(item.cafeId.toString()) || item.cafeId,
+      name: item.name,
+      category: item.category,
+      avgPrice: item.avgPrice,
+      totalSold: item.totalSold,
+      expectedPrice: item.expectedPrice,
+      reviewStatus: item.reviewStatus,
+      aliases: item.aliases || [],
+      priceMismatchCount: item.priceMismatchCount || 0,
+      lastPriceMismatchAt: item.lastPriceMismatchAt,
+      observedPriceMin: item.observedPriceMin,
+      observedPriceMax: item.observedPriceMax,
     })),
     upcomingForecasts: forecasts.map((forecast) => ({
       date: forecast.date,
@@ -425,7 +461,7 @@ const sanitizeMessages = (messages = []) =>
 const missingChatKeyResponse = () => ({
   answer: 'AI chat requires an Anthropic API key. Add ANTHROPIC_API_KEY to your backend environment and restart the server.',
   generatedAt: new Date(),
-  contextStats: { transactionCount: 0, locations: 0, topItems: 0, forecasts: 0 },
+  contextStats: { transactionCount: 0, locations: 0, topItems: 0, forecasts: 0, menuItemIssues: 0 },
 });
 
 const buildContextStats = (context) => ({
@@ -433,6 +469,7 @@ const buildContextStats = (context) => ({
   locations: context.locations.length,
   topItems: context.topItems90d.length,
   forecasts: context.upcomingForecasts.length,
+  menuItemIssues: context.menuItemIssues?.length || 0,
   contextWindow: context.dataset.contextWindow,
 });
 
@@ -451,6 +488,7 @@ const buildBusinessChatRequest = async ({ cafeId, orgId, messages }) => {
 Use the provided business, location, forecast, event, item, and transaction context to answer the operator's questions.
 Be practical, specific, and numerate. Use South African Rand where money is discussed.
 If the context does not contain enough data for a claim, say so and explain what data would be needed.
+If menuItemIssues contains unresolved or price-mismatched sales items, ask the operator to confirm mapping or pricing before treating those item facts as clean.
 Never invent transactions, locations, dates, or exact values not present in the context.
 Prefer concise markdown with short headings, bullets, and clear next actions.
 
@@ -532,16 +570,7 @@ const mappingCache = new Map(); // sha1(headers) -> mapping
  * @param {object[]} sampleRows up to 5 rows for context
  * @returns {Promise<{mapping: object, itemsMode: 'packed'|'line-per-row'}>}
  */
-const proposeColumnMapping = async (headers, sampleRows) => {
-  const cacheKey = crypto.createHash('sha1').update(headers.join('|')).digest('hex');
-  if (mappingCache.has(cacheKey)) {
-    return mappingCache.get(cacheKey);
-  }
-
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return { mapping: {}, itemsMode: 'packed' };
-  }
-
+const proposeColumnMappingWithClaude = async (headers, sampleRows) => {
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
   const prompt = `You are mapping CSV columns from a coffee-shop POS export to a canonical schema.
@@ -579,28 +608,56 @@ Return ONLY valid JSON with this exact shape, no markdown, no preamble:
 
 Use null for fields you cannot confidently identify. Choose itemsMode "line-per-row" if each row appears to be a single line item rather than a full receipt.`;
 
+  const message = await client.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 512,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  const text = (message.content[0]?.text || '').replace(/```json|```/g, '').trim();
+  const parsed = JSON.parse(text);
+  const cleaned = {};
+  for (const [k, v] of Object.entries(parsed.mapping || {})) {
+    if (v && headers.includes(v)) cleaned[k] = v;
+  }
+  return {
+    mapping: cleaned,
+    itemsMode: parsed.itemsMode === 'line-per-row' ? 'line-per-row' : 'packed',
+  };
+};
+
+const proposeColumnMapping = async (headers, sampleRows, usageContext = {}) => {
+  const cacheKey = crypto.createHash('sha1').update(headers.join('|')).digest('hex');
+  if (mappingCache.has(cacheKey)) {
+    return mappingCache.get(cacheKey);
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return { mapping: {}, itemsMode: 'packed' };
+  }
+
   let result = { mapping: {}, itemsMode: 'packed' };
   try {
-    const message = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 512,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const text = (message.content[0]?.text || '').replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(text);
-    const cleaned = {};
-    for (const [k, v] of Object.entries(parsed.mapping || {})) {
-      if (v && headers.includes(v)) cleaned[k] = v;
+    if (usageContext.orgId) {
+      const metered = await meterGuavaCredits({
+        orgId: usageContext.orgId,
+        cafeId: usageContext.cafeId,
+        userId: usageContext.userId,
+        featureKey: 'import_column_mapping',
+        metadata: { headerCount: headers.length },
+        run: () => proposeColumnMappingWithClaude(headers, sampleRows),
+      });
+      result = { ...metered.result, guavaCredits: metered.guavaCredits };
+    } else {
+      result = await proposeColumnMappingWithClaude(headers, sampleRows);
     }
-    result = {
-      mapping: cleaned,
-      itemsMode: parsed.itemsMode === 'line-per-row' ? 'line-per-row' : 'packed',
-    };
   } catch (err) {
     console.error('[anthropic] proposeColumnMapping failed:', err.message);
   }
 
-  mappingCache.set(cacheKey, result);
+  mappingCache.set(cacheKey, {
+    mapping: result.mapping || {},
+    itemsMode: result.itemsMode === 'line-per-row' ? 'line-per-row' : 'packed',
+  });
   return result;
 };
 

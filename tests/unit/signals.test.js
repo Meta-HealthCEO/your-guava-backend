@@ -1,4 +1,10 @@
-const { isPayday, isPublicHoliday, isSchoolHoliday } = require('../../src/utils/signals');
+const {
+  isPayday,
+  isPublicHoliday,
+  getPublicHolidayInfo,
+  getPublicHolidaysForYear,
+  isSchoolHoliday,
+} = require('../../src/utils/signals');
 
 describe('signals utility', () => {
   describe('isPayday', () => {
@@ -49,6 +55,57 @@ describe('signals utility', () => {
 
     it('returns true for 2026 Family Day / Easter Monday (Apr 6)', () => {
       expect(isPublicHoliday(new Date(2026, 3, 6))).toBe(true);
+    });
+
+    it('calculates Easter-based holidays for future years', () => {
+      expect(getPublicHolidayInfo(new Date(2028, 3, 14))).toEqual(
+        expect.objectContaining({ name: 'Good Friday' })
+      );
+      expect(getPublicHolidayInfo(new Date(2028, 3, 17))).toEqual(
+        expect.objectContaining({ name: 'Family Day' })
+      );
+    });
+
+    it('marks the following Monday when a public holiday falls on Sunday', () => {
+      expect(isPublicHoliday(new Date(2026, 7, 9))).toBe(true); // National Women's Day
+      expect(getPublicHolidayInfo(new Date(2026, 7, 10))).toEqual(
+        expect.objectContaining({
+          name: "National Women's Day observed",
+          observedOf: "National Women's Day",
+        })
+      );
+    });
+
+    it('includes known one-off declared public holidays', () => {
+      expect(getPublicHolidayInfo(new Date(2024, 4, 29))).toEqual(
+        expect.objectContaining({ name: 'National and Provincial Elections' })
+      );
+      expect(getPublicHolidayInfo(new Date(2022, 11, 27))).toEqual(
+        expect.objectContaining({ name: 'Special Public Holiday' })
+      );
+    });
+
+    it('accepts environment-configured public holiday overrides', () => {
+      const original = process.env.PUBLIC_HOLIDAY_OVERRIDES;
+      process.env.PUBLIC_HOLIDAY_OVERRIDES = '2030-02-14:Cafe Closure Day';
+
+      expect(getPublicHolidayInfo(new Date(2030, 1, 14))).toEqual(
+        expect.objectContaining({ name: 'Cafe Closure Day' })
+      );
+
+      if (original === undefined) delete process.env.PUBLIC_HOLIDAY_OVERRIDES;
+      else process.env.PUBLIC_HOLIDAY_OVERRIDES = original;
+    });
+
+    it('returns a generated yearly holiday calendar', () => {
+      const holidays = getPublicHolidaysForYear(2026);
+
+      expect(holidays).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ date: '2026-04-03', name: 'Good Friday' }),
+          expect.objectContaining({ date: '2026-08-10', observedOf: "National Women's Day" }),
+        ])
+      );
     });
 
     it('returns false for non-holiday dates', () => {

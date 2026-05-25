@@ -1,147 +1,153 @@
-/**
- * Unit tests for forecast service modifiers.
- *
- * We test the internal functions by requiring the forecast.service module
- * and checking that the unexported functions can be tested indirectly.
- * Since the modifiers are not exported, we replicate the logic for unit testing.
- * The integration test (forecasts.test.js) tests the full generateForecast flow.
- */
+const {
+  DEFAULT_FORECAST_SETTINGS,
+  getFactorEntitlements,
+  getForecastSettings,
+  normalizeForecastSettings,
+  buildGlobalFactors,
+  buildItemFactors,
+  multiplyFactors,
+  eventImpactPct,
+} = require('../../src/services/forecastFactors.service');
 
-describe('forecast modifiers (logic verification)', () => {
-  // Replicate the exported-in-module logic for testing
-  const weatherModifier = (category, weather) => {
-    let mod = 1.0;
-    if (!weather) return mod;
-    const { temp, isRain } = weather;
-    if (temp > 27) {
-      if (category === 'cold_drink') mod += 0.30;
-      if (category === 'coffee') mod -= 0.10;
-    } else if (temp < 18) {
-      if (category === 'coffee') mod += 0.15;
-      if (category === 'cold_drink') mod -= 0.20;
-    }
-    if (isRain) {
-      mod -= 0.10;
-    }
-    return Math.max(mod, 0.1);
+describe('forecast factors', () => {
+  const baseSignals = {
+    loadSheddingStage: 0,
+    isPublicHoliday: false,
+    isSchoolHoliday: false,
+    isPayday: false,
   };
 
-  const loadSheddingModifier = (stage) => {
-    if (stage === 0) return 1.0;
-    if (stage <= 2) return 0.92;
-    if (stage <= 4) return 0.78;
-    return 0.60;
-  };
+  it('preserves the default recent-week history weights', () => {
+    const settings = normalizeForecastSettings();
 
-  const holidayModifier = (isPublicHoliday, isSchoolHoliday) => {
-    if (isPublicHoliday && isSchoolHoliday) return 1.20;
-    if (isPublicHoliday) return 1.15;
-    if (isSchoolHoliday) return 1.08;
-    return 1.0;
-  };
-
-  const paydayModifier = (isPayday) => (isPayday ? 1.20 : 1.0);
-
-  describe('weatherModifier', () => {
-    it('boosts cold_drink on hot days (temp > 27)', () => {
-      const mod = weatherModifier('cold_drink', { temp: 30, isRain: false });
-      expect(mod).toBeCloseTo(1.30, 2);
-    });
-
-    it('reduces coffee on hot days (temp > 27)', () => {
-      const mod = weatherModifier('coffee', { temp: 30, isRain: false });
-      expect(mod).toBeCloseTo(0.90, 2);
-    });
-
-    it('boosts coffee on cold days (temp < 18)', () => {
-      const mod = weatherModifier('coffee', { temp: 12, isRain: false });
-      expect(mod).toBeCloseTo(1.15, 2);
-    });
-
-    it('reduces cold_drink on cold days (temp < 18)', () => {
-      const mod = weatherModifier('cold_drink', { temp: 12, isRain: false });
-      expect(mod).toBeCloseTo(0.80, 2);
-    });
-
-    it('applies rain penalty', () => {
-      const mod = weatherModifier('food', { temp: 22, isRain: true });
-      expect(mod).toBeCloseTo(0.90, 2);
-    });
-
-    it('stacks cold day + rain for cold_drink', () => {
-      const mod = weatherModifier('cold_drink', { temp: 12, isRain: true });
-      // -0.20 (cold) - 0.10 (rain) = 0.70
-      expect(mod).toBeCloseTo(0.70, 2);
-    });
-
-    it('returns 1.0 when weather is null', () => {
-      expect(weatherModifier('coffee', null)).toBe(1.0);
-    });
-
-    it('returns at least 0.1 (minimum floor)', () => {
-      // Extreme case: should not go below 0.1
-      const mod = weatherModifier('cold_drink', { temp: 10, isRain: true });
-      expect(mod).toBeGreaterThanOrEqual(0.1);
-    });
-
-    it('returns 1.0 for neutral temperature (18-27)', () => {
-      const mod = weatherModifier('coffee', { temp: 22, isRain: false });
-      expect(mod).toBe(1.0);
-    });
+    expect(settings.history.recentWeights).toEqual([0.35, 0.25, 0.20]);
+    expect(settings.history.twoWeekWeights).toEqual([0.6, 0.4]);
   });
 
-  describe('loadSheddingModifier', () => {
-    it('returns 1.0 for stage 0 (no load shedding)', () => {
-      expect(loadSheddingModifier(0)).toBe(1.0);
-    });
+  it('keeps default weather behaviour for hot, cold, and rainy days', () => {
+    const settings = normalizeForecastSettings();
 
-    it('returns 0.92 for stage 1', () => {
-      expect(loadSheddingModifier(1)).toBe(0.92);
+    const hotColdDrink = buildItemFactors({
+      category: 'cold_drink',
+      signals: baseSignals,
+      weather: { temp: 30, condition: 'Sunny', isRain: false },
+      events: [],
+      settings,
     });
+    expect(hotColdDrink.find((f) => f.key === 'weather').multiplier).toBeCloseTo(1.30, 2);
 
-    it('returns 0.92 for stage 2', () => {
-      expect(loadSheddingModifier(2)).toBe(0.92);
+    const hotCoffee = buildItemFactors({
+      category: 'coffee',
+      signals: baseSignals,
+      weather: { temp: 30, condition: 'Sunny', isRain: false },
+      events: [],
+      settings,
     });
+    expect(hotCoffee.find((f) => f.key === 'weather').multiplier).toBeCloseTo(0.90, 2);
 
-    it('returns 0.78 for stage 3', () => {
-      expect(loadSheddingModifier(3)).toBe(0.78);
+    const coldRain = buildItemFactors({
+      category: 'cold_drink',
+      signals: baseSignals,
+      weather: { temp: 12, condition: 'Rain', isRain: true },
+      events: [],
+      settings,
     });
-
-    it('returns 0.78 for stage 4', () => {
-      expect(loadSheddingModifier(4)).toBe(0.78);
-    });
-
-    it('returns 0.60 for stage 5+', () => {
-      expect(loadSheddingModifier(5)).toBe(0.60);
-      expect(loadSheddingModifier(6)).toBe(0.60);
-    });
+    expect(coldRain.find((f) => f.key === 'weather').multiplier).toBeCloseTo(0.70, 2);
   });
 
-  describe('holidayModifier', () => {
-    it('returns 1.20 for public holiday + school holiday', () => {
-      expect(holidayModifier(true, true)).toBe(1.20);
+  it('keeps default load shedding, holiday, payday, and event weights', () => {
+    const settings = normalizeForecastSettings();
+    const factors = buildGlobalFactors({
+      signals: {
+        loadSheddingStage: 5,
+        isPublicHoliday: true,
+        isSchoolHoliday: true,
+        isPayday: true,
+      },
+      weather: { temp: 22, condition: 'Clear', isRain: false },
+      events: [{ name: 'Market', impact: 'high' }],
+      settings,
     });
 
-    it('returns 1.15 for public holiday only', () => {
-      expect(holidayModifier(true, false)).toBe(1.15);
-    });
-
-    it('returns 1.08 for school holiday only', () => {
-      expect(holidayModifier(false, true)).toBe(1.08);
-    });
-
-    it('returns 1.0 when no holidays', () => {
-      expect(holidayModifier(false, false)).toBe(1.0);
-    });
+    expect(factors.find((f) => f.key === 'loadShedding').multiplier).toBeCloseTo(0.60, 2);
+    expect(factors.find((f) => f.key === 'holiday').multiplier).toBeCloseTo(1.20, 2);
+    expect(factors.find((f) => f.key === 'payday').multiplier).toBeCloseTo(1.20, 2);
+    expect(factors.find((f) => f.key === 'events').multiplier).toBeCloseTo(1.35, 2);
   });
 
-  describe('paydayModifier', () => {
-    it('returns 1.20 on payday', () => {
-      expect(paydayModifier(true)).toBe(1.20);
+  it('gates effective factor settings by subscription plan', () => {
+    const cafe = {
+      forecastSettings: normalizeForecastSettings({
+        events: { enabled: true, highPct: 50 },
+        payday: { enabled: true, pct: 12 },
+        stock: { safetyMarginPct: 25, maxBiasPct: 40 },
+        history: { maxWeeks: 12 },
+        learning: { enabled: true },
+      }),
+    };
+
+    const starter = getForecastSettings(cafe, 'starter');
+    expect(starter.events.enabled).toBe(false);
+    expect(starter.payday.enabled).toBe(false);
+    expect(starter.stock.safetyMarginPct).toBe(0);
+    expect(starter.history.maxWeeks).toBe(DEFAULT_FORECAST_SETTINGS.history.maxWeeks);
+    expect(starter.learning.enabled).toBe(false);
+
+    const growth = getForecastSettings(cafe, 'growth');
+    expect(growth.events.enabled).toBe(true);
+    expect(growth.events.highPct).toBe(50);
+    expect(growth.payday.pct).toBe(12);
+    expect(growth.stock.safetyMarginPct).toBe(25);
+    expect(growth.learning.enabled).toBe(false);
+
+    const pro = getForecastSettings(cafe, 'pro');
+    expect(pro.history.maxWeeks).toBe(12);
+    expect(pro.learning.enabled).toBe(true);
+  });
+
+  it('returns factor entitlements for the current plan', () => {
+    const entitlements = getFactorEntitlements('growth');
+
+    expect(entitlements.unlockedKeys).toEqual(
+      expect.arrayContaining(['weather', 'holiday', 'payday', 'events', 'loadShedding', 'stock'])
+    );
+    expect(entitlements.lockedKeys).toEqual(expect.arrayContaining(['history', 'learning']));
+  });
+
+  it('applies cafe-specific factor overrides', () => {
+    const settings = normalizeForecastSettings({
+      payday: { pct: 12 },
+      events: { highPct: 50 },
     });
 
-    it('returns 1.0 on non-payday', () => {
-      expect(paydayModifier(false)).toBe(1.0);
+    const factors = buildGlobalFactors({
+      signals: { ...baseSignals, isPayday: true },
+      weather: { temp: 22, condition: 'Clear', isRain: false },
+      events: [{ name: 'Derby Day', impact: 'high' }],
+      settings,
     });
+
+    expect(factors.find((f) => f.key === 'payday').multiplier).toBeCloseTo(1.12, 2);
+    expect(factors.find((f) => f.key === 'events').multiplier).toBeCloseTo(1.50, 2);
+  });
+
+  it('lets a local event carry an explicit weighting', () => {
+    const settings = normalizeForecastSettings();
+
+    expect(eventImpactPct({ impact: 'high', impactPct: 62 }, settings.events)).toBe(62);
+    expect(eventImpactPct({ impact: 'low' }, settings.events)).toBe(DEFAULT_FORECAST_SETTINGS.events.lowPct);
+  });
+
+  it('multiplies the active item factors into a final demand modifier', () => {
+    const settings = normalizeForecastSettings({ payday: { pct: 10 } });
+    const factors = buildItemFactors({
+      category: 'coffee',
+      signals: { ...baseSignals, isPayday: true },
+      weather: { temp: 12, condition: 'Clear', isRain: false },
+      events: [],
+      settings,
+    });
+
+    expect(multiplyFactors(factors)).toBeCloseTo(1.15 * 1.10, 2);
   });
 });

@@ -55,6 +55,7 @@ const insightChatSchema = new mongoose.Schema(
       locations: { type: Number, default: 0 },
       topItems: { type: Number, default: 0 },
       forecasts: { type: Number, default: 0 },
+      menuItemIssues: { type: Number, default: 0 },
       contextWindow: { type: String },
     },
     archived: {

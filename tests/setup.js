@@ -7,9 +7,17 @@ process.env.JWT_REFRESH_SECRET = 'test-jwt-refresh-secret-key-12345';
 process.env.JWT_EXPIRES_IN = '15m';
 process.env.JWT_REFRESH_EXPIRES_IN = '7d';
 process.env.NODE_ENV = 'test';
+process.env.WEATHER_API_KEY = '';
+process.env.WEATHER_API_URL = '';
 delete process.env.RESEND_API_KEY;
 delete process.env.RESEND_FROM_EMAIL;
 delete process.env.RESEND_REPLY_TO;
+delete process.env.PAYMENT_PROVIDER;
+delete process.env.ONEGATE_API_URL;
+delete process.env.ONEGATE_ORGANISATION_ID;
+delete process.env.ONEGATE_ORG_ID;
+delete process.env.ONEGATE_API_SALT;
+delete process.env.API_PUBLIC_URL;
 
 const app = require('../src/app');
 

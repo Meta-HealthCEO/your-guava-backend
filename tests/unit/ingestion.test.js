@@ -8,7 +8,7 @@ afterEach(clearDB);
 
 const Transaction = require('../../src/models/Transaction.model');
 const Item = require('../../src/models/Item.model');
-const { parseYocoCSV } = require('../../src/services/ingestion.service');
+const { ingestParsedRows, parseYocoCSV } = require('../../src/services/ingestion.service');
 
 describe('ingestion service', () => {
   describe('parseYocoCSV', () => {
@@ -58,8 +58,48 @@ describe('ingestion service', () => {
       // "Flat White (Blend)", "Long White (Blend)", "Iced Coffee (None)", "Brownie", "Espresso (Blend)"
       expect(itemNames).toContain('Flat White (Blend)');
       expect(itemNames).toContain('Brownie');
+      expect(itemNames).toContain('Espresso (Blend)');
       expect(itemNames).toContain('Iced Coffee (None)');
-      expect(items.length).toBeGreaterThanOrEqual(4);
+      expect(items.length).toBeGreaterThanOrEqual(5);
+
+      const byName = new Map(items.map((item) => [item.name, item]));
+      expect(byName.get('Flat White (Blend)').category).toBe('coffee');
+      expect(byName.get('Iced Coffee (None)').category).toBe('cold_drink');
+      expect(byName.get('Brownie').category).toBe('food');
+    });
+
+    it('reuses an existing exact-name Item even if legacy normalised metadata is missing', async () => {
+      const cafeId = new mongoose.Types.ObjectId();
+      const existing = await Item.create({
+        cafeId,
+        name: 'Black Coffee (Small)',
+        category: 'coffee',
+        expectedPrice: 36,
+        reviewStatus: 'matched',
+      });
+      const csv = Buffer.from([
+        'Receipt,Date,Time,Items,Total',
+        'R1,2026-04-01,08:30,1 x Black Coffee (Small),36',
+      ].join('\n'));
+
+      const result = await ingestParsedRows(csv, {
+        cafeId,
+        uploadId: null,
+        columnMapping: {
+          receiptId: 'Receipt',
+          date: 'Date',
+          time: 'Time',
+          items: 'Items',
+          total: 'Total',
+        },
+        itemsMode: 'packed',
+        fileExt: 'csv',
+      });
+
+      expect(result.imported).toBe(1);
+      expect(await Item.countDocuments({ cafeId, name: 'Black Coffee (Small)' })).toBe(1);
+      const tx = await Transaction.findOne({ cafeId, receiptId: 'R1' }).lean();
+      expect(String(tx.items[0].salesItemId)).toBe(String(existing._id));
     });
 
     it('correctly parses items with quantities from CSV', async () => {
@@ -77,6 +117,9 @@ describe('ingestion service', () => {
       if (longWhite) {
         expect(longWhite.quantity).toBe(2);
       }
+      const brownie = tx.items.find((i) => i.name === 'Brownie');
+      expect(brownie.quantity).toBe(1);
+      expect(tx.total).toBe(143);
     });
   });
 });

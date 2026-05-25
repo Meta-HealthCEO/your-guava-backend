@@ -26,9 +26,21 @@ const transactionSchema = new mongoose.Schema(
     paymentMethod: { type: String },
     items: [
       {
+        salesItemId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: 'Item',
+        },
         name: { type: String, required: true },
+        rawName: { type: String },
         quantity: { type: Number, required: true },
         unitPrice: { type: Number },
+        expectedPrice: { type: Number },
+        priceVariancePct: { type: Number },
+        menuItemStatus: {
+          type: String,
+          enum: ['matched', 'needs_review', 'price_mismatch', 'ignored'],
+          default: 'matched',
+        },
       },
     ],
     total: { type: Number },

@@ -17,6 +17,7 @@ const supertest = require('supertest');
 const { setup, teardown, clearDB, createTestUser, app } = require('../setup');
 
 const request = supertest(app);
+const Cafe = require('../../src/models/Cafe.model');
 
 beforeAll(setup);
 afterAll(teardown);
@@ -24,10 +25,12 @@ afterEach(clearDB);
 
 describe('Transactions API', () => {
   let token;
+  let user;
 
   beforeEach(async () => {
     const testUser = await createTestUser();
     token = testUser.token;
+    user = testUser.user;
   });
 
   describe('POST /api/transactions/upload', () => {
@@ -51,6 +54,66 @@ describe('Transactions API', () => {
         .post('/api/transactions/upload')
         .set('Authorization', `Bearer ${token}`);
       expect(res.status).toBe(400);
+    });
+
+    it('returns 400 for unsupported file extensions', async () => {
+      const res = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', Buffer.from('not,a,pos,file'), 'data.txt');
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/csv/i);
+    });
+
+    it('does not auto-confirm a stale saved mapping against a different header shape', async () => {
+      await Cafe.findByIdAndUpdate(user.activeCafeId, {
+        $set: {
+          savedColumnMapping: {
+            date: 'Old Date',
+            items: 'Old Items',
+            total: 'Old Total',
+            itemsMode: 'packed',
+          },
+        },
+      });
+
+      const csvPath = path.join(__dirname, '..', 'fixtures', 'test-generic-pos.csv');
+      const res = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', csvPath);
+
+      expect(res.status).toBe(200);
+      expect(res.body.posType).toBe('wizard');
+      expect(res.body.needsConfirmation).toBe(true);
+      expect(res.body.columnMapping).toEqual({});
+    });
+
+    it('auto-confirms a saved mapping only when it matches the current headers', async () => {
+      await Cafe.findByIdAndUpdate(user.activeCafeId, {
+        $set: {
+          savedColumnMapping: {
+            receiptId: 'Txn Number',
+            date: 'Sale Date',
+            time: 'Sale Time',
+            items: 'Description',
+            total: 'Amount',
+            itemsMode: 'packed',
+          },
+        },
+      });
+
+      const csvPath = path.join(__dirname, '..', 'fixtures', 'test-generic-pos.csv');
+      const res = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', csvPath);
+
+      expect(res.status).toBe(200);
+      expect(res.body.posType).toBe('wizard');
+      expect(res.body.needsConfirmation).toBe(false);
+      expect(res.body.columnMapping.date).toBe('Sale Date');
     });
   });
 
@@ -116,6 +179,41 @@ describe('Transactions API', () => {
       expect(res.body.stats.totalRevenue).toBeGreaterThan(0);
       expect(res.body.stats.topItems).toBeDefined();
       expect(Array.isArray(res.body.stats.topItems)).toBe(true);
+    });
+
+    it('calculates average daily revenue over the inclusive date range', async () => {
+      const Transaction = require('../../src/models/Transaction.model');
+      const firstDate = new Date('2026-05-20T09:00:00.000Z');
+      const secondDate = new Date('2026-05-21T09:00:00.000Z');
+
+      await Transaction.create([
+        {
+          cafeId: user.activeCafeId,
+          date: firstDate,
+          hour: 9,
+          dayOfWeek: firstDate.getDay(),
+          status: 'approved',
+          items: [{ name: 'Flat White', quantity: 1, unitPrice: 40 }],
+          total: 100,
+        },
+        {
+          cafeId: user.activeCafeId,
+          date: secondDate,
+          hour: 9,
+          dayOfWeek: secondDate.getDay(),
+          status: 'approved',
+          items: [{ name: 'Long White', quantity: 1, unitPrice: 40 }],
+          total: 200,
+        },
+      ]);
+
+      const res = await request
+        .get('/api/transactions/stats')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.stats.totalRevenue).toBe(300);
+      expect(res.body.stats.avgDailyRevenue).toBe(150);
     });
 
     it('returns zero stats when no transactions exist', async () => {

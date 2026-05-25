@@ -33,45 +33,122 @@ const isPayday = (date) => {
   );
 };
 
-/**
- * Returns true if the given date is a South African public holiday (2025-2026).
- */
-const isPublicHoliday = (date) => {
+const toDateKey = (date) => {
   const d = new Date(date);
-  const month = d.getMonth() + 1; // 1-indexed
-  const day = d.getDate();
-  const year = d.getFullYear();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
 
-  const holidays = [
-    // Fixed holidays (month, day)
-    [1, 1],   // New Year's Day
-    [3, 21],  // Human Rights Day
-    [4, 27],  // Freedom Day
-    [5, 1],   // Workers Day
-    [6, 16],  // Youth Day
-    [8, 9],   // National Women's Day
-    [9, 24],  // Heritage Day
-    [12, 16], // Day of Reconciliation
-    [12, 25], // Christmas Day
-    [12, 26], // Day of Goodwill
+const addDays = (date, days) => {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+};
+
+const isSameLocalDate = (a, b = new Date()) => {
+  const left = new Date(a);
+  const right = new Date(b);
+  return (
+    left.getFullYear() === right.getFullYear() &&
+    left.getMonth() === right.getMonth() &&
+    left.getDate() === right.getDate()
+  );
+};
+
+const addHoliday = (holidays, date, name, observedOf) => {
+  holidays.set(toDateKey(date), { date: toDateKey(date), name, observedOf });
+};
+
+const calculateEasterSunday = (year) => {
+  const a = year % 19;
+  const b = Math.floor(year / 100);
+  const c = year % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31);
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  return new Date(year, month - 1, day);
+};
+
+const SPECIAL_PUBLIC_HOLIDAYS = {
+  // National election days and formally declared one-off public holidays.
+  '2019-05-08': 'National and Provincial Elections',
+  '2021-11-01': 'Local Government Elections',
+  '2022-12-27': 'Special Public Holiday',
+  '2024-05-29': 'National and Provincial Elections',
+};
+
+const publicHolidayOverrides = () => {
+  const raw = process.env.PUBLIC_HOLIDAY_OVERRIDES || process.env.SA_PUBLIC_HOLIDAY_OVERRIDES || '';
+  if (!raw.trim()) return {};
+
+  return raw.split(',').reduce((overrides, item) => {
+    const [date, ...nameParts] = item.trim().split(':');
+    if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      overrides[date] = nameParts.join(':').trim() || 'Special Public Holiday';
+    }
+    return overrides;
+  }, {});
+};
+
+const getPublicHolidaysForYear = (year) => {
+  const holidays = new Map();
+  const fixedHolidays = [
+    [1, 1, "New Year's Day"],
+    [3, 21, 'Human Rights Day'],
+    [4, 27, 'Freedom Day'],
+    [5, 1, 'Workers Day'],
+    [6, 16, 'Youth Day'],
+    [8, 9, "National Women's Day"],
+    [9, 24, 'Heritage Day'],
+    [12, 16, 'Day of Reconciliation'],
+    [12, 25, 'Christmas Day'],
+    [12, 26, 'Day of Goodwill'],
   ];
 
-  for (const [hMonth, hDay] of holidays) {
-    if (month === hMonth && day === hDay) return true;
+  for (const [month, day, name] of fixedHolidays) {
+    addHoliday(holidays, new Date(year, month - 1, day), name);
   }
 
-  // Variable holidays (Easter-based) - hardcoded for 2025 and 2026
-  const variableHolidays = [
-    // 2025
-    '2025-04-18', // Good Friday
-    '2025-04-21', // Family Day (Easter Monday)
-    // 2026
-    '2026-04-03', // Good Friday
-    '2026-04-06', // Family Day (Easter Monday)
-  ];
+  const easterSunday = calculateEasterSunday(year);
+  addHoliday(holidays, addDays(easterSunday, -2), 'Good Friday');
+  addHoliday(holidays, addDays(easterSunday, 1), 'Family Day');
 
-  const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-  return variableHolidays.includes(dateStr);
+  const baseHolidays = [...holidays.values()];
+  for (const holiday of baseHolidays) {
+    const holidayDate = new Date(holiday.date);
+    if (holidayDate.getDay() === 0) {
+      addHoliday(holidays, addDays(holidayDate, 1), `${holiday.name} observed`, holiday.name);
+    }
+  }
+
+  const allSpecialHolidays = { ...SPECIAL_PUBLIC_HOLIDAYS, ...publicHolidayOverrides() };
+  for (const [date, name] of Object.entries(allSpecialHolidays)) {
+    if (date.startsWith(`${year}-`)) {
+      addHoliday(holidays, new Date(date), name);
+    }
+  }
+
+  return [...holidays.values()].sort((a, b) => a.date.localeCompare(b.date));
+};
+
+const getPublicHolidayInfo = (date) => {
+  const d = new Date(date);
+  const dateKey = toDateKey(d);
+  return getPublicHolidaysForYear(d.getFullYear()).find((holiday) => holiday.date === dateKey) || null;
+};
+
+/**
+ * Returns true if the given date is a South African public holiday.
+ */
+const isPublicHoliday = (date) => {
+  return Boolean(getPublicHolidayInfo(date));
 };
 
 /**
@@ -111,6 +188,8 @@ const isSchoolHoliday = (date) => {
  * Caches for 30 minutes.
  */
 const getLoadSheddingStage = async () => {
+  if (process.env.NODE_ENV === 'test') return 0;
+
   const now = Date.now();
   if (
     loadSheddingCache.fetchedAt &&
@@ -147,7 +226,7 @@ const getSignalsForDate = async (date, location = {}) => {
   const d = new Date(date);
   const dayOfWeek = d.getDay();
 
-  const [loadSheddingStage] = await Promise.all([getLoadSheddingStage()]);
+  const loadSheddingStage = isSameLocalDate(d) ? await getLoadSheddingStage() : 0;
 
   return {
     isPayday: isPayday(d),
@@ -161,6 +240,8 @@ const getSignalsForDate = async (date, location = {}) => {
 module.exports = {
   isPayday,
   isPublicHoliday,
+  getPublicHolidayInfo,
+  getPublicHolidaysForYear,
   isSchoolHoliday,
   getLoadSheddingStage,
   getSignalsForDate,

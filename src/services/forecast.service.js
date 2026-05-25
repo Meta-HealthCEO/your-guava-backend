@@ -3,73 +3,162 @@ const Item = require('../models/Item.model');
 const Forecast = require('../models/Forecast.model');
 const Event = require('../models/Event.model');
 const Cafe = require('../models/Cafe.model');
+const Organization = require('../models/Organization.model');
 const { getSignalsForDate } = require('../utils/signals');
 const { getWeatherForecast } = require('./weather.service');
+const {
+  getForecastSettings,
+  getFactorEntitlements,
+  factorUnlocked,
+  buildGlobalFactors,
+  buildItemFactors,
+  multiplyFactors,
+} = require('./forecastFactors.service');
 
-// Weighted moving average weights (most recent first)
-const WEIGHTS = [0.35, 0.25, 0.20]; // weeks 1, 2, 3
-// Remaining weight (0.20) is split evenly across weeks 4-8
 const MS_PER_DAY = 1000 * 60 * 60 * 24;
+const CALIBRATION_LOOKBACK_DAYS = 60;
+const MIN_OVERALL_CALIBRATION_SAMPLES = 3;
+const MIN_FACTOR_CALIBRATION_SAMPLES = 3;
+const MIN_ITEM_CALIBRATION_SAMPLES = 3;
 
-/**
- * Applies a weather modifier to a predicted quantity based on item category and weather conditions.
- */
-const weatherModifier = (category, weather) => {
-  let mod = 1.0;
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
-  if (!weather) return mod;
+const accumulateRatio = (bucket, ratio, weight) => {
+  bucket.weightedRatio += ratio * weight;
+  bucket.totalWeight += weight;
+  bucket.sampleSize += 1;
+};
 
-  const { temp, isRain } = weather;
+const calibratedMultiplier = (averageRatio, shrink, min, max) =>
+  clamp(1 + (averageRatio - 1) * shrink, min, max);
 
-  if (temp > 27) {
-    if (category === 'cold_drink') mod += 0.30;
-    if (category === 'coffee') mod -= 0.10;
-  } else if (temp < 18) {
-    if (category === 'coffee') mod += 0.15;
-    if (category === 'cold_drink') mod -= 0.20;
+const buildLearningFactor = (multiplier, sampleSize, options = {}) => {
+  const enabled = options.enabled !== false;
+  const adjustmentPct = (multiplier - 1) * 100;
+  const active = enabled && Math.abs(adjustmentPct) >= 1 && sampleSize >= MIN_OVERALL_CALIBRATION_SAMPLES;
+  return {
+    key: 'learning',
+    label: 'Learning correction',
+    active,
+    adjustmentPct: active ? Number(adjustmentPct.toFixed(2)) : 0,
+    multiplier: active ? Number(multiplier.toFixed(4)) : 1,
+    effect: active
+      ? `${adjustmentPct > 0 ? '+' : ''}${Number(adjustmentPct.toFixed(1))}%`
+      : 'no effect',
+    reason: enabled
+      ? (sampleSize > 0 ? `${sampleSize} matched historical item outcomes` : 'not enough history yet')
+      : (options.reason || 'Upgrade to Pro to apply learning corrections'),
+  };
+};
+
+const computeForecastCalibration = async (cafeId, targetDate) => {
+  const lookbackStart = new Date(targetDate);
+  lookbackStart.setDate(lookbackStart.getDate() - CALIBRATION_LOOKBACK_DAYS);
+  lookbackStart.setHours(0, 0, 0, 0);
+
+  const pastForecasts = await Forecast.find({
+    cafeId,
+    date: { $gte: lookbackStart, $lt: targetDate },
+    actualsUpdatedAt: { $exists: true, $ne: null },
+  })
+    .select('items')
+    .lean();
+
+  const overall = { weightedRatio: 0, totalWeight: 0, sampleSize: 0 };
+  const factorBuckets = new Map();
+  const itemBuckets = new Map();
+  const observations = [];
+
+  for (const forecast of pastForecasts) {
+    for (const item of forecast.items || []) {
+      if (item.actualQty == null || !Number.isFinite(item.predictedQty) || item.predictedQty <= 0) continue;
+
+      const ratio = clamp(item.actualQty / item.predictedQty, 0.25, 2);
+      const weight = Math.max(item.actualQty || 0, item.predictedQty || 0, 1);
+      const activeFactors = (item.factors || []).filter((factor) => factor.active && factor.key !== 'learning');
+
+      accumulateRatio(overall, ratio, weight);
+      observations.push({ ratio, weight, activeFactors, itemName: item.itemName });
+
+    }
   }
 
-  if (isRain) {
-    mod -= 0.10;
+  const rawOverallRatio = overall.totalWeight > 0 ? overall.weightedRatio / overall.totalWeight : 1;
+  const overallMultiplier = overall.sampleSize >= MIN_OVERALL_CALIBRATION_SAMPLES
+    ? calibratedMultiplier(rawOverallRatio, 0.5, 0.85, 1.15)
+    : 1;
+
+  for (const observation of observations) {
+    const residualRatio = rawOverallRatio > 0 ? observation.ratio / rawOverallRatio : observation.ratio;
+    if (observation.itemName) {
+      if (!itemBuckets.has(observation.itemName)) {
+        itemBuckets.set(observation.itemName, { weightedRatio: 0, totalWeight: 0, sampleSize: 0 });
+      }
+      accumulateRatio(itemBuckets.get(observation.itemName), residualRatio, observation.weight);
+    }
+
+    for (const activeFactor of observation.activeFactors) {
+      if (!factorBuckets.has(activeFactor.key)) {
+        factorBuckets.set(activeFactor.key, {
+          key: activeFactor.key,
+          label: activeFactor.label,
+          weightedRatio: 0,
+          totalWeight: 0,
+          sampleSize: 0,
+        });
+      }
+      accumulateRatio(factorBuckets.get(activeFactor.key), residualRatio, observation.weight);
+    }
   }
 
-  return Math.max(mod, 0.1); // never go below 10%
+  const factorMultipliers = [...factorBuckets.values()]
+    .filter((bucket) => bucket.sampleSize >= MIN_FACTOR_CALIBRATION_SAMPLES && bucket.totalWeight > 0)
+    .map((bucket) => {
+      const averageRatio = bucket.weightedRatio / bucket.totalWeight;
+      return {
+        key: bucket.key,
+        label: bucket.label,
+        multiplier: Number(calibratedMultiplier(averageRatio, 0.6, 0.8, 1.2).toFixed(4)),
+        sampleSize: bucket.sampleSize,
+        averageRatio: Number(averageRatio.toFixed(4)),
+      };
+    });
+
+  const itemMultipliers = [...itemBuckets.entries()]
+    .filter(([, bucket]) => bucket.sampleSize >= MIN_ITEM_CALIBRATION_SAMPLES && bucket.totalWeight > 0)
+    .map(([itemName, bucket]) => {
+      const averageRatio = bucket.weightedRatio / bucket.totalWeight;
+      return {
+        itemName,
+        multiplier: Number(calibratedMultiplier(averageRatio, 0.5, 0.8, 1.2).toFixed(4)),
+        sampleSize: bucket.sampleSize,
+        averageRatio: Number(averageRatio.toFixed(4)),
+      };
+    });
+
+  return {
+    lookbackDays: CALIBRATION_LOOKBACK_DAYS,
+    sampleSize: overall.sampleSize,
+    overallMultiplier: Number(overallMultiplier.toFixed(4)),
+    factorMultipliers,
+    itemMultipliers,
+    generatedAt: new Date(),
+  };
 };
 
-/**
- * Returns a load shedding multiplier based on the current stage.
- */
-const loadSheddingModifier = (stage) => {
-  if (stage === 0) return 1.0;
-  if (stage <= 2) return 0.92;
-  if (stage <= 4) return 0.78;
-  return 0.60; // stage 5+
-};
+const calibrationMultiplierForItem = (calibration, itemName, factors) => {
+  let multiplier = calibration.overallMultiplier || 1;
 
-/**
- * Returns a holiday multiplier.
- */
-const holidayModifier = (isPublicHoliday, isSchoolHoliday) => {
-  if (isPublicHoliday && isSchoolHoliday) return 1.20;
-  if (isPublicHoliday) return 1.15;
-  if (isSchoolHoliday) return 1.08;
-  return 1.0;
-};
+  const itemCalibration = (calibration.itemMultipliers || []).find((entry) => entry.itemName === itemName);
+  if (itemCalibration) multiplier *= itemCalibration.multiplier;
 
-/**
- * Returns a payday multiplier.
- */
-const paydayModifier = (isPayday) => (isPayday ? 1.20 : 1.0);
+  for (const factor of factors) {
+    if (!factor.active) continue;
+    const factorCalibration = (calibration.factorMultipliers || []).find((entry) => entry.key === factor.key);
+    if (factorCalibration) multiplier *= factorCalibration.multiplier;
+  }
 
-/**
- * Returns an events multiplier based on the highest-impact event.
- * low = +10%, medium = +20%, high = +35%
- */
-const eventsModifier = (events) => {
-  if (!events || events.length === 0) return 1.0;
-  const impactMap = { low: 1.10, medium: 1.20, high: 1.35 };
-  const maxImpact = Math.max(...events.map((e) => impactMap[e.impact] || 1.0));
-  return maxImpact;
+  return clamp(multiplier, 0.7, 1.3);
 };
 
 /**
@@ -111,30 +200,29 @@ const groupByWeekAndItem = (transactions, targetDate) => {
  * @param {{ [bucketIndex: number]: number }} buckets
  * @returns {number}
  */
-const weightedAverage = (buckets) => {
+const buildHistoryWeights = (numWeeks, historySettings) => {
+  if (numWeeks === 1) return [1.0];
+  if (numWeeks === 2) return historySettings.twoWeekWeights;
+
+  const recentWeights = historySettings.recentWeights.slice(0, 3);
+  const remainingWeight = Math.max(0, 1.0 - recentWeights.reduce((sum, weight) => sum + weight, 0));
+  const olderWeeks = numWeeks - recentWeights.length;
+  const olderWeightPerWeek = olderWeeks > 0 ? remainingWeight / olderWeeks : 0;
+  return Array.from({ length: numWeeks }, (_value, index) =>
+    index < recentWeights.length ? recentWeights[index] : olderWeightPerWeek
+  );
+};
+
+const weightedAverage = (buckets, historySettings) => {
   // Use the ACTUAL populated bucket indices, sorted from most recent (smallest) to oldest.
   const sortedKeys = Object.keys(buckets)
     .map(Number)
     .sort((a, b) => a - b)
-    .slice(0, 8); // cap at 8 weeks
+    .slice(0, historySettings.maxWeeks);
   const numWeeks = sortedKeys.length;
   if (numWeeks === 0) return 0;
 
-  // Build weights for the available buckets
-  let weights;
-  if (numWeeks === 1) {
-    weights = [1.0];
-  } else if (numWeeks === 2) {
-    weights = [0.6, 0.4];
-  } else {
-    const remainingWeight = 1.0 - WEIGHTS[0] - WEIGHTS[1] - WEIGHTS[2];
-    const olderWeeks = numWeeks - 3;
-    const olderWeightPerWeek = olderWeeks > 0 ? remainingWeight / olderWeeks : 0;
-    weights = [];
-    for (let i = 0; i < numWeeks; i++) {
-      weights.push(i < WEIGHTS.length ? WEIGHTS[i] : olderWeightPerWeek);
-    }
-  }
+  const weights = buildHistoryWeights(numWeeks, historySettings);
 
   let total = 0;
   for (let i = 0; i < numWeeks; i++) {
@@ -145,23 +233,48 @@ const weightedAverage = (buckets) => {
   return total;
 };
 
+const buildHistoricalPriceMap = (transactions) => {
+  const buckets = new Map();
+
+  for (const tx of transactions) {
+    for (const item of tx.items || []) {
+      if (!item.name || !Number.isFinite(item.unitPrice) || item.unitPrice <= 0) continue;
+      const qty = Number.isFinite(item.quantity) && item.quantity > 0 ? item.quantity : 1;
+      if (!buckets.has(item.name)) {
+        buckets.set(item.name, { value: 0, qty: 0 });
+      }
+      const bucket = buckets.get(item.name);
+      bucket.value += item.unitPrice * qty;
+      bucket.qty += qty;
+    }
+  }
+
+  return new Map(
+    [...buckets.entries()]
+      .filter(([, bucket]) => bucket.qty > 0)
+      .map(([name, bucket]) => [name, bucket.value / bucket.qty])
+  );
+};
+
 /**
  * Computes a suggested stock quantity for a given item based on historical forecast bias.
- * Uses the last 30 days of forecast docs where actualQty was recorded.
+ * Uses the 30 days before the target date where actualQty was recorded.
  *
  * @param {string|ObjectId} cafeId
  * @param {string} itemName
  * @param {number} predictedQty
  * @returns {Promise<number>}
  */
-const computeSuggestedStock = async (cafeId, itemName, predictedQty) => {
-  const thirtyDaysAgo = new Date();
+const computeSuggestedStock = async (cafeId, itemName, predictedQty, settings, targetDate = new Date()) => {
+  const target = new Date(targetDate);
+  target.setHours(0, 0, 0, 0);
+  const thirtyDaysAgo = new Date(target);
   thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
   thirtyDaysAgo.setHours(0, 0, 0, 0);
 
   const pastForecasts = await Forecast.find({
     cafeId,
-    date: { $gte: thirtyDaysAgo },
+    date: { $gte: thirtyDaysAgo, $lt: target },
     'items.itemName': itemName,
     'items.actualQty': { $gt: 0 },
   })
@@ -178,20 +291,21 @@ const computeSuggestedStock = async (cafeId, itemName, predictedQty) => {
     }
   }
 
-  const SAFETY_MARGIN = 1.10;
+  const safetyMargin = 1 + settings.stock.safetyMarginPct / 100;
+  const maxBias = settings.stock.maxBiasPct / 100;
 
   if (pairs.length >= 3) {
     const avgBias = pairs.reduce((sum, p) => {
       const bias = (p.actual - p.predicted) / Math.max(p.predicted, 1);
-      return sum + Math.max(-0.5, Math.min(0.5, bias));
+      return sum + Math.max(-maxBias, Math.min(maxBias, bias));
     }, 0) / pairs.length;
 
-    const biasAdjusted = Math.round(predictedQty * (1 + avgBias) * SAFETY_MARGIN);
+    const biasAdjusted = Math.round(predictedQty * (1 + avgBias) * safetyMargin);
     return Math.max(predictedQty, biasAdjusted);
   }
 
   // Cold start: just apply the safety margin
-  return Math.round(predictedQty * SAFETY_MARGIN);
+  return Math.round(predictedQty * safetyMargin);
 };
 
 /**
@@ -204,6 +318,8 @@ const computeSuggestedStock = async (cafeId, itemName, predictedQty) => {
 const generateForecast = async (cafeId, targetDate) => {
   const target = new Date(targetDate);
   target.setHours(0, 0, 0, 0);
+  const nextTarget = new Date(target);
+  nextTarget.setDate(nextTarget.getDate() + 1);
   const targetDayOfWeek = target.getDay();
 
   // Fetch last 8 weeks of same-day-of-week transactions
@@ -230,6 +346,11 @@ const generateForecast = async (cafeId, targetDate) => {
 
   // Get cafe location for weather
   const cafe = await Cafe.findById(cafeId).lean();
+  const org = cafe?.orgId ? await Organization.findById(cafe.orgId).lean() : null;
+  const plan = org?.plan || 'starter';
+  const settings = getForecastSettings(cafe, plan);
+  const entitlements = getFactorEntitlements(plan);
+  const learningEnabled = factorUnlocked(plan, 'learning') && settings.learning.enabled;
   const lat = cafe?.location?.lat || -33.9249; // Cape Town default
   const lng = cafe?.location?.lng || 18.4241;
 
@@ -237,11 +358,12 @@ const generateForecast = async (cafeId, targetDate) => {
   const [signals, weather, events] = await Promise.all([
     getSignalsForDate(target, { lat, lng }),
     getWeatherForecast(lat, lng, target),
-    Event.find({ cafeId, date: target }).lean(),
+    Event.find({ cafeId, date: { $gte: target, $lt: nextTarget } }).lean(),
   ]);
 
   // Group transactions by week and item
   const itemWeekMap = groupByWeekAndItem(transactions, target);
+  const historicalPriceMap = buildHistoricalPriceMap(transactions);
 
   // Get top 15 items by total historical frequency
   const itemTotals = [];
@@ -256,32 +378,57 @@ const generateForecast = async (cafeId, targetDate) => {
   const itemDocs = await Item.find({ cafeId, name: { $in: topItems } }).lean();
   const categoryMap = new Map(itemDocs.map((i) => [i.name, i.category]));
 
-  // Calculate predicted quantities with modifiers
-  const loadMod = loadSheddingModifier(signals.loadSheddingStage);
-  const holidayMod = holidayModifier(signals.isPublicHoliday, signals.isSchoolHoliday);
-  const paydayMod = paydayModifier(signals.isPayday);
-  const eventMod = eventsModifier(events);
-
+  const forecastFactors = buildGlobalFactors({ signals, weather, events, settings });
+  const calibration = learningEnabled
+    ? await computeForecastCalibration(cafeId, target)
+    : {
+        lookbackDays: CALIBRATION_LOOKBACK_DAYS,
+        sampleSize: 0,
+        overallMultiplier: 1,
+        factorMultipliers: [],
+        itemMultipliers: [],
+        generatedAt: new Date(),
+      };
+  const globalLearningFactor = buildLearningFactor(
+    calibration.overallMultiplier || 1,
+    calibration.sampleSize || 0,
+    {
+      enabled: learningEnabled,
+      reason: 'Learning correction is available on the Pro plan',
+    }
+  );
+  const storedForecastFactors = [...forecastFactors, globalLearningFactor];
   const forecastItems = [];
   let totalPredictedRevenue = 0;
 
   for (const name of topItems) {
     const buckets = itemWeekMap.get(name) || {};
-    const baseQty = weightedAverage(buckets);
+    const baseQty = weightedAverage(buckets, settings.history);
     const category = categoryMap.get(name) || 'other';
-    const weatherMod = weatherModifier(category, weather);
-
-    const finalQty = Math.round(baseQty * weatherMod * loadMod * holidayMod * paydayMod * eventMod);
+    const factors = buildItemFactors({ category, signals, weather, events, settings });
+    const learningMultiplier = learningEnabled ? calibrationMultiplierForItem(calibration, name, factors) : 1;
+    const learningFactor = buildLearningFactor(
+      learningMultiplier,
+      calibration.sampleSize || 0,
+      {
+        enabled: learningEnabled,
+        reason: 'Learning correction is available on the Pro plan',
+      }
+    );
+    const storedItemFactors = [...factors, learningFactor];
+    const finalQty = Math.round(baseQty * multiplyFactors(factors) * learningMultiplier);
 
     // Estimate revenue using item avgPrice if available
     const itemDoc = itemDocs.find((d) => d.name === name);
-    const avgPrice = itemDoc?.avgPrice || 0;
+    const avgPrice = itemDoc?.avgPrice || historicalPriceMap.get(name) || 0;
     totalPredictedRevenue += finalQty * avgPrice;
 
     forecastItems.push({
       itemName: name,
+      baseQty: parseFloat(baseQty.toFixed(2)),
       predictedQty: finalQty,
-      suggestedStock: await computeSuggestedStock(cafeId, name, finalQty),
+      suggestedStock: await computeSuggestedStock(cafeId, name, finalQty, settings, target),
+      factors: storedItemFactors,
     });
   }
 
@@ -297,14 +444,21 @@ const generateForecast = async (cafeId, targetDate) => {
             temp: weather.temp,
             condition: weather.condition,
             humidity: weather.humidity,
+            isRain: weather.isRain,
+            precipMm: weather.precipMm,
+            chanceOfRain: weather.chanceOfRain,
           },
           loadSheddingStage: signals.loadSheddingStage,
           isPublicHoliday: signals.isPublicHoliday,
           isSchoolHoliday: signals.isSchoolHoliday,
           isPayday: signals.isPayday,
           dayOfWeek: targetDayOfWeek,
-          events: events.map((e) => ({ name: e.name, impact: e.impact })),
+          events: events.map((e) => ({ name: e.name, impact: e.impact, impactPct: e.impactPct })),
         },
+        factors: storedForecastFactors,
+        factorSettings: settings,
+        factorEntitlements: entitlements,
+        calibration,
         totalPredictedRevenue: parseFloat(totalPredictedRevenue.toFixed(2)),
         trainingData: {
           transactionCount: transactions.length,

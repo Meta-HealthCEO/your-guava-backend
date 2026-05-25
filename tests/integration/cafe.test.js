@@ -54,6 +54,67 @@ describe('Cafe API', () => {
     });
   });
 
+  describe('Trading hours', () => {
+    it('returns sensible default trading hours when none are set', async () => {
+      const res = await request
+        .get('/api/cafe/me')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body.cafe.tradingHours)).toBe(true);
+      expect(res.body.cafe.tradingHours).toHaveLength(7);
+      const monday = res.body.cafe.tradingHours.find((d) => d.dayOfWeek === 1);
+      expect(monday).toMatchObject({ isOpen: true, openTime: '07:00', closeTime: '17:00' });
+      const sunday = res.body.cafe.tradingHours.find((d) => d.dayOfWeek === 0);
+      expect(sunday.isOpen).toBe(false);
+    });
+
+    it('persists trading hours via PUT and returns the updated week', async () => {
+      const tradingHours = [
+        { dayOfWeek: 0, isOpen: false, openTime: '08:00', closeTime: '14:00' },
+        { dayOfWeek: 1, isOpen: true, openTime: '06:30', closeTime: '18:00' },
+        { dayOfWeek: 2, isOpen: true, openTime: '06:30', closeTime: '18:00' },
+        { dayOfWeek: 3, isOpen: true, openTime: '06:30', closeTime: '18:00' },
+        { dayOfWeek: 4, isOpen: true, openTime: '06:30', closeTime: '18:00' },
+        { dayOfWeek: 5, isOpen: true, openTime: '06:30', closeTime: '20:00' },
+        { dayOfWeek: 6, isOpen: true, openTime: '08:00', closeTime: '16:00' },
+      ];
+
+      const res = await request
+        .put('/api/cafe/me')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ tradingHours });
+
+      expect(res.status).toBe(200);
+      expect(res.body.cafe.tradingHours).toHaveLength(7);
+      expect(res.body.cafe.tradingHours.find((d) => d.dayOfWeek === 1)).toMatchObject({
+        isOpen: true,
+        openTime: '06:30',
+        closeTime: '18:00',
+      });
+      expect(res.body.cafe.tradingHours.find((d) => d.dayOfWeek === 0).isOpen).toBe(false);
+    });
+
+    it('rejects an open day where closeTime is not after openTime', async () => {
+      const tradingHours = [
+        { dayOfWeek: 0, isOpen: false, openTime: '08:00', closeTime: '14:00' },
+        { dayOfWeek: 1, isOpen: true, openTime: '17:00', closeTime: '17:00' },
+        { dayOfWeek: 2, isOpen: true, openTime: '07:00', closeTime: '17:00' },
+        { dayOfWeek: 3, isOpen: true, openTime: '07:00', closeTime: '17:00' },
+        { dayOfWeek: 4, isOpen: true, openTime: '07:00', closeTime: '17:00' },
+        { dayOfWeek: 5, isOpen: true, openTime: '07:00', closeTime: '17:00' },
+        { dayOfWeek: 6, isOpen: true, openTime: '08:00', closeTime: '15:00' },
+      ];
+
+      const res = await request
+        .put('/api/cafe/me')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ tradingHours });
+
+      expect(res.status).toBe(400);
+    });
+  });
+
   describe('GET /api/cafe/list', () => {
     it('owner sees all org cafes', async () => {
       const res = await request

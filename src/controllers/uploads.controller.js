@@ -5,8 +5,97 @@ const Forecast = require('../models/Forecast.model');
 const r2 = require('../services/r2.service');
 const ingestion = require('../services/ingestion.service');
 const { updateForecastActuals, generateWeekForecast } = require('../services/forecast.service');
+const { computeDedupKey } = require('../utils/dedupKey');
 
 const REQUIRED = ['date', 'items', 'total'];
+const VALID_ITEMS_MODES = new Set(['packed', 'line-per-row']);
+
+const validateMapping = (upload, columnMapping, itemsMode) => {
+  if (!VALID_ITEMS_MODES.has(itemsMode || 'packed')) {
+    return `Invalid itemsMode: ${itemsMode}`;
+  }
+
+  const missing = REQUIRED.filter((f) => !columnMapping?.[f]);
+  if (missing.length > 0) {
+    return `Missing required mapping: ${missing.join(', ')}`;
+  }
+
+  const headers = Array.isArray(upload?.headers) ? upload.headers : [];
+  if (headers.length > 0) {
+    const invalid = Object.entries(columnMapping || {})
+      .filter(([, value]) => value != null && value !== '' && !headers.includes(value))
+      .map(([field, value]) => `${field} -> ${value}`);
+    if (invalid.length > 0) {
+      return `Mapped columns are not in this file: ${invalid.join(', ')}`;
+    }
+  }
+
+  return null;
+};
+
+const assertImportableResult = (result) => {
+  if (result.totalRows === 0) {
+    const err = new Error('No transaction rows found in this upload');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (result.imported === 0 && result.errors > 0 && result.errors >= result.totalRows) {
+    const err = new Error('No valid transaction rows could be imported with this mapping');
+    err.statusCode = 400;
+    throw err;
+  }
+};
+
+const assertParsedRowsImportable = (parsed) => {
+  if (parsed.totalRows === 0) {
+    const err = new Error('No transaction rows found in this upload');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (parsed.rows.length === 0 && parsed.errors > 0 && parsed.errors >= parsed.totalRows) {
+    const err = new Error('No valid transaction rows could be imported with this mapping');
+    err.statusCode = 400;
+    throw err;
+  }
+};
+
+const duplicateFilterForRow = (cafeId, row) => {
+  if (row.receiptId) return { cafeId, receiptId: row.receiptId };
+
+  const dedupKey = computeDedupKey({
+    date: row.date.toISOString().slice(0, 10),
+    time: row.date.toISOString().slice(11, 16),
+    total: row.total,
+    items: row.items,
+  });
+  return { cafeId, dedupKey };
+};
+
+const assertRemapHasImportableRows = async (parsed, cafeId, uploadId) => {
+  const approvedRows = parsed.rows.filter((row) => (row.status || 'approved').toLowerCase() === 'approved');
+  if (approvedRows.length === 0) {
+    const err = new Error('No approved transaction rows could be imported with this mapping');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  let duplicateRows = 0;
+  for (const row of approvedRows) {
+    const existing = await Transaction.findOne({
+      ...duplicateFilterForRow(cafeId, row),
+      uploadId: { $ne: uploadId },
+    }).select('_id').lean();
+    if (existing) duplicateRows++;
+  }
+
+  if (duplicateRows === approvedRows.length) {
+    const err = new Error('Every valid row already exists in another upload; remap would leave this upload empty');
+    err.statusCode = 409;
+    throw err;
+  }
+};
 
 const startOfToday = () => {
   const today = new Date();
@@ -51,16 +140,25 @@ const confirm = async (req, res, next) => {
     const { columnMapping, itemsMode } = req.body;
     const cafeId = req.user.cafeId;
 
-    const missing = REQUIRED.filter((f) => !columnMapping?.[f]);
-    if (missing.length > 0) {
-      return res.status(400).json({ success: false, message: `Missing required mapping: ${missing.join(', ')}` });
-    }
-
     const upload = await Upload.findOne({ _id: id, cafeId });
     if (!upload) return res.status(404).json({ success: false, message: 'Upload not found' });
     if (upload.status === 'completed' || upload.status === 'parsing') {
       return res.status(409).json({ success: false, message: `Upload already ${upload.status}` });
     }
+
+    const mappingError = validateMapping(upload, columnMapping, itemsMode);
+    if (mappingError) {
+      return res.status(400).json({ success: false, message: mappingError });
+    }
+
+    const previousUploadState = {
+      status: upload.status,
+      columnMapping: upload.columnMapping?.toObject ? upload.columnMapping.toObject() : { ...(upload.columnMapping || {}) },
+      itemsMode: upload.itemsMode,
+      stats: upload.stats?.toObject ? upload.stats.toObject() : { ...(upload.stats || {}) },
+      dateRange: upload.dateRange?.toObject ? upload.dateRange.toObject() : { ...(upload.dateRange || {}) },
+      completedAt: upload.completedAt,
+    };
 
     upload.status = 'parsing';
     upload.columnMapping = columnMapping;
@@ -69,7 +167,13 @@ const confirm = async (req, res, next) => {
 
     try {
       const buffer = await r2.downloadFile(upload.r2Key);
+      if (!Buffer.isBuffer(buffer)) {
+        const err = new Error('Original upload file is unavailable');
+        err.statusCode = 503;
+        throw err;
+      }
       const ext = upload.fileName.split('.').pop().toLowerCase();
+      await Transaction.deleteMany({ cafeId, uploadId: upload._id });
       const result = await ingestion.ingestParsedRows(buffer, {
         cafeId,
         uploadId: upload._id,
@@ -77,6 +181,7 @@ const confirm = async (req, res, next) => {
         itemsMode: upload.itemsMode,
         fileExt: ext,
       });
+      assertImportableResult(result);
 
       upload.status = 'completed';
       upload.stats = {
@@ -116,9 +221,15 @@ const confirm = async (req, res, next) => {
         dateRange: upload.dateRange,
       });
     } catch (err) {
-      upload.status = 'failed';
+      upload.status = previousUploadState.status;
+      upload.columnMapping = previousUploadState.columnMapping;
+      upload.itemsMode = previousUploadState.itemsMode;
+      upload.stats = previousUploadState.stats;
+      upload.dateRange = previousUploadState.dateRange;
+      upload.completedAt = previousUploadState.completedAt;
       upload.errorMessage = err.message;
       await upload.save();
+      await Transaction.deleteMany({ cafeId, uploadId: upload._id });
       throw err;
     }
   } catch (error) {
@@ -172,7 +283,9 @@ const rows = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
     const upload = await Upload.findOne({ _id: req.params.id, cafeId }).lean();
-    if (!upload) return res.status(404).json({ success: false, message: 'Upload not found' });
+    if (!upload || upload.status === 'deleted') {
+      return res.status(404).json({ success: false, message: 'Upload not found' });
+    }
 
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
@@ -203,11 +316,6 @@ const remap = async (req, res, next) => {
     const { columnMapping, itemsMode } = req.body;
     const cafeId = req.user.cafeId;
 
-    const missing = REQUIRED.filter((f) => !columnMapping?.[f]);
-    if (missing.length > 0) {
-      return res.status(400).json({ success: false, message: `Missing required mapping: ${missing.join(', ')}` });
-    }
-
     const upload = await Upload.findOne({ _id: id, cafeId });
     if (!upload || upload.status === 'deleted') {
       return res.status(404).json({ success: false, message: 'Upload not found' });
@@ -215,6 +323,20 @@ const remap = async (req, res, next) => {
     if (upload.status === 'parsing' || upload.status === 'pending_mapping') {
       return res.status(409).json({ success: false, message: `Cannot remap while ${upload.status}` });
     }
+
+    const mappingError = validateMapping(upload, columnMapping, itemsMode);
+    if (mappingError) {
+      return res.status(400).json({ success: false, message: mappingError });
+    }
+
+    const previousUploadState = {
+      status: upload.status,
+      columnMapping: upload.columnMapping?.toObject ? upload.columnMapping.toObject() : { ...(upload.columnMapping || {}) },
+      itemsMode: upload.itemsMode,
+      stats: upload.stats?.toObject ? upload.stats.toObject() : { ...(upload.stats || {}) },
+      dateRange: upload.dateRange?.toObject ? upload.dateRange.toObject() : { ...(upload.dateRange || {}) },
+      completedAt: upload.completedAt,
+    };
 
     upload.status = 'parsing';
     upload.columnMapping = columnMapping;
@@ -224,6 +346,11 @@ const remap = async (req, res, next) => {
     try {
       // 1. Parse first (read-only — can fail without any side effects)
       const buffer = await r2.downloadFile(upload.r2Key);
+      if (!Buffer.isBuffer(buffer)) {
+        const err = new Error('Original upload file is unavailable');
+        err.statusCode = 503;
+        throw err;
+      }
       const ext = upload.fileName.split('.').pop().toLowerCase();
       const { parseBuffer } = require('../services/parser.service');
       const parsed = await parseBuffer(buffer, {
@@ -231,6 +358,8 @@ const remap = async (req, res, next) => {
         itemsMode: upload.itemsMode,
         fileExt: ext,
       });
+      assertParsedRowsImportable(parsed);
+      await assertRemapHasImportableRows(parsed, cafeId, upload._id);
 
       // 2. Parse succeeded — now safe to delete existing transactions
       await Transaction.deleteMany({ cafeId, uploadId: upload._id });
@@ -240,6 +369,7 @@ const remap = async (req, res, next) => {
         cafeId,
         uploadId: upload._id,
       });
+      assertImportableResult(result);
 
       upload.status = 'completed';
       upload.stats = {
@@ -269,7 +399,12 @@ const remap = async (req, res, next) => {
         dateRange: upload.dateRange,
       });
     } catch (err) {
-      upload.status = 'failed';
+      upload.status = previousUploadState.status;
+      upload.columnMapping = previousUploadState.columnMapping;
+      upload.itemsMode = previousUploadState.itemsMode;
+      upload.stats = previousUploadState.stats;
+      upload.dateRange = previousUploadState.dateRange;
+      upload.completedAt = previousUploadState.completedAt;
       upload.errorMessage = err.message;
       await upload.save();
       throw err;
@@ -289,6 +424,7 @@ const remove = async (req, res, next) => {
 
     const dateRange = upload.dateRange;
     await Transaction.deleteMany({ cafeId, uploadId: upload._id });
+    await ingestion.rebuildItemsForCafe(cafeId);
     await invalidatePlanningForecasts(cafeId);
     await fillActualsForRange(cafeId, dateRange);
     try { await r2.deleteFile(upload.r2Key); } catch (err) {
