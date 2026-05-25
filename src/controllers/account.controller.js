@@ -97,6 +97,43 @@ const getAccount = async (req, res, next) => {
   }
 };
 
+const getCreditBalance = async (req, res, next) => {
+  try {
+    let orgId = req.user.orgId;
+
+    if (!orgId) {
+      const user = await User.findById(req.user.id).select('orgId').lean();
+      orgId = user?.orgId;
+    }
+
+    const org = await Organization.findById(orgId);
+    if (!org) {
+      return res.status(404).json({ success: false, message: 'Organization not found' });
+    }
+
+    ensureFreshCreditWindow(org);
+    await org.save();
+
+    const plan = getPlan(org.plan);
+    return res.status(200).json({
+      success: true,
+      credits: creditSnapshot(org),
+      organization: {
+        plan: normalisePlanId(org.plan),
+        billingStatus: org.billingStatus,
+        billingCycle: org.billingCycle,
+      },
+      plan: {
+        id: plan.id,
+        name: plan.name,
+        includedGuavaCredits: plan.includedGuavaCredits ?? plan.includedAiCredits,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 const updateProfile = async (req, res, next) => {
   try {
     const { name, organizationName, billingEmail } = req.body;
@@ -340,6 +377,7 @@ module.exports = {
   buyAiCredits,
   checkout,
   getAccount,
+  getCreditBalance,
   getPaymentStatus,
   handleOneGateReturn,
   handleOneGateWebhook,

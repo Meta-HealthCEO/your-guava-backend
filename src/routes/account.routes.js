@@ -4,6 +4,7 @@ const { ownerOnly } = require('../middleware/rbac.middleware');
 const {
   checkout,
   getAccount,
+  getCreditBalance,
   getPaymentStatus,
   handleOneGateReturn,
   handleOneGateWebhook,
@@ -18,6 +19,7 @@ router.get('/payments/onegate/return', handleOneGateReturn);
 
 router.use(authMiddleware);
 
+router.get('/credits', getCreditBalance);
 router.get('/', getAccount);
 router.patch('/profile', updateProfile);
 router.post('/checkout', ownerOnly, checkout);

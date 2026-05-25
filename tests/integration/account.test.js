@@ -42,6 +42,30 @@ describe('Account API', () => {
     expect(res.body.account.plans.map((plan) => plan.id)).toEqual(['starter', 'growth', 'pro']);
   });
 
+  it('returns a lightweight Guava Credit balance for the app toolbar', async () => {
+    const res = await request
+      .get('/api/account/credits')
+      .set('Authorization', `Bearer ${ownerToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.credits).toEqual(
+      expect.objectContaining({
+        included: expect.any(Number),
+        bonus: expect.any(Number),
+        used: expect.any(Number),
+        available: expect.any(Number),
+      })
+    );
+    expect(res.body.organization).toEqual(
+      expect.objectContaining({ plan: 'starter', billingStatus: 'trialing' })
+    );
+    expect(res.body.plan).toEqual(
+      expect.objectContaining({ id: 'starter', name: 'Starter', includedGuavaCredits: expect.any(Number) })
+    );
+    expect(res.body.account).toBeUndefined();
+  });
+
   it('updates profile and organisation billing details', async () => {
     const res = await request
       .patch('/api/account/profile')
