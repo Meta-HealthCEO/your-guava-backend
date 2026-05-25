@@ -462,10 +462,81 @@ describe('Forecasts API', () => {
       expect(res.body.meta.overallRevenueAccuracy).toEqual(expect.any(Number));
       expect(res.body.meta.avgDailyRevenueAccuracy).toEqual(expect.any(Number));
       expect(res.body.meta.avgRevenueAccuracy).toBe(res.body.meta.avgDailyRevenueAccuracy);
+      expect(res.body.pagination).toEqual(
+        expect.objectContaining({ total: 1, page: 1, limit: 30, pages: 1 })
+      );
 
       const stored = await Forecast.findOne({ cafeId: cafe._id, date: target }).lean();
       expect(stored.actualRevenue).toBe(384);
       expect(stored.totalPredictedRevenue).toBeGreaterThan(0);
+    });
+
+    it('paginates historical prediction rows while keeping full-period summary totals', async () => {
+      const Cafe = require('../../src/models/Cafe.model');
+      const Forecast = require('../../src/models/Forecast.model');
+      const Transaction = require('../../src/models/Transaction.model');
+      const cafe = await Cafe.findOne({});
+
+      for (let index = 0; index < 5; index += 1) {
+        const date = new Date('2026-05-20T00:00:00.000Z');
+        date.setDate(date.getDate() - index);
+        const transactionDate = new Date(date);
+        transactionDate.setHours(10, 0, 0, 0);
+
+        await Forecast.create({
+          cafeId: cafe._id,
+          date,
+          totalPredictedRevenue: 100,
+          predictedTransactionCount: 5,
+          actualRevenue: 120,
+          actualTransactionCount: 1,
+          accuracy: 83.3,
+          actualsUpdatedAt: new Date(),
+          items: [],
+          factors: [
+            { key: 'weather', label: 'Weather', active: false },
+            { key: 'loadShedding', label: 'Load shedding', active: false },
+            { key: 'holiday', label: 'Holiday', active: false },
+            { key: 'payday', label: 'Payday', active: false },
+            { key: 'events', label: 'Events', active: false },
+          ],
+          factorSettings: { weather: { enabled: true } },
+          factorEntitlements: { weather: { enabled: true } },
+          calibration: { sampleSize: 1, overallMultiplier: 1, factorMultipliers: [], itemMultipliers: [] },
+          signals: {
+            weather: { temp: 18, condition: 'Clear', humidity: 60 },
+            loadSheddingStage: 0,
+            isPublicHoliday: false,
+            isSchoolHoliday: false,
+            isPayday: false,
+            dayOfWeek: date.getDay(),
+            events: [],
+          },
+        });
+
+        await Transaction.create({
+          cafeId: cafe._id,
+          date: transactionDate,
+          hour: 10,
+          dayOfWeek: date.getDay(),
+          status: 'approved',
+          items: [{ name: 'Flat White', quantity: 1, unitPrice: 120 }],
+          total: 120,
+        });
+      }
+
+      const res = await request
+        .get('/api/forecasts/history?startDate=2026-05-01&endDate=2026-05-20&page=2&limit=2&backfill=false')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.history).toHaveLength(2);
+      expect(res.body.pagination).toEqual(
+        expect.objectContaining({ total: 5, page: 2, limit: 2, pages: 3 })
+      );
+      expect(res.body.meta.totalRows).toBe(5);
+      expect(res.body.meta.totalPredictedRevenue).toBe(500);
+      expect(res.body.meta.totalActualRevenue).toBe(600);
     });
 
     it('returns quickly with pending metadata when history needs backfill', async () => {

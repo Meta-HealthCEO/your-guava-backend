@@ -313,6 +313,8 @@ const getHistory = async (req, res, next) => {
     const cafeId = req.user.cafeId;
     const cafeObjectId = new mongoose.Types.ObjectId(String(cafeId));
     const days = clampHistoryDays(req.query.days);
+    const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit, 10) || 30));
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const syncBackfillLimit =
       req.query.backfill === 'sync'
         ? Math.max(1, Math.min(HISTORY_BACKFILL_BATCH_SIZE, Number.parseInt(req.query.backfillLimit, 10) || 1))
@@ -410,17 +412,21 @@ const getHistory = async (req, res, next) => {
     const avgDailyRevenueAccuracy = accuracyRows.length > 0
       ? parseFloat((accuracyRows.reduce((sum, row) => sum + row.revenueAccuracy, 0) / accuracyRows.length).toFixed(1))
       : null;
+    const totalRows = rows.length;
+    const totalPages = Math.max(Math.ceil(totalRows / limit), 1);
+    const currentPage = Math.min(page, totalPages);
+    const pagedRows = rows.slice((currentPage - 1) * limit, currentPage * limit);
 
     return res.status(200).json({
       success: true,
-      history: rows,
-      rows,
+      history: pagedRows,
+      rows: pagedRows,
       meta: {
         days,
         startDate: toDateKey(startDay),
         endDate: toDateKey(endDay),
         totalTradingDays: dateKeys.length,
-        totalRows: rows.length,
+        totalRows,
         generated,
         pendingDays: missingDateKeys.length,
         isPartial: missingDateKeys.length > 0,
@@ -438,6 +444,12 @@ const getHistory = async (req, res, next) => {
         variancePct: totalPredictedRevenue > 0
           ? parseFloat(((variance / totalPredictedRevenue) * 100).toFixed(1))
           : null,
+      },
+      pagination: {
+        total: totalRows,
+        page: currentPage,
+        limit,
+        pages: totalPages,
       },
     });
   } catch (error) {
