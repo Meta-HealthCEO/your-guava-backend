@@ -47,6 +47,11 @@ const create = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Leave period must include at least one weekday' });
     }
 
+    const staffMember = await Staff.findOne({ _id: staffId, cafeId }).select('_id').lean();
+    if (!staffMember) {
+      return res.status(404).json({ success: false, message: 'Staff member not found' });
+    }
+
     // Check leave balance (skip for unpaid leave)
     if (type !== 'unpaid') {
       const balance = await LeaveBalance.findOne({ staffId, cafeId });

@@ -10,11 +10,15 @@ const {
   syncOrders,
   subscribeWebhook,
   processWebhookEvent,
+  createOAuthState,
+  verifyOAuthState,
+  verifyWebhookSignature,
 } = require('../services/yoco.service');
+const { encryptSecret } = require('../services/secrets.service');
 
 // GET /api/yoco/auth — Get OAuth authorization URL
 router.get('/auth', authMiddleware, (req, res) => {
-  const state = req.user.cafeId;
+  const state = createOAuthState(req.user.cafeId);
   const url = getAuthorizationUrl(state);
   res.json({ success: true, url });
 });
@@ -22,9 +26,12 @@ router.get('/auth', authMiddleware, (req, res) => {
 // POST /api/yoco/callback — Exchange OAuth code for tokens
 router.post('/callback', authMiddleware, async (req, res, next) => {
   try {
-    const { code } = req.body;
+    const { code, state } = req.body;
     if (!code) {
       return res.status(400).json({ success: false, message: 'Authorization code required' });
+    }
+    if (!verifyOAuthState(state, req.user.cafeId)) {
+      return res.status(400).json({ success: false, message: 'Invalid or expired OAuth state' });
     }
 
     const tokens = await exchangeCode(code);
@@ -33,8 +40,8 @@ router.post('/callback', authMiddleware, async (req, res, next) => {
     await Cafe.findByIdAndUpdate(req.user.cafeId, {
       $set: {
         yocoConnected: true,
-        'yocoTokens.accessToken': tokens.access_token,
-        'yocoTokens.refreshToken': tokens.refresh_token,
+        'yocoTokens.accessToken': encryptSecret(tokens.access_token),
+        'yocoTokens.refreshToken': encryptSecret(tokens.refresh_token),
         'yocoTokens.expiresAt': expiresAt,
       },
     });
@@ -99,19 +106,19 @@ router.post('/sync', authMiddleware, async (req, res, next) => {
   }
 });
 
-// POST /api/yoco/webhook — Webhook handler (no auth — called by Yoco)
+// POST /api/yoco/webhook — Webhook handler (no auth — called by Yoco, signature-verified)
 router.post('/webhook', async (req, res) => {
-  try {
-    // Respond quickly to Yoco (must respond within 15s)
-    res.status(200).json({ received: true });
-
-    // Process asynchronously
-    processWebhookEvent(req.body).catch((err) => {
-      console.error('[yoco webhook] Processing error:', err.message);
-    });
-  } catch {
-    res.status(200).json({ received: true });
+  const verification = verifyWebhookSignature(req);
+  if (!verification.valid) {
+    console.warn(`[yoco webhook] Rejected: ${verification.reason}`);
+    return res.status(401).json({ received: false, message: 'Invalid webhook signature' });
   }
+
+  // Respond quickly to Yoco (must respond within 15s), then process asynchronously
+  res.status(200).json({ received: true });
+  processWebhookEvent(req.body).catch((err) => {
+    console.error('[yoco webhook] Processing error:', err.message);
+  });
 });
 
 // POST /api/yoco/disconnect — Disconnect Yoco

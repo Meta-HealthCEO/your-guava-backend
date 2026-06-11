@@ -65,30 +65,39 @@ const createTestUser = async (overrides = {}) => {
   };
 };
 
-// Helper to create a manager via the team invite
+// Helper to create a manager via the team invite.
+// The server generates the temporary password; with no email provider
+// configured in tests it is returned in the invite response.
 const createTestManager = async (ownerToken, cafeIds) => {
   const supertest = require('supertest');
   const request = supertest(app);
 
-  await request
+  const inviteRes = await request
     .post('/api/team/invite')
     .set('Authorization', `Bearer ${ownerToken}`)
     .send({
       name: 'Test Manager',
       email: 'manager@yourguava.com',
-      password: 'password123',
       cafeIds,
     });
+
+  if (!inviteRes.body.temporaryPassword) {
+    throw new Error(
+      `createTestManager: temporaryPassword missing from invite response (emailSent=${inviteRes.body.emailSent}). ` +
+        'Ensure no email provider is configured in the test environment.'
+    );
+  }
 
   // Login as manager to get token
   const loginRes = await request.post('/api/auth/login').send({
     email: 'manager@yourguava.com',
-    password: 'password123',
+    password: inviteRes.body.temporaryPassword,
   });
 
   return {
     token: loginRes.body.accessToken,
     user: loginRes.body.user,
+    temporaryPassword: inviteRes.body.temporaryPassword,
   };
 };
 

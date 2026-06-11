@@ -291,6 +291,10 @@ const computeSuggestedStock = async (cafeId, itemName, predictedQty, settings, t
     }
   }
 
+  return computeSuggestedStockFromPairs(predictedQty, pairs, settings);
+};
+
+const computeSuggestedStockFromPairs = (predictedQty, pairs, settings) => {
   const safetyMargin = 1 + settings.stock.safetyMarginPct / 100;
   const maxBias = settings.stock.maxBiasPct / 100;
 
@@ -306,6 +310,47 @@ const computeSuggestedStock = async (cafeId, itemName, predictedQty, settings, t
 
   // Cold start: just apply the safety margin
   return Math.round(predictedQty * safetyMargin);
+};
+
+const computeSuggestedStockMap = async (cafeId, predictedQtyByItem, settings, targetDate = new Date()) => {
+  const itemNames = [...predictedQtyByItem.keys()];
+  if (itemNames.length === 0) return new Map();
+
+  const target = new Date(targetDate);
+  target.setHours(0, 0, 0, 0);
+  const thirtyDaysAgo = new Date(target);
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  thirtyDaysAgo.setHours(0, 0, 0, 0);
+
+  const pastForecasts = await Forecast.find({
+    cafeId,
+    date: { $gte: thirtyDaysAgo, $lt: target },
+    'items.itemName': { $in: itemNames },
+    'items.actualQty': { $gt: 0 },
+  })
+    .select('items')
+    .lean();
+
+  const itemNameSet = new Set(itemNames);
+  const pairsByItem = new Map(itemNames.map((name) => [name, []]));
+  for (const doc of pastForecasts) {
+    for (const item of doc.items || []) {
+      if (itemNameSet.has(item.itemName) && item.actualQty > 0 && item.predictedQty != null) {
+        pairsByItem.get(item.itemName).push({ predicted: item.predictedQty, actual: item.actualQty });
+      }
+    }
+  }
+
+  return new Map(
+    itemNames.map((itemName) => [
+      itemName,
+      computeSuggestedStockFromPairs(
+        predictedQtyByItem.get(itemName),
+        pairsByItem.get(itemName) || [],
+        settings
+      ),
+    ])
+  );
 };
 
 /**
@@ -356,7 +401,7 @@ const generateForecast = async (cafeId, targetDate) => {
 
   // Fetch signals, weather, and events in parallel
   const [signals, weather, events] = await Promise.all([
-    getSignalsForDate(target, { lat, lng }),
+    getSignalsForDate(target, { lat, lng, city: cafe?.location?.city }),
     getWeatherForecast(lat, lng, target),
     Event.find({ cafeId, date: { $gte: target, $lt: nextTarget } }).lean(),
   ]);
@@ -399,6 +444,7 @@ const generateForecast = async (cafeId, targetDate) => {
   );
   const storedForecastFactors = [...forecastFactors, globalLearningFactor];
   const forecastItems = [];
+  const predictedQtyByItem = new Map();
   let totalPredictedRevenue = 0;
 
   for (const name of topItems) {
@@ -427,9 +473,14 @@ const generateForecast = async (cafeId, targetDate) => {
       itemName: name,
       baseQty: parseFloat(baseQty.toFixed(2)),
       predictedQty: finalQty,
-      suggestedStock: await computeSuggestedStock(cafeId, name, finalQty, settings, target),
       factors: storedItemFactors,
     });
+    predictedQtyByItem.set(name, finalQty);
+  }
+
+  const suggestedStockByItem = await computeSuggestedStockMap(cafeId, predictedQtyByItem, settings, target);
+  for (const item of forecastItems) {
+    item.suggestedStock = suggestedStockByItem.get(item.itemName) ?? item.predictedQty;
   }
 
   // Upsert forecast document
@@ -487,18 +538,22 @@ const generateForecast = async (cafeId, targetDate) => {
  * @returns {Promise<Forecast[]>}
  */
 const generateWeekForecast = async (cafeId) => {
-  const forecasts = [];
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  for (let i = 0; i < 7; i++) {
+  const targetDates = Array.from({ length: 7 }, (_, i) => {
     const targetDate = new Date(today);
     targetDate.setDate(today.getDate() + i);
-    const forecast = await generateForecast(cafeId, targetDate);
-    forecasts.push(forecast);
-  }
+    return targetDate;
+  });
 
-  return forecasts;
+  // Resilient: a transient failure on one day must not lose the whole week.
+  const results = await Promise.allSettled(
+    targetDates.map((targetDate) => generateForecast(cafeId, targetDate))
+  );
+  return results
+    .filter((result) => result.status === 'fulfilled')
+    .map((result) => result.value);
 };
 
 /**

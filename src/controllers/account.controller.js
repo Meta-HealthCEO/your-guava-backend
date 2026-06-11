@@ -19,6 +19,7 @@ const {
   usageSummary,
 } = require('../services/usage.service');
 const oneGate = require('../services/onegate.service');
+const { clearApiCache } = require('../middleware/cache.middleware');
 
 const buildAccountPayload = async (userId) => {
   const user = await User.findById(userId).select('-password -refreshTokens').lean();
@@ -141,6 +142,13 @@ const updateProfile = async (req, res, next) => {
     const user = await User.findById(req.user.id);
     const org = await Organization.findById(user.orgId);
 
+    // Organization-level fields are owner-only; anyone can update their own name.
+    if ((organizationName || billingEmail) && user.role !== 'owner') {
+      return res
+        .status(403)
+        .json({ success: false, message: 'Only the owner can change organization details' });
+    }
+
     if (name && name.trim().length >= 2) {
       user.name = name.trim();
     }
@@ -152,6 +160,7 @@ const updateProfile = async (req, res, next) => {
     }
 
     await Promise.all([user.save(), org.save()]);
+    clearApiCache();
 
     const account = await buildAccountPayload(req.user.id);
     return res.status(200).json({ success: true, account });
@@ -183,6 +192,7 @@ const mockCheckout = async ({ req, org, selectedPlan, billingCycle, paymentMetho
   if (planChanged) {
     await invalidateFutureForecastsForOrg(org._id);
   }
+  clearApiCache();
 
   const account = await buildAccountPayload(req.user.id);
   return {
@@ -293,6 +303,7 @@ const buyAiCredits = async (req, res, next) => {
     ensureFreshCreditWindow(org);
     org.aiCredits.bonus = (org.aiCredits?.bonus || 0) + pack.credits;
     await org.save();
+    clearApiCache();
 
     const account = await buildAccountPayload(req.user.id);
     return res.status(200).json({
@@ -323,6 +334,7 @@ const handleOneGateWebhook = async (req, res, next) => {
     }
 
     await reconcileOneGatePayment(reference, req.body);
+    clearApiCache();
     return res.status(200).json({ success: true });
   } catch (error) {
     if (error.statusCode === 202) {
@@ -341,6 +353,7 @@ const handleOneGateReturn = async (req, res) => {
     try {
       const session = await reconcileOneGatePayment(reference);
       status = session.status === 'paid' ? 'paid' : session.status;
+      clearApiCache();
     } catch (_error) {
       status = requestedResult === 'error' ? 'failed' : status;
     }
@@ -356,6 +369,7 @@ const getPaymentStatus = async (req, res, next) => {
     if (!session || String(session.orgId) !== String(req.user.orgId)) {
       return res.status(404).json({ success: false, message: 'Payment session not found' });
     }
+    clearApiCache();
 
     return res.status(200).json({
       success: true,

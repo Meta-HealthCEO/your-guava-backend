@@ -35,7 +35,6 @@ describe('Team API', () => {
         .send({
           name: 'New Manager',
           email: 'manager@yourguava.com',
-          password: 'password123',
           cafeIds: [cafeId],
         });
 
@@ -44,6 +43,9 @@ describe('Team API', () => {
       expect(res.body.manager).toBeDefined();
       expect(res.body.manager.email).toBe('manager@yourguava.com');
       expect(res.body.manager.role).toBe('manager');
+      // Email was "sent" (mock), so the password must not leak into the response
+      expect(res.body.emailSent).toBe(true);
+      expect(res.body.temporaryPassword).toBeUndefined();
       expect(inviteSpy).toHaveBeenCalledTimes(1);
       expect(inviteSpy).toHaveBeenCalledWith({
         manager: expect.objectContaining({
@@ -52,7 +54,7 @@ describe('Team API', () => {
         }),
         owner: expect.objectContaining({ email: 'test@yourguava.com' }),
         cafes: expect.arrayContaining([expect.objectContaining({ name: 'Test Cafe' })]),
-        temporaryPassword: 'password123',
+        temporaryPassword: expect.stringMatching(/^Guava-/),
       });
 
       const persisted = await User.findOne({ email: 'manager@yourguava.com' });
@@ -61,8 +63,33 @@ describe('Team API', () => {
       expect(persisted.orgId.toString()).toBe(ownerUser.orgId.toString());
       expect(persisted.activeCafeId.toString()).toBe(cafeId.toString());
       expect(persisted.cafeIds.map((id) => id.toString())).toEqual([cafeId.toString()]);
-      expect(persisted.password).not.toBe('password123');
-      await expect(persisted.comparePassword('password123')).resolves.toBe(true);
+
+      const sentPassword = inviteSpy.mock.calls[0][0].temporaryPassword;
+      expect(persisted.password).not.toBe(sentPassword);
+      await expect(persisted.comparePassword(sentPassword)).resolves.toBe(true);
+    });
+
+    it('ignores a client-supplied password and generates its own', async () => {
+      const cafeId = ownerUser.activeCafeId;
+
+      const res = await request
+        .post('/api/team/invite')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({
+          name: 'New Manager',
+          email: 'manager2@yourguava.com',
+          password: 'attacker-chosen-password',
+          cafeIds: [cafeId],
+        });
+
+      expect(res.status).toBe(201);
+      // No email provider configured → password returned for manual relay
+      expect(res.body.emailSent).toBe(false);
+      expect(res.body.temporaryPassword).toMatch(/^Guava-/);
+
+      const persisted = await User.findOne({ email: 'manager2@yourguava.com' });
+      await expect(persisted.comparePassword('attacker-chosen-password')).resolves.toBe(false);
+      await expect(persisted.comparePassword(res.body.temporaryPassword)).resolves.toBe(true);
     });
 
     it('manager cannot invite (403)', async () => {

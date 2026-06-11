@@ -23,11 +23,15 @@ const localPathForKey = (key) => {
   return target;
 };
 
-const signLocalUrl = (key, expires) =>
-  crypto
-    .createHmac('sha256', process.env.JWT_SECRET || 'dev-local-storage-secret')
+const signLocalUrl = (key, expires) => {
+  if (!process.env.JWT_SECRET) {
+    throw new Error('JWT_SECRET must be set to sign local download URLs');
+  }
+  return crypto
+    .createHmac('sha256', process.env.JWT_SECRET)
     .update(`${key}.${expires}`)
     .digest('hex');
+};
 
 const getClient = () => {
   if (client) return client;

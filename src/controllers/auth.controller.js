@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const User = require('../models/User.model');
 const Cafe = require('../models/Cafe.model');
 const Organization = require('../models/Organization.model');
@@ -9,6 +10,25 @@ const COOKIE_OPTIONS = {
   sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
   secure: process.env.NODE_ENV === 'production',
   maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days in ms
+};
+
+// Max stored refresh tokens per user (roughly one per device, plus rotations)
+const MAX_REFRESH_TOKENS = 10;
+
+// Drops expired/invalid tokens so the stored list stays bounded and clean.
+const pruneRefreshTokens = (entries = []) =>
+  entries.filter((entry) => {
+    try {
+      jwt.verify(entry.token, process.env.JWT_REFRESH_SECRET);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
+const storeRefreshToken = (user, refreshToken) => {
+  const pruned = pruneRefreshTokens(user.refreshTokens);
+  user.refreshTokens = [...pruned.slice(-(MAX_REFRESH_TOKENS - 1)), { token: refreshToken }];
 };
 
 const generateTokens = (userId, cafeId, role, orgId) => {
@@ -23,8 +43,10 @@ const generateTokens = (userId, cafeId, role, orgId) => {
     { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
   );
 
+  // jti makes every refresh token unique even when issued in the same second,
+  // so rotation never re-creates a token byte-identical to the one it consumed.
   const refreshToken = jwt.sign(
-    { id: userId },
+    { id: userId, jti: crypto.randomUUID() },
     process.env.JWT_REFRESH_SECRET,
     { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' }
   );
@@ -70,7 +92,7 @@ const register = async (req, res, next) => {
 
     const { accessToken, refreshToken } = generateTokens(user._id, cafe._id, 'owner', org._id);
 
-    user.refreshTokens.push({ token: refreshToken });
+    storeRefreshToken(user, refreshToken);
     await user.save();
 
     await emailService.sendWelcomeEmail({ user, org, cafe });
@@ -122,7 +144,7 @@ const login = async (req, res, next) => {
 
     const { accessToken, refreshToken } = generateTokens(user._id, user.activeCafeId, user.role, user.orgId);
 
-    user.refreshTokens.push({ token: refreshToken });
+    storeRefreshToken(user, refreshToken);
     await user.save();
 
     const cookieOptions = {
@@ -167,6 +189,17 @@ const refresh = async (req, res, next) => {
     // Verify the token
     jwt.verify(token, process.env.JWT_REFRESH_SECRET);
 
+    // Atomically consume the presented token. The $pull is the race gate:
+    // if two requests arrive with the same token, only the first removes it
+    // (modifiedCount === 1); the loser is treated as a replay and rejected.
+    const consume = await User.updateOne(
+      { _id: user._id, 'refreshTokens.token': token },
+      { $pull: { refreshTokens: { token } } }
+    );
+    if (consume.modifiedCount === 0) {
+      return res.status(401).json({ success: false, message: 'Invalid or expired refresh token' });
+    }
+
     const accessToken = jwt.sign(
       {
         id: user._id,
@@ -177,6 +210,22 @@ const refresh = async (req, res, next) => {
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
     );
+
+    // Rotate: issue and store a fresh, unique (jti) refresh token, bounded list.
+    const newRefreshToken = jwt.sign(
+      { id: user._id, jti: crypto.randomUUID() },
+      process.env.JWT_REFRESH_SECRET,
+      { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' }
+    );
+    await User.updateOne(
+      { _id: user._id },
+      {
+        $push: {
+          refreshTokens: { $each: [{ token: newRefreshToken }], $slice: -MAX_REFRESH_TOKENS },
+        },
+      }
+    );
+    res.cookie('refreshToken', newRefreshToken, COOKIE_OPTIONS);
 
     return res.status(200).json({ success: true, accessToken });
   } catch (error) {

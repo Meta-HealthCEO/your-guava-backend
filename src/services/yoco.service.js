@@ -1,10 +1,101 @@
 const axios = require('axios');
+const crypto = require('crypto');
 const Cafe = require('../models/Cafe.model');
 const Transaction = require('../models/Transaction.model');
 const {
   rebuildItemsForCafe,
   reconcileTransactionItems,
 } = require('./menuItems.service');
+const { encryptSecret, decryptSecret } = require('./secrets.service');
+
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+const WEBHOOK_TIMESTAMP_TOLERANCE_S = 5 * 60;
+
+// --- OAuth state (CSRF protection) ---
+
+const signOAuthState = (cafeId, expiresAt) =>
+  crypto
+    .createHmac('sha256', process.env.JWT_SECRET)
+    .update(`yoco-oauth.${cafeId}.${expiresAt}`)
+    .digest('base64url');
+
+/**
+ * Builds an HMAC-signed OAuth state value bound to the cafe.
+ * Format: <cafeId>.<expiresAtMs>.<signature>
+ */
+function createOAuthState(cafeId) {
+  const expiresAt = Date.now() + OAUTH_STATE_TTL_MS;
+  return `${cafeId}.${expiresAt}.${signOAuthState(cafeId, expiresAt)}`;
+}
+
+/**
+ * Verifies an OAuth state value and that it belongs to the given cafe.
+ * @returns {boolean}
+ */
+function verifyOAuthState(state, cafeId) {
+  if (typeof state !== 'string') return false;
+  const [stateCafeId, expiresAt, sig] = state.split('.');
+  if (!stateCafeId || !expiresAt || !sig) return false;
+  if (stateCafeId !== String(cafeId)) return false;
+  if (Number(expiresAt) < Date.now()) return false;
+
+  const expected = signOAuthState(stateCafeId, expiresAt);
+  const sigBuf = Buffer.from(sig, 'base64url');
+  const expectedBuf = Buffer.from(expected, 'base64url');
+  return sigBuf.length === expectedBuf.length && crypto.timingSafeEqual(sigBuf, expectedBuf);
+}
+
+// --- Webhook signature verification (svix-compatible scheme used by Yoco) ---
+
+/**
+ * Verifies the webhook-id/webhook-timestamp/webhook-signature headers
+ * against the raw request body using YOCO_WEBHOOK_SECRET.
+ * @param {object} req – Express request with req.rawBody populated
+ * @returns {{valid: boolean, reason?: string}}
+ */
+function verifyWebhookSignature(req) {
+  const secret = process.env.YOCO_WEBHOOK_SECRET;
+  if (!secret) {
+    return { valid: false, reason: 'YOCO_WEBHOOK_SECRET not configured' };
+  }
+
+  const id = req.headers['webhook-id'];
+  const timestamp = req.headers['webhook-timestamp'];
+  const signatureHeader = req.headers['webhook-signature'];
+  if (!id || !timestamp || !signatureHeader || !req.rawBody) {
+    return { valid: false, reason: 'Missing webhook signature headers' };
+  }
+
+  const ageSeconds = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (!Number.isFinite(ageSeconds) || ageSeconds > WEBHOOK_TIMESTAMP_TOLERANCE_S) {
+    return { valid: false, reason: 'Webhook timestamp outside tolerance' };
+  }
+
+  const secretBytes = Buffer.from(secret.replace(/^whsec_/, ''), 'base64');
+  const expected = crypto
+    .createHmac('sha256', secretBytes)
+    .update(`${id}.${timestamp}.${req.rawBody.toString('utf8')}`)
+    .digest('base64');
+  const expectedBuf = Buffer.from(expected, 'base64');
+
+  // Header may contain several space-separated "v1,<sig>" entries (key rotation).
+  // Compare against all candidates without short-circuiting so timing does not
+  // leak which entry matched.
+  const candidates = String(signatureHeader)
+    .split(' ')
+    .map((part) => (part.includes(',') ? part.split(',')[1] : part))
+    .filter(Boolean);
+
+  let valid = false;
+  for (const candidate of candidates) {
+    const candidateBuf = Buffer.from(candidate, 'base64');
+    if (candidateBuf.length === expectedBuf.length && crypto.timingSafeEqual(candidateBuf, expectedBuf)) {
+      valid = true;
+    }
+  }
+
+  return valid ? { valid: true } : { valid: false, reason: 'Signature mismatch' };
+}
 
 // --- OAuth ---
 
@@ -76,17 +167,17 @@ async function getValidToken(cafe) {
 
   const now = new Date();
   if (cafe.yocoTokens.expiresAt && cafe.yocoTokens.expiresAt > now) {
-    return cafe.yocoTokens.accessToken;
+    return decryptSecret(cafe.yocoTokens.accessToken);
   }
 
   // Token expired — refresh it
-  const tokens = await refreshAccessToken(cafe.yocoTokens.refreshToken);
+  const tokens = await refreshAccessToken(decryptSecret(cafe.yocoTokens.refreshToken));
   const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
 
   await Cafe.findByIdAndUpdate(cafe._id, {
     $set: {
-      'yocoTokens.accessToken': tokens.access_token,
-      'yocoTokens.refreshToken': tokens.refresh_token || cafe.yocoTokens.refreshToken,
+      'yocoTokens.accessToken': encryptSecret(tokens.access_token),
+      'yocoTokens.refreshToken': encryptSecret(tokens.refresh_token) || cafe.yocoTokens.refreshToken,
       'yocoTokens.expiresAt': expiresAt,
     },
   });
@@ -290,4 +381,7 @@ module.exports = {
   syncOrders,
   subscribeWebhook,
   processWebhookEvent,
+  createOAuthState,
+  verifyOAuthState,
+  verifyWebhookSignature,
 };

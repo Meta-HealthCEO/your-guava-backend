@@ -1,4 +1,5 @@
 const Cafe = require('../models/Cafe.model');
+const { encryptSecret, decryptSecret } = require('../services/secrets.service');
 
 const xeroService = require('../services/integrations/xero.service');
 const quickbooksService = require('../services/integrations/quickbooks.service');
@@ -109,8 +110,8 @@ const callback = async (req, res, _next) => {
 
     const update = {
       [`accountingIntegrations.${provider}.connected`]: true,
-      [`accountingIntegrations.${provider}.accessToken`]: tokens.accessToken,
-      [`accountingIntegrations.${provider}.refreshToken`]: tokens.refreshToken,
+      [`accountingIntegrations.${provider}.accessToken`]: encryptSecret(tokens.accessToken),
+      [`accountingIntegrations.${provider}.refreshToken`]: encryptSecret(tokens.refreshToken),
       [`accountingIntegrations.${provider}.expiresAt`]: expiresAt,
       [`accountingIntegrations.${provider}.connectedAt`]: new Date(),
     };
@@ -147,13 +148,13 @@ const sync = async (req, res, next) => {
     // Proactively refresh if the token is within 60 s of expiry
     if (service.isTokenExpired(integ.expiresAt)) {
       try {
-        const refreshed = await service.refreshAccessToken(integ.refreshToken);
+        const refreshed = await service.refreshAccessToken(decryptSecret(integ.refreshToken));
         const newExpiresAt = new Date(Date.now() + (refreshed.expiresIn || 1800) * 1000);
         await Cafe.findByIdAndUpdate(req.user.cafeId, {
           $set: {
-            [`accountingIntegrations.${provider}.accessToken`]: refreshed.accessToken,
+            [`accountingIntegrations.${provider}.accessToken`]: encryptSecret(refreshed.accessToken),
             [`accountingIntegrations.${provider}.refreshToken`]:
-              refreshed.refreshToken || integ.refreshToken,
+              encryptSecret(refreshed.refreshToken) || integ.refreshToken,
             [`accountingIntegrations.${provider}.expiresAt`]: newExpiresAt,
           },
         });
@@ -194,7 +195,7 @@ const sync = async (req, res, next) => {
     }
 
     const result = await service.pushSalesSummary(
-      { ...cafe.toObject(), accessToken: integ.accessToken },
+      { ...cafe.toObject(), accessToken: decryptSecret(integ.accessToken) },
       summary
     );
 

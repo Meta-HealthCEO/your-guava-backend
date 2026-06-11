@@ -34,6 +34,15 @@ function getWeekBounds(date) {
  * Get total hours for a staff member in the week containing the given date,
  * excluding a specific shift id (for updates).
  */
+/**
+ * Returns true if the staff member exists and belongs to the given cafe.
+ * Prevents attaching shifts/leave to another tenant's staff.
+ */
+async function staffBelongsToCafe(staffId, cafeId) {
+  const staff = await Staff.findOne({ _id: staffId, cafeId }).select('_id').lean();
+  return Boolean(staff);
+}
+
 async function getWeeklyHours(cafeId, staffId, date, excludeShiftId = null) {
   const { monday, sunday } = getWeekBounds(date);
   const filter = {
@@ -65,6 +74,10 @@ const create = async (req, res, next) => {
     const hoursWorked = calcHours(startTime, endTime);
     if (hoursWorked <= 0) {
       return res.status(400).json({ success: false, message: 'endTime must be after startTime' });
+    }
+
+    if (!(await staffBelongsToCafe(staffId, cafeId))) {
+      return res.status(404).json({ success: false, message: 'Staff member not found' });
     }
 
     // Check if weekly total exceeds 45hrs — auto-flag overtime
@@ -244,6 +257,10 @@ const update = async (req, res, next) => {
     const hoursWorked = calcHours(newStartTime, newEndTime);
     if (hoursWorked <= 0) {
       return res.status(400).json({ success: false, message: 'endTime must be after startTime' });
+    }
+
+    if (staffId && !(await staffBelongsToCafe(staffId, cafeId))) {
+      return res.status(404).json({ success: false, message: 'Staff member not found' });
     }
 
     // Re-check overtime threshold

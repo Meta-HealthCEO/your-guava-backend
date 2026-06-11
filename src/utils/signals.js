@@ -1,7 +1,7 @@
 const axios = require('axios');
 
-// Simple in-memory cache for load shedding stage
-let loadSheddingCache = { stage: 0, fetchedAt: null };
+// Simple in-memory cache for load shedding status (both reported areas)
+let loadSheddingCache = { stages: null, fetchedAt: null };
 const LOAD_SHEDDING_CACHE_MS = 30 * 60 * 1000; // 30 minutes
 
 /**
@@ -151,27 +151,37 @@ const isPublicHoliday = (date) => {
   return Boolean(getPublicHolidayInfo(date));
 };
 
+// Western Cape school terms by year (approximate WC dates).
+// Extend annually; dates for new years are published by the DBE.
+const SCHOOL_TERMS_BY_YEAR = {
+  2025: [
+    { start: new Date(2025, 0, 15), end: new Date(2025, 2, 28) },  // Term 1
+    { start: new Date(2025, 3, 22), end: new Date(2025, 5, 27) },  // Term 2
+    { start: new Date(2025, 6, 22), end: new Date(2025, 8, 26) },  // Term 3
+    { start: new Date(2025, 9, 7),  end: new Date(2025, 11, 12) }, // Term 4
+  ],
+  2026: [
+    { start: new Date(2026, 0, 14), end: new Date(2026, 2, 27) },  // Term 1
+    { start: new Date(2026, 3, 14), end: new Date(2026, 5, 26) },  // Term 2
+    { start: new Date(2026, 6, 21), end: new Date(2026, 8, 25) },  // Term 3
+    { start: new Date(2026, 9, 6),  end: new Date(2026, 11, 11) }, // Term 4
+  ],
+};
+
 /**
- * Returns true if the given date falls outside Western Cape school terms (2025-2026).
- * Non-term days are considered school holidays.
+ * Returns true if the given date falls outside school terms.
+ * Fails safe: when term dates for the date's year are unknown, returns false
+ * (no signal) instead of treating every day as a school holiday.
  */
 const isSchoolHoliday = (date) => {
   const d = new Date(date);
   // Strip time for date-only comparison
   const check = new Date(d.getFullYear(), d.getMonth(), d.getDate());
 
-  const terms = [
-    // 2025 terms (approximate WC dates)
-    { start: new Date(2025, 0, 15), end: new Date(2025, 2, 28) },  // Term 1
-    { start: new Date(2025, 3, 22), end: new Date(2025, 5, 27) },  // Term 2
-    { start: new Date(2025, 6, 22), end: new Date(2025, 8, 26) },  // Term 3
-    { start: new Date(2025, 9, 7),  end: new Date(2025, 11, 12) }, // Term 4
-    // 2026 terms
-    { start: new Date(2026, 0, 14), end: new Date(2026, 2, 27) },  // Term 1
-    { start: new Date(2026, 3, 14), end: new Date(2026, 5, 26) },  // Term 2
-    { start: new Date(2026, 6, 21), end: new Date(2026, 8, 25) },  // Term 3
-    { start: new Date(2026, 9, 6),  end: new Date(2026, 11, 11) }, // Term 4
-  ];
+  const terms = SCHOOL_TERMS_BY_YEAR[check.getFullYear()];
+  if (!terms) {
+    return false; // Unknown year — no school-holiday signal rather than a permanent one
+  }
 
   for (const term of terms) {
     if (check >= term.start && check <= term.end) {
@@ -182,20 +192,26 @@ const isSchoolHoliday = (date) => {
   return true; // Outside all terms — school holiday
 };
 
+// Cape Town runs its own load shedding schedule; everywhere else follows Eskom national.
+const loadSheddingAreaForCity = (city = '') =>
+  /cape\s*town/i.test(String(city)) ? 'capetown' : 'eskom';
+
 /**
- * Fetches the current EskomSePush load shedding stage.
- * Returns 0 if unavailable or no load shedding.
- * Caches for 30 minutes.
+ * Fetches the current EskomSePush load shedding stage for the cafe's area.
+ * Cape Town cafes use the City of Cape Town stage; all other locations use
+ * the Eskom national stage. Returns 0 if unavailable. Caches for 30 minutes.
  */
-const getLoadSheddingStage = async () => {
+const getLoadSheddingStage = async (city) => {
   if (process.env.NODE_ENV === 'test') return 0;
 
+  const area = loadSheddingAreaForCity(city);
   const now = Date.now();
   if (
     loadSheddingCache.fetchedAt &&
-    now - loadSheddingCache.fetchedAt < LOAD_SHEDDING_CACHE_MS
+    now - loadSheddingCache.fetchedAt < LOAD_SHEDDING_CACHE_MS &&
+    loadSheddingCache.stages
   ) {
-    return loadSheddingCache.stage;
+    return loadSheddingCache.stages[area] || 0;
   }
 
   try {
@@ -210,12 +226,15 @@ const getLoadSheddingStage = async () => {
       }
     );
 
-    const stage = response.data?.status?.capetown?.stage || 0;
-    loadSheddingCache = { stage: Number(stage), fetchedAt: now };
-    return loadSheddingCache.stage;
+    const stages = {
+      capetown: Number(response.data?.status?.capetown?.stage || 0),
+      eskom: Number(response.data?.status?.eskom?.stage || 0),
+    };
+    loadSheddingCache = { stages, fetchedAt: now };
+    return stages[area] || 0;
   } catch (error) {
     console.error('[signals] Load shedding API error:', error.message);
-    return loadSheddingCache.stage || 0;
+    return loadSheddingCache.stages?.[area] || 0;
   }
 };
 
@@ -226,7 +245,7 @@ const getSignalsForDate = async (date, location = {}) => {
   const d = new Date(date);
   const dayOfWeek = d.getDay();
 
-  const loadSheddingStage = isSameLocalDate(d) ? await getLoadSheddingStage() : 0;
+  const loadSheddingStage = isSameLocalDate(d) ? await getLoadSheddingStage(location.city) : 0;
 
   return {
     isPayday: isPayday(d),

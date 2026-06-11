@@ -10,7 +10,16 @@ const Item = require('./models/Item.model');
 const YOCO_FILE = 'C:\\Users\\shaun\\transactions_temp.xlsx';
 const MONGO_URI = process.argv[2] || process.env.MONGODB_URI;
 
+const isLocalUri = (uri = '') => /localhost|127\.0\.0\.1/.test(uri);
+
 async function seed() {
+  // Destructive: wipes all core collections. Refuse to run against anything
+  // that isn't a local database unless explicitly forced.
+  if (process.env.NODE_ENV === 'production' || (!isLocalUri(MONGO_URI) && process.env.SEED_FORCE !== 'true')) {
+    console.error('[seed-bulk] Refusing to run: non-local MONGODB_URI or production environment. Set SEED_FORCE=true to override.');
+    process.exit(1);
+  }
+
   console.log('Connecting to', MONGO_URI.replace(/\/\/.*@/, '//*****@'));
   await mongoose.connect(MONGO_URI);
   console.log('Connected');

@@ -132,5 +132,12 @@ describe('signals utility', () => {
       // Before Term 1: Jan 1-13
       expect(isSchoolHoliday(new Date(2026, 0, 5))).toBe(true); // Jan 5
     });
+
+    it('fails safe (no signal) for years without term data', () => {
+      // Without 2027+ term data, every day must NOT read as a school holiday
+      expect(isSchoolHoliday(new Date(2027, 1, 15))).toBe(false);
+      expect(isSchoolHoliday(new Date(2027, 6, 1))).toBe(false);
+      expect(isSchoolHoliday(new Date(2030, 3, 1))).toBe(false);
+    });
   });
 });

@@ -3,6 +3,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
+const helmet = require('helmet');
+const { globalLimiter } = require('./middleware/rateLimit.middleware');
 
 const authRoutes = require('./routes/auth.routes');
 const cafeRoutes = require('./routes/cafe.routes');
@@ -24,6 +26,12 @@ const errorMiddleware = require('./middleware/error.middleware');
 
 const app = express();
 
+// Behind one reverse proxy (Render/Railway/etc.) — needed for correct client IPs in rate limiting
+app.set('trust proxy', 1);
+
+app.use(helmet());
+app.use(globalLimiter);
+
 // CORS
 app.use(
   cors({
@@ -32,8 +40,14 @@ app.use(
   })
 );
 
-// Body parsers
-app.use(express.json());
+// Body parsers — rawBody is kept for webhook signature verification
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 

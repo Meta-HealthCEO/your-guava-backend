@@ -5,9 +5,9 @@ const Organization = require('../models/Organization.model');
 const Transaction = require('../models/Transaction.model');
 const {
   generateForecast,
-  generateWeekForecast,
   updateForecastActuals,
 } = require('../services/forecast.service');
+const { clearApiCache } = require('../middleware/cache.middleware');
 const {
   DEFAULT_FORECAST_SETTINGS,
   getFactorEntitlements,
@@ -195,7 +195,6 @@ const getWeek = async (req, res, next) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    // Check if we already have all 7 days
     const nextWeek = new Date(today);
     nextWeek.setDate(nextWeek.getDate() + 7);
 
@@ -204,12 +203,26 @@ const getWeek = async (req, res, next) => {
       date: { $gte: today, $lt: nextWeek },
     }).sort({ date: 1 });
 
-    if (existing.length === 7 && !existing.some(needsPlanningRefresh)) {
-      return res.status(200).json({ success: true, forecasts: existing });
-    }
+    const existingByDate = new Map(existing.map((forecast) => [toDateKey(forecast.date), forecast]));
+    const targetDates = Array.from({ length: 7 }, (_, index) => addDays(today, index));
+    // Resilient: a transient failure on one day still returns the other days.
+    const settled = await Promise.allSettled(
+      targetDates.map(async (targetDate) => {
+        const existingForecast = existingByDate.get(toDateKey(targetDate));
+        if (existingForecast && !needsPlanningRefresh(existingForecast)) {
+          return existingForecast;
+        }
+        return generateForecast(cafeId, targetDate);
+      })
+    );
+    const forecasts = settled
+      .filter((result) => result.status === 'fulfilled' && result.value)
+      .map((result) => result.value);
 
-    // Generate missing forecasts
-    const forecasts = await generateWeekForecast(cafeId);
+    settled
+      .filter((result) => result.status === 'rejected')
+      .forEach((result) => console.error('[forecasts] week day generation failed:', result.reason?.message));
+
     return res.status(200).json({ success: true, forecasts });
   } catch (error) {
     next(error);
@@ -226,6 +239,7 @@ const generate = async (req, res, next) => {
     }
 
     const forecast = await generateForecast(cafeId, new Date(date));
+    clearApiCache();
     return res.status(200).json({ success: true, forecast });
   } catch (error) {
     next(error);
@@ -265,6 +279,7 @@ const updateFactors = async (req, res, next) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     await Forecast.deleteMany({ cafeId: cafe._id, date: { $gte: today } });
+    clearApiCache();
 
     return res.status(200).json({
       success: true,

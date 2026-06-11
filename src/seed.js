@@ -7,7 +7,16 @@ const { ingestFile } = require('./services/ingestion.service');
 
 const YOCO_FILE = 'C:\\Users\\shaun\\transactions_temp.xlsx';
 
+const isLocalUri = (uri = '') => /localhost|127\.0\.0\.1/.test(uri);
+
 async function seed() {
+  // Destructive: wipes users/cafes/orgs. Refuse to run against anything
+  // that isn't a local database unless explicitly forced.
+  if (process.env.NODE_ENV === 'production' || (!isLocalUri(process.env.MONGODB_URI) && process.env.SEED_FORCE !== 'true')) {
+    console.error('[seed] Refusing to run: non-local MONGODB_URI or production environment. Set SEED_FORCE=true to override.');
+    process.exit(1);
+  }
+
   await mongoose.connect(process.env.MONGODB_URI);
   console.log('Connected to MongoDB');
 

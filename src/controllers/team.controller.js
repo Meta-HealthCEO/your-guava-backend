@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const User = require('../models/User.model');
 const Cafe = require('../models/Cafe.model');
 const Organization = require('../models/Organization.model');
@@ -23,13 +24,16 @@ const validateCafeAccess = async (orgId, cafeIds = []) => {
   return cafeIds.filter((id) => orgCafeIds.includes(id));
 };
 
+// Cryptographically random temporary password — never accepted from the client.
+const generateTemporaryPassword = () => `Guava-${crypto.randomBytes(6).toString('base64url')}`;
+
 // POST /api/team/invite - Owner adds a manager seat to the organisation.
 const inviteManager = async (req, res, next) => {
   try {
-    const { email, name, password, cafeIds } = req.body;
+    const { email, name, cafeIds } = req.body;
 
-    if (!email || !name || !password) {
-      return res.status(400).json({ success: false, message: 'Email, name, and password are required' });
+    if (!email || !name) {
+      return res.status(400).json({ success: false, message: 'Email and name are required' });
     }
 
     const owner = await User.findById(req.user.id);
@@ -56,10 +60,11 @@ const inviteManager = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'At least one valid cafe must be assigned' });
     }
 
+    const temporaryPassword = generateTemporaryPassword();
     const manager = await User.create({
       email,
       name,
-      password,
+      password: temporaryPassword,
       role: 'manager',
       orgId: owner.orgId,
       cafeIds: validCafeIds,
@@ -67,12 +72,25 @@ const inviteManager = async (req, res, next) => {
     });
 
     const assignedCafes = await Cafe.find({ _id: { $in: validCafeIds } }).select('name').lean();
-    await emailService.sendTeamInviteEmail({
-      manager,
-      owner,
-      cafes: assignedCafes,
-      temporaryPassword: password,
-    });
+    let emailSent = false;
+    try {
+      const emailResult = await emailService.sendTeamInviteEmail({
+        manager,
+        owner,
+        cafes: assignedCafes,
+        temporaryPassword,
+      });
+      emailSent = !emailResult?.skipped;
+    } catch (emailErr) {
+      // Manager is already persisted — fall through and return the password so
+      // the owner can relay it, rather than leaving the account unreachable.
+      console.error('[team] invite email failed, returning password to owner:', emailErr.message);
+    }
+
+    if (!emailSent) {
+      // Audit: temporary credential exposed via API response instead of email.
+      console.warn(`[team] invite for ${manager.email} returned temp password via API (no email sent)`);
+    }
 
     const updatedSeats = await buildSeatSummary(owner.orgId);
 
@@ -87,6 +105,9 @@ const inviteManager = async (req, res, next) => {
         cafeIds: manager.cafeIds,
       },
       seats: updatedSeats,
+      emailSent,
+      // Only exposed when no email provider is configured, so the owner can relay it.
+      ...(emailSent ? {} : { temporaryPassword }),
     });
   } catch (error) {
     next(error);
