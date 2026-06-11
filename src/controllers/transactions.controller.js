@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction.model');
 const Cafe = require('../models/Cafe.model');
 const Upload = require('../models/Upload.model');
@@ -181,15 +182,53 @@ const getTransactions = async (req, res, next) => {
 const getStats = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
+    const cafeObjectId = new mongoose.Types.ObjectId(String(cafeId));
 
-    const transactions = await Transaction.find({
-      cafeId,
-      status: 'approved',
-    })
-      .select('date total items')
-      .lean();
+    const [result] = await Transaction.aggregate([
+      {
+        $match: {
+          cafeId: cafeObjectId,
+          status: 'approved',
+        },
+      },
+      {
+        $facet: {
+          totals: [
+            {
+              $group: {
+                _id: null,
+                totalTransactions: { $sum: 1 },
+                totalRevenue: { $sum: { $ifNull: ['$total', 0] } },
+                firstDate: { $min: '$date' },
+                lastDate: { $max: '$date' },
+              },
+            },
+          ],
+          topItems: [
+            { $unwind: '$items' },
+            {
+              $group: {
+                _id: '$items.name',
+                qty: { $sum: { $ifNull: ['$items.quantity', 0] } },
+              },
+            },
+            { $sort: { qty: -1 } },
+            { $limit: 5 },
+            {
+              $project: {
+                _id: 0,
+                name: '$_id',
+                qty: 1,
+              },
+            },
+          ],
+        },
+      },
+    ]);
 
-    if (transactions.length === 0) {
+    const totals = result?.totals?.[0];
+
+    if (!totals) {
       return res.status(200).json({
         success: true,
         stats: {
@@ -203,13 +242,9 @@ const getStats = async (req, res, next) => {
       });
     }
 
-    // Total revenue
-    const totalRevenue = transactions.reduce((sum, tx) => sum + (tx.total || 0), 0);
-
-    // Date range
-    const dates = transactions.map((tx) => new Date(tx.date).getTime());
-    const firstDate = new Date(Math.min(...dates));
-    const lastDate = new Date(Math.max(...dates));
+    const totalRevenue = Number(totals.totalRevenue || 0);
+    const firstDate = totals.firstDate;
+    const lastDate = totals.lastDate;
     const firstDay = new Date(firstDate);
     firstDay.setHours(0, 0, 0, 0);
     const lastDay = new Date(lastDate);
@@ -217,25 +252,13 @@ const getStats = async (req, res, next) => {
     const dayCount = Math.max(Math.floor((lastDay - firstDay) / (1000 * 60 * 60 * 24)) + 1, 1);
     const avgDailyRevenue = totalRevenue / dayCount;
 
-    // Top 5 items
-    const itemCounts = {};
-    for (const tx of transactions) {
-      for (const item of tx.items || []) {
-        itemCounts[item.name] = (itemCounts[item.name] || 0) + item.quantity;
-      }
-    }
-    const topItems = Object.entries(itemCounts)
-      .sort(([, a], [, b]) => b - a)
-      .slice(0, 5)
-      .map(([name, qty]) => ({ name, qty }));
-
     return res.status(200).json({
       success: true,
       stats: {
-        totalTransactions: transactions.length,
+        totalTransactions: totals.totalTransactions,
         totalRevenue: parseFloat(totalRevenue.toFixed(2)),
         avgDailyRevenue: parseFloat(avgDailyRevenue.toFixed(2)),
-        topItems,
+        topItems: result.topItems || [],
         firstDate,
         lastDate,
       },
@@ -260,7 +283,7 @@ const getDataStatus = async (req, res, next) => {
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
     const coverage = await Transaction.aggregate([
-      { $match: { cafeId: new (require('mongoose')).Types.ObjectId(cafeId), date: { $gte: thirtyDaysAgo } } },
+      { $match: { cafeId: new mongoose.Types.ObjectId(String(cafeId)), date: { $gte: thirtyDaysAgo } } },
       {
         $group: {
           _id: {

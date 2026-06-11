@@ -65,5 +65,8 @@ transactionSchema.index(
   { unique: true, partialFilterExpression: { dedupKey: { $type: 'string' } } }
 );
 transactionSchema.index({ cafeId: 1, date: -1 });
+transactionSchema.index({ cafeId: 1, status: 1, date: -1 });
+transactionSchema.index({ cafeId: 1, status: 1, dayOfWeek: 1, date: -1 });
+transactionSchema.index({ cafeId: 1, status: 1, dayOfWeek: 1, hour: 1, date: -1 });
 
 module.exports = mongoose.model('Transaction', transactionSchema);

@@ -1,7 +1,7 @@
 jest.mock('axios');
 
 const axios = require('axios');
-const { getWeatherForecast } = require('../../src/services/weather.service');
+const { getWeatherForecast, clearWeatherCache } = require('../../src/services/weather.service');
 
 const toDateKey = (date) => {
   const d = new Date(date);
@@ -14,6 +14,7 @@ describe('weather service', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    clearWeatherCache();
     process.env.WEATHER_API_KEY = 'test-weather-key';
     process.env.WEATHER_API_URL = 'https://api.weatherapi.com/v1';
   });
@@ -105,6 +106,56 @@ describe('weather service', () => {
         temp: 23,
         condition: 'Sunny',
         isRain: false,
+      })
+    );
+  });
+
+  it('caches every day from a forecast response for follow-up future dates', async () => {
+    const first = new Date();
+    first.setDate(first.getDate() + 1);
+    const second = new Date();
+    second.setDate(second.getDate() + 2);
+    const firstStr = toDateKey(first);
+    const secondStr = toDateKey(second);
+
+    axios.get.mockResolvedValueOnce({
+      data: {
+        forecast: {
+          forecastday: [
+            {
+              date: firstStr,
+              day: {
+                avgtemp_c: 21,
+                avghumidity: 52,
+                totalprecip_mm: 0,
+                daily_chance_of_rain: 0,
+                condition: { text: 'Clear' },
+              },
+            },
+            {
+              date: secondStr,
+              day: {
+                avgtemp_c: 17,
+                avghumidity: 72,
+                totalprecip_mm: 1.2,
+                daily_chance_of_rain: 62,
+                condition: { text: 'Light rain' },
+              },
+            },
+          ],
+        },
+      },
+    });
+
+    await getWeatherForecast(-33.9, 18.4, first);
+    const secondResult = await getWeatherForecast(-33.9, 18.4, second);
+
+    expect(axios.get).toHaveBeenCalledTimes(1);
+    expect(secondResult).toEqual(
+      expect.objectContaining({
+        temp: 17,
+        condition: 'Light rain',
+        isRain: true,
       })
     );
   });

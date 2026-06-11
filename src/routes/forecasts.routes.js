@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth.middleware');
+const { apiCache } = require('../middleware/cache.middleware');
 const {
   getToday,
   getWeek,
@@ -17,11 +18,14 @@ const {
 
 router.use(authMiddleware);
 
-router.get('/today', getToday);
-router.get('/tomorrow', require('../controllers/forecasts.controller').getTomorrow);
-router.get('/week', getWeek);
-router.get('/recent', getRecent);
-router.get('/history', getHistory);
+const forecastCache = apiCache({ ttlMs: 30000, keyPrefix: 'forecasts' });
+const historyCache = apiCache({ ttlMs: 10000, keyPrefix: 'forecast-history' });
+
+router.get('/today', forecastCache, getToday);
+router.get('/tomorrow', forecastCache, require('../controllers/forecasts.controller').getTomorrow);
+router.get('/week', forecastCache, getWeek);
+router.get('/recent', forecastCache, getRecent);
+router.get('/history', historyCache, getHistory);
 router.get('/factors', getFactors);
 router.put('/factors', updateFactors);
 router.post('/generate', generate);

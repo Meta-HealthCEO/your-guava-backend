@@ -2,6 +2,7 @@ const axios = require('axios');
 
 // In-memory cache: { key -> { data, fetchedAt } }
 const weatherCache = new Map();
+const pendingWeatherRequests = new Map();
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 const DEFAULT_WEATHER = {
@@ -26,6 +27,55 @@ const startOfDay = (date) => {
 
 const isPastDate = (date) => startOfDay(date).getTime() < startOfDay(new Date()).getTime();
 
+const cacheKeyFor = (lat, lng, dateStr) => `${lat},${lng},${dateStr}`;
+
+const readCache = (cacheKey) => {
+  const cached = weatherCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
+    return cached.data;
+  }
+  return null;
+};
+
+const normaliseDay = (dayData) => {
+  if (!dayData?.day) return null;
+
+  const day = dayData.day;
+  const conditionText = day.condition?.text || 'Clear';
+  const isRain = conditionText.toLowerCase().includes('rain') ||
+    conditionText.toLowerCase().includes('drizzle') ||
+    conditionText.toLowerCase().includes('shower') ||
+    Number(day.totalprecip_mm || 0) > 0 ||
+    Number(day.daily_chance_of_rain || 0) >= 50;
+
+  return {
+    temp: day.avgtemp_c ?? DEFAULT_WEATHER.temp,
+    condition: conditionText,
+    humidity: day.avghumidity ?? DEFAULT_WEATHER.humidity,
+    isRain,
+    precipMm: Number(day.totalprecip_mm ?? DEFAULT_WEATHER.precipMm),
+    chanceOfRain: Number(day.daily_chance_of_rain ?? DEFAULT_WEATHER.chanceOfRain),
+  };
+};
+
+const rememberDay = (lat, lng, dayData) => {
+  const result = normaliseDay(dayData);
+  if (!result || !dayData.date) return null;
+
+  weatherCache.set(cacheKeyFor(lat, lng, dayData.date), { data: result, fetchedAt: Date.now() });
+  return result;
+};
+
+const runDedupe = async (pendingKey, fn) => {
+  if (pendingWeatherRequests.has(pendingKey)) {
+    return pendingWeatherRequests.get(pendingKey);
+  }
+
+  const promise = fn().finally(() => pendingWeatherRequests.delete(pendingKey));
+  pendingWeatherRequests.set(pendingKey, promise);
+  return promise;
+};
+
 /**
  * Fetches the weather forecast/history for a given lat/lng and date.
  * Uses WeatherAPI.com /history.json for past dates and /forecast.json otherwise.
@@ -49,55 +99,42 @@ const getWeatherForecast = async (lat, lng, date) => {
 
   const targetDate = new Date(date);
   const dateStr = toDateKey(targetDate);
-  const cacheKey = `${lat},${lng},${dateStr}`;
+  const cacheKey = cacheKeyFor(lat, lng, dateStr);
 
-  const cached = weatherCache.get(cacheKey);
-  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
-    return cached.data;
+  const cached = readCache(cacheKey);
+  if (cached) {
+    return cached;
   }
 
   try {
     const useHistory = isPastDate(targetDate);
-    const response = await axios.get(`${baseUrl}/${useHistory ? 'history.json' : 'forecast.json'}`, {
-      params: useHistory
-        ? {
-            key: apiKey,
-            q: `${lat},${lng}`,
-            dt: dateStr,
-          }
-        : {
-            key: apiKey,
-            q: `${lat},${lng}`,
-            days: 7,
-          },
-      timeout: 8000,
-    });
+    const pendingKey = useHistory ? `history:${cacheKey}` : `forecast:${lat},${lng}`;
+    const response = await runDedupe(pendingKey, () =>
+      axios.get(`${baseUrl}/${useHistory ? 'history.json' : 'forecast.json'}`, {
+        params: useHistory
+          ? {
+              key: apiKey,
+              q: `${lat},${lng}`,
+              dt: dateStr,
+            }
+          : {
+              key: apiKey,
+              q: `${lat},${lng}`,
+              days: 7,
+            },
+        timeout: 8000,
+      })
+    );
 
     const forecastDays = response.data?.forecast?.forecastday || [];
-    const dayData = forecastDays.find((d) => d.date === dateStr);
-
-    if (!dayData) {
-      return { ...DEFAULT_WEATHER };
+    for (const forecastDay of forecastDays) {
+      rememberDay(lat, lng, forecastDay);
     }
 
-    const day = dayData.day;
-    const conditionText = day.condition?.text || 'Clear';
-    const isRain = conditionText.toLowerCase().includes('rain') ||
-      conditionText.toLowerCase().includes('drizzle') ||
-      conditionText.toLowerCase().includes('shower') ||
-      Number(day.totalprecip_mm || 0) > 0 ||
-      Number(day.daily_chance_of_rain || 0) >= 50;
-
-    const result = {
-      temp: day.avgtemp_c ?? DEFAULT_WEATHER.temp,
-      condition: conditionText,
-      humidity: day.avghumidity ?? DEFAULT_WEATHER.humidity,
-      isRain,
-      precipMm: Number(day.totalprecip_mm ?? DEFAULT_WEATHER.precipMm),
-      chanceOfRain: Number(day.daily_chance_of_rain ?? DEFAULT_WEATHER.chanceOfRain),
-    };
-
-    weatherCache.set(cacheKey, { data: result, fetchedAt: Date.now() });
+    const result = readCache(cacheKey);
+    if (!result) {
+      return { ...DEFAULT_WEATHER };
+    }
     return result;
   } catch (error) {
     console.error('[weather] API error:', error.message);
@@ -105,4 +142,9 @@ const getWeatherForecast = async (lat, lng, date) => {
   }
 };
 
-module.exports = { getWeatherForecast };
+const clearWeatherCache = () => {
+  weatherCache.clear();
+  pendingWeatherRequests.clear();
+};
+
+module.exports = { getWeatherForecast, clearWeatherCache };

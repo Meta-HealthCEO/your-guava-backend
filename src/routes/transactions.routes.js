@@ -4,6 +4,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const authMiddleware = require('../middleware/auth.middleware');
+const { apiCache } = require('../middleware/cache.middleware');
 const {
   upload,
   getTransactions,
@@ -73,7 +74,7 @@ router.use(authMiddleware);
 
 router.post('/upload', handleMulterUpload, upload);
 router.get('/status', getDataStatus);
-router.get('/stats', getStats);
+router.get('/stats', apiCache({ ttlMs: 30000, keyPrefix: 'transaction-stats' }), getStats);
 router.get('/', getTransactions);
 
 module.exports = router;

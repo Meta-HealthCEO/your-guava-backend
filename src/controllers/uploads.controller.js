@@ -6,6 +6,7 @@ const r2 = require('../services/r2.service');
 const ingestion = require('../services/ingestion.service');
 const { updateForecastActuals, generateWeekForecast } = require('../services/forecast.service');
 const { computeDedupKey } = require('../utils/dedupKey');
+const { clearApiCache } = require('../middleware/cache.middleware');
 
 const REQUIRED = ['date', 'items', 'total'];
 const VALID_ITEMS_MODES = new Set(['packed', 'line-per-row']);
@@ -214,6 +215,7 @@ const confirm = async (req, res, next) => {
         $set: { dataUploaded: true, lastSyncAt: new Date() },
       });
 
+      clearApiCache();
       return res.status(200).json({
         success: true,
         uploadId: upload._id,
@@ -392,6 +394,7 @@ const remap = async (req, res, next) => {
       await generateWeekForecast(cafeId).catch((err) => console.error('[uploads] week regen failed:', err.message));
       await fillActualsForRange(cafeId, result.dateRange);
 
+      clearApiCache();
       return res.status(200).json({
         success: true,
         uploadId: upload._id,
@@ -433,6 +436,7 @@ const remove = async (req, res, next) => {
     upload.status = 'deleted';
     await upload.save();
 
+    clearApiCache();
     return res.status(200).json({ success: true });
   } catch (error) {
     next(error);

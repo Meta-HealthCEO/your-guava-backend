@@ -108,5 +108,6 @@ const forecastSchema = new mongoose.Schema(
 );
 
 forecastSchema.index({ cafeId: 1, date: 1 }, { unique: true });
+forecastSchema.index({ cafeId: 1, 'items.itemName': 1, date: -1 });
 
 module.exports = mongoose.model('Forecast', forecastSchema);
