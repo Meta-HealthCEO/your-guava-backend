@@ -160,12 +160,15 @@ const isTokenExpired = (expiresAt) => {
  * The `cafe` object passed here will have `accessToken` and `tenantId`
  * already populated from the stored integration fields.
  */
-const pushSalesSummary = async (_cafe, summaryData) => {
+const pushSalesSummary = async () => {
   // TODO: push to Xero — POST /BankTransactions or /Invoices
   // Doc: https://developer.xero.com/documentation/api/accounting/banktransactions
   // When implementing: use _cafe.accessToken + _cafe.tenantId in the request headers.
-  console.log('[xero] would push sales summary:', summaryData);
-  return { ok: true, providerRef: 'stub-xero-' + Date.now() };
+  return {
+    ok: false,
+    statusCode: 501,
+    error: 'Xero sales posting is not implemented yet',
+  };
 };
 
 module.exports = {

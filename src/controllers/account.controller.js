@@ -21,6 +21,15 @@ const {
 const oneGate = require('../services/onegate.service');
 const { clearApiCache } = require('../middleware/cache.middleware');
 
+const mockBillingEnabled = () => process.env.NODE_ENV !== 'production';
+
+const billingNotConfigured = (res) =>
+  res.status(503).json({
+    success: false,
+    code: 'BILLING_PROVIDER_NOT_CONFIGURED',
+    message: 'Card payments are not configured. Enable OneGate before accepting paid plan or credit purchases.',
+  });
+
 const buildAccountPayload = async (userId) => {
   const user = await User.findById(userId).select('-password -refreshTokens').lean();
   if (!user) {
@@ -245,6 +254,8 @@ const checkout = async (req, res, next) => {
       });
     }
 
+    if (!mockBillingEnabled()) return billingNotConfigured(res);
+
     const { checkout: mock, account } = await mockCheckout({
       req,
       org,
@@ -299,6 +310,8 @@ const buyAiCredits = async (req, res, next) => {
         account,
       });
     }
+
+    if (!mockBillingEnabled()) return billingNotConfigured(res);
 
     ensureFreshCreditWindow(org);
     org.aiCredits.bonus = (org.aiCredits?.bonus || 0) + pack.credits;

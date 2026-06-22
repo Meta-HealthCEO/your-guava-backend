@@ -1,4 +1,3 @@
-const crypto = require('crypto');
 const supertest = require('supertest');
 const { setup, teardown, clearDB, createTestUser, createTestManager, app } = require('../setup');
 const User = require('../../src/models/User.model');
@@ -13,78 +12,29 @@ beforeAll(setup);
 afterAll(teardown);
 beforeEach(() => {
   // Ensure a stray local .env value never leaks into webhook tests
+  delete process.env.YOCO_INTEGRATION_ENABLED;
   delete process.env.YOCO_WEBHOOK_SECRET;
 });
 afterEach(async () => {
   jest.restoreAllMocks();
+  delete process.env.YOCO_INTEGRATION_ENABLED;
   delete process.env.YOCO_WEBHOOK_SECRET;
   await clearDB();
 });
 
-const signWebhook = (secret, id, timestamp, body) => {
-  const secretBytes = Buffer.from(secret.replace(/^whsec_/, ''), 'base64');
-  return crypto
-    .createHmac('sha256', secretBytes)
-    .update(`${id}.${timestamp}.${body}`)
-    .digest('base64');
-};
-
-describe('Yoco webhook signature verification', () => {
-  const secret = `whsec_${Buffer.from('test-webhook-secret-key').toString('base64')}`;
-
-  it('rejects webhooks when no secret is configured', async () => {
+describe('Legacy Yoco API surface', () => {
+  it('does not expose the webhook route unless explicitly enabled', async () => {
     const res = await request.post('/api/yoco/webhook').send({ event_type: 'payment.created' });
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(404);
   });
 
-  it('rejects webhooks without signature headers', async () => {
-    process.env.YOCO_WEBHOOK_SECRET = secret;
-    const res = await request.post('/api/yoco/webhook').send({ event_type: 'payment.created' });
-    expect(res.status).toBe(401);
-  });
-
-  it('rejects webhooks with an invalid signature', async () => {
-    process.env.YOCO_WEBHOOK_SECRET = secret;
+  it('does not expose the OAuth callback route unless explicitly enabled', async () => {
+    const { token } = await createTestUser();
     const res = await request
-      .post('/api/yoco/webhook')
-      .set('webhook-id', 'msg_1')
-      .set('webhook-timestamp', String(Math.floor(Date.now() / 1000)))
-      .set('webhook-signature', 'v1,bm90LWEtcmVhbC1zaWduYXR1cmU=')
-      .send({ event_type: 'payment.created' });
-    expect(res.status).toBe(401);
-  });
-
-  it('accepts webhooks with a valid signature', async () => {
-    process.env.YOCO_WEBHOOK_SECRET = secret;
-    const body = JSON.stringify({ event_type: 'other.event' });
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const signature = signWebhook(secret, 'msg_1', timestamp, body);
-
-    const res = await request
-      .post('/api/yoco/webhook')
-      .set('Content-Type', 'application/json')
-      .set('webhook-id', 'msg_1')
-      .set('webhook-timestamp', timestamp)
-      .set('webhook-signature', `v1,${signature}`)
-      .send(body);
-    expect(res.status).toBe(200);
-    expect(res.body.received).toBe(true);
-  });
-
-  it('rejects webhooks with a stale timestamp', async () => {
-    process.env.YOCO_WEBHOOK_SECRET = secret;
-    const body = JSON.stringify({ event_type: 'other.event' });
-    const staleTimestamp = String(Math.floor(Date.now() / 1000) - 3600);
-    const signature = signWebhook(secret, 'msg_1', staleTimestamp, body);
-
-    const res = await request
-      .post('/api/yoco/webhook')
-      .set('Content-Type', 'application/json')
-      .set('webhook-id', 'msg_1')
-      .set('webhook-timestamp', staleTimestamp)
-      .set('webhook-signature', `v1,${signature}`)
-      .send(body);
-    expect(res.status).toBe(401);
+      .post('/api/yoco/callback')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ code: 'auth-code', state: 'forged-state' });
+    expect(res.status).toBe(404);
   });
 });
 
@@ -106,14 +56,6 @@ describe('Yoco OAuth state', () => {
     expect(verifyOAuthState(undefined, 'cafe123')).toBe(false);
   });
 
-  it('callback rejects requests without a valid state', async () => {
-    const { token } = await createTestUser();
-    const res = await request
-      .post('/api/yoco/callback')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ code: 'auth-code', state: 'forged-state' });
-    expect(res.status).toBe(400);
-  });
 });
 
 describe('Refresh token rotation', () => {

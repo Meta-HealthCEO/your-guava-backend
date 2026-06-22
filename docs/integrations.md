@@ -4,6 +4,9 @@ Three providers supported: Xero, QuickBooks, Sage Accounting.
 
 ## Setup
 
+For MVP, keep `ACCOUNTING_INTEGRATIONS_ENABLED=false`. Production startup
+refuses this flag until provider posting is implemented end-to-end.
+
 For each provider you want to use, register a developer app and add the OAuth
 callback URL `http://localhost:5173/integrations/<provider>/callback` (or your
 production equivalent). Then populate the corresponding env vars in `.env` (see
@@ -12,7 +15,7 @@ production equivalent). Then populate the corresponding env vars in `.env` (see
 ## Status of each integration
 
 - **OAuth flow**: fully wired (real authorize URL build, real code exchange, real token refresh)
-- **Sales push**: stubbed — currently logs to console and returns success. The next step is to
+- **Sales push**: not implemented. Sync returns `501` until the provider posting code is wired. The next step is to
   wire the `pushSalesSummary` function in each `src/services/integrations/<provider>.service.js`
   to call the provider's actual invoice/journal endpoint:
   - Xero: POST `/BankTransactions` or `/Invoices`

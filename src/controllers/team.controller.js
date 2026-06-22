@@ -72,24 +72,40 @@ const inviteManager = async (req, res, next) => {
     });
 
     const assignedCafes = await Cafe.find({ _id: { $in: validCafeIds } }).select('name').lean();
-    let emailSent = false;
+    let emailResult;
     try {
-      const emailResult = await emailService.sendTeamInviteEmail({
+      emailResult = await emailService.sendTeamInviteEmail({
         manager,
         owner,
         cafes: assignedCafes,
         temporaryPassword,
       });
-      emailSent = !emailResult?.skipped;
     } catch (emailErr) {
-      // Manager is already persisted — fall through and return the password so
-      // the owner can relay it, rather than leaving the account unreachable.
-      console.error('[team] invite email failed, returning password to owner:', emailErr.message);
+      emailResult = { sent: false, error: emailErr };
+      // Rollback happens below so the temporary password never leaves the server.
     }
 
-    if (!emailSent) {
-      // Audit: temporary credential exposed via API response instead of email.
-      console.warn(`[team] invite for ${manager.email} returned temp password via API (no email sent)`);
+    if (emailResult?.skipped || !emailResult?.sent) {
+      // Do not leave an unreachable account behind if email delivery fails.
+      await User.deleteOne({ _id: manager._id });
+      const updatedSeats = await buildSeatSummary(owner.orgId);
+      const providerMissing = emailResult?.skipped;
+      const errorMessage = providerMissing
+        ? 'Team invite email is not configured. Configure email delivery before inviting members.'
+        : 'Team invite email could not be sent. No team member was created.';
+
+      if (providerMissing) {
+        console.warn(`[team] invite for ${manager.email} blocked because email is not configured`);
+      } else {
+        console.error('[team] invite email failed; manager invite rolled back:', emailResult?.error?.message || emailResult?.error || 'unknown error');
+      }
+
+      return res.status(providerMissing ? 503 : 502).json({
+        success: false,
+        message: errorMessage,
+        emailSent: false,
+        seats: updatedSeats,
+      });
     }
 
     const updatedSeats = await buildSeatSummary(owner.orgId);
@@ -105,9 +121,7 @@ const inviteManager = async (req, res, next) => {
         cafeIds: manager.cafeIds,
       },
       seats: updatedSeats,
-      emailSent,
-      // Only exposed when no email provider is configured, so the owner can relay it.
-      ...(emailSent ? {} : { temporaryPassword }),
+      emailSent: true,
     });
   } catch (error) {
     next(error);
@@ -243,6 +257,7 @@ const switchCafe = async (req, res, next) => {
         cafeId,
         role: user.role,
         orgId: user.orgId ? user.orgId.toString() : null,
+        tokenVersion: Number(user.tokenVersion || 0),
       },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }

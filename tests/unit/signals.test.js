@@ -3,6 +3,7 @@ const {
   isPublicHoliday,
   getPublicHolidayInfo,
   getPublicHolidaysForYear,
+  getSchoolCalendarForYear,
   isSchoolHoliday,
 } = require('../../src/utils/signals');
 
@@ -116,28 +117,103 @@ describe('signals utility', () => {
   });
 
   describe('isSchoolHoliday', () => {
+    const originalSchoolCalendarOverrides = {
+      SCHOOL_CALENDAR_OVERRIDES: process.env.SCHOOL_CALENDAR_OVERRIDES,
+      SCHOOL_TERM_OVERRIDES: process.env.SCHOOL_TERM_OVERRIDES,
+      SA_SCHOOL_TERM_OVERRIDES: process.env.SA_SCHOOL_TERM_OVERRIDES,
+    };
+
+    afterEach(() => {
+      for (const [key, value] of Object.entries(originalSchoolCalendarOverrides)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    });
+
+    it('exposes the gazetted learner calendar through 2027', () => {
+      expect(getSchoolCalendarForYear(2027)).toEqual({
+        terms: [
+          { start: '2027-01-13', end: '2027-03-19' },
+          { start: '2027-04-06', end: '2027-06-25' },
+          { start: '2027-07-20', end: '2027-09-22' },
+          { start: '2027-10-05', end: '2027-12-08' },
+        ],
+        specialSchoolHolidays: ['2027-04-26'],
+      });
+    });
+
     it('returns false during school term (in session)', () => {
       // 2026 Term 1: Jan 14 - Mar 27
       expect(isSchoolHoliday(new Date(2026, 0, 20))).toBe(false); // Jan 20
       expect(isSchoolHoliday(new Date(2026, 1, 15))).toBe(false); // Feb 15
-      // 2026 Term 2: Apr 14 - Jun 26
+      // 2026 Term 2: Apr 8 - Jun 26
+      expect(isSchoolHoliday(new Date(2026, 3, 8))).toBe(false); // Apr 8
       expect(isSchoolHoliday(new Date(2026, 4, 10))).toBe(false); // May 10
+      // 2027 Term 3: Jul 20 - Sep 22
+      expect(isSchoolHoliday(new Date(2027, 6, 20))).toBe(false); // Jul 20
     });
 
     it('returns true during school holiday (outside term)', () => {
-      // Between Term 1 and Term 2: Mar 28 - Apr 13
+      // Between Term 1 and Term 2: Mar 28 - Apr 7
       expect(isSchoolHoliday(new Date(2026, 3, 1))).toBe(true); // Apr 1
-      // After Term 4: Dec 12+
+      // After Term 4: Dec 10+
+      expect(isSchoolHoliday(new Date(2026, 11, 10))).toBe(true); // Dec 10
       expect(isSchoolHoliday(new Date(2026, 11, 20))).toBe(true); // Dec 20
       // Before Term 1: Jan 1-13
       expect(isSchoolHoliday(new Date(2026, 0, 5))).toBe(true); // Jan 5
+      // 2027 winter break
+      expect(isSchoolHoliday(new Date(2027, 6, 1))).toBe(true); // Jul 1
+    });
+
+    it('corrects the published 2025 and 2026 term boundaries', () => {
+      expect(isSchoolHoliday(new Date(2025, 9, 1))).toBe(false); // 2025 Term 3 still active
+      expect(isSchoolHoliday(new Date(2025, 9, 8))).toBe(true); // 2025 Oct break
+      expect(isSchoolHoliday(new Date(2026, 8, 24))).toBe(true); // 2026 Sep break
+    });
+
+    it('marks gazetted special school holidays inside a term', () => {
+      expect(isSchoolHoliday(new Date(2025, 3, 29))).toBe(true); // Apr 29
+      expect(isSchoolHoliday(new Date(2026, 5, 15))).toBe(true); // Jun 15
+      expect(isSchoolHoliday(new Date(2027, 3, 26))).toBe(true); // Apr 26
     });
 
     it('fails safe (no signal) for years without term data', () => {
-      // Without 2027+ term data, every day must NOT read as a school holiday
-      expect(isSchoolHoliday(new Date(2027, 1, 15))).toBe(false);
-      expect(isSchoolHoliday(new Date(2027, 6, 1))).toBe(false);
+      expect(getSchoolCalendarForYear(2030)).toBeNull();
       expect(isSchoolHoliday(new Date(2030, 3, 1))).toBe(false);
+    });
+
+    it('accepts environment-configured school calendar overrides', () => {
+      process.env.SCHOOL_CALENDAR_OVERRIDES = JSON.stringify({
+        2030: {
+          terms: [
+            ['2030-01-10', '2030-03-20'],
+            ['2030-04-07', '2030-06-19'],
+            ['2030-07-14', '2030-09-18'],
+            ['2030-10-06', '2030-12-05'],
+          ],
+          specialSchoolHolidays: ['2030-06-17'],
+        },
+      });
+
+      expect(getSchoolCalendarForYear(2030)).toEqual(
+        expect.objectContaining({
+          specialSchoolHolidays: ['2030-06-17'],
+        })
+      );
+      expect(isSchoolHoliday(new Date(2030, 0, 15))).toBe(false); // In term
+      expect(isSchoolHoliday(new Date(2030, 2, 25))).toBe(true); // Between terms
+      expect(isSchoolHoliday(new Date(2030, 5, 17))).toBe(true); // Special school holiday
+    });
+
+    it('ignores malformed school calendar overrides safely', () => {
+      process.env.SCHOOL_CALENDAR_OVERRIDES = JSON.stringify({
+        2030: {
+          terms: [['2030-01-10', '2030-03-20']],
+        },
+      });
+
+      expect(getSchoolCalendarForYear(2030)).toBeNull();
+      expect(isSchoolHoliday(new Date(2030, 0, 15))).toBe(false);
     });
   });
 });

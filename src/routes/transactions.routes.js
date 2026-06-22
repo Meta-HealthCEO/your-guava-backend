@@ -33,12 +33,12 @@ const storage = multer.diskStorage({
 });
 
 const fileFilter = (_req, file, cb) => {
-  const allowedExts = ['.csv', '.xlsx', '.xls'];
+  const allowedExts = ['.csv', '.xlsx'];
   const ext = path.extname(file.originalname).toLowerCase();
   if (allowedExts.includes(ext)) {
     cb(null, true);
   } else {
-    const err = new Error('Only CSV, XLS, and XLSX files are allowed');
+    const err = new Error('Only CSV and XLSX files are allowed');
     err.statusCode = 400;
     cb(err, false);
   }

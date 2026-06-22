@@ -12,7 +12,6 @@ router.get('/revenue', analyticsCache, analytics.getRevenue);
 router.get('/items', analyticsCache, analytics.getItems);
 router.get('/heatmap', analyticsCache, analytics.getHeatmap);
 router.get('/customers', analyticsCache, analytics.getCustomers);
-router.get('/waste', analyticsCache, analytics.getWaste);
 router.get('/combos', analyticsCache, analytics.getCombos);
 
 module.exports = router;

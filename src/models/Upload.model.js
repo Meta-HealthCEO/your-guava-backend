@@ -16,6 +16,15 @@ const columnMappingSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const rowErrorSchema = new mongoose.Schema(
+  {
+    rowNumber: { type: Number },
+    reason: { type: String, required: true },
+    raw: { type: mongoose.Schema.Types.Mixed },
+  },
+  { _id: false }
+);
+
 const uploadSchema = new mongoose.Schema(
   {
     cafeId: {
@@ -60,6 +69,7 @@ const uploadSchema = new mongoose.Schema(
       lastDate: { type: Date },
     },
     errorMessage: { type: String },
+    rowErrors: { type: [rowErrorSchema], default: [] },
     headers: [{ type: String }],
     sampleRows: [{ type: mongoose.Schema.Types.Mixed }],
     completedAt: { type: Date },

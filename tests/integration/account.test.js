@@ -13,6 +13,7 @@ afterEach(async () => {
   delete process.env.ONEGATE_ORG_ID;
   delete process.env.ONEGATE_API_SALT;
   delete process.env.API_PUBLIC_URL;
+  delete process.env.BILLING_MOCK_ENABLED;
   await clearDB();
 });
 
@@ -98,6 +99,25 @@ describe('Account API', () => {
     expect(res.body.account.organization.billingCycle).toBe('annual');
     expect(res.body.account.usage.guavaCredits.included).toBe(1800);
     expect(await Forecast.countDocuments({})).toBe(0);
+  });
+
+  it('does not allow mock checkout in production', async () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    process.env.BILLING_MOCK_ENABLED = 'true';
+
+    try {
+      const res = await request
+        .post('/api/account/checkout')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({ plan: 'growth', billingCycle: 'monthly' });
+
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('BILLING_PROVIDER_NOT_CONFIGURED');
+    } finally {
+      if (savedNodeEnv == null) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = savedNodeEnv;
+    }
   });
 
   it('creates a hosted OneGate card checkout without activating the plan before payment', async () => {
@@ -214,6 +234,25 @@ describe('Account API', () => {
     expect(res.status).toBe(200);
     expect(res.body.purchase.credits).toBe(500);
     expect(res.body.account.usage.guavaCredits.bonus).toBe(500);
+  });
+
+  it('does not allow mock credit purchases in production', async () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    process.env.BILLING_MOCK_ENABLED = 'true';
+
+    try {
+      const res = await request
+        .post('/api/account/ai-credits')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({ credits: 500 });
+
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('BILLING_PROVIDER_NOT_CONFIGURED');
+    } finally {
+      if (savedNodeEnv == null) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = savedNodeEnv;
+    }
   });
 
   it('summarises metered Guava Credit activity', async () => {

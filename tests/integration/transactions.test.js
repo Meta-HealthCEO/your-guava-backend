@@ -115,6 +115,35 @@ describe('Transactions API', () => {
       expect(res.body.needsConfirmation).toBe(false);
       expect(res.body.columnMapping.date).toBe('Sale Date');
     });
+
+    it('does not auto-confirm a line-per-row saved mapping without receipt ID', async () => {
+      await Cafe.findByIdAndUpdate(user.activeCafeId, {
+        $set: {
+          savedColumnMapping: {
+            date: 'Date',
+            time: 'Time',
+            items: 'Item',
+            quantity: 'Qty',
+            total: 'Line Total',
+            itemsMode: 'line-per-row',
+          },
+        },
+      });
+
+      const csv = Buffer.from([
+        'Date,Time,Item,Qty,Line Total',
+        '2026-04-01,08:30,Flat White,1,35.00',
+      ].join('\n'));
+      const res = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', csv, 'line-no-receipt.csv');
+
+      expect(res.status).toBe(200);
+      expect(res.body.posType).toBe('wizard');
+      expect(res.body.itemsMode).toBe('line-per-row');
+      expect(res.body.needsConfirmation).toBe(true);
+    });
   });
 
   // re-enabled after /uploads/:id/confirm exists (Task 11)

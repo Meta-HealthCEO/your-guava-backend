@@ -4,6 +4,7 @@ const Cafe = require('../models/Cafe.model');
 const Forecast = require('../models/Forecast.model');
 const r2 = require('../services/r2.service');
 const ingestion = require('../services/ingestion.service');
+const parser = require('../services/parser.service');
 const { updateForecastActuals, generateWeekForecast } = require('../services/forecast.service');
 const { computeDedupKey } = require('../utils/dedupKey');
 const { clearApiCache } = require('../middleware/cache.middleware');
@@ -12,11 +13,13 @@ const REQUIRED = ['date', 'items', 'total'];
 const VALID_ITEMS_MODES = new Set(['packed', 'line-per-row']);
 
 const validateMapping = (upload, columnMapping, itemsMode) => {
-  if (!VALID_ITEMS_MODES.has(itemsMode || 'packed')) {
+  const mode = itemsMode || 'packed';
+  if (!VALID_ITEMS_MODES.has(mode)) {
     return `Invalid itemsMode: ${itemsMode}`;
   }
 
-  const missing = REQUIRED.filter((f) => !columnMapping?.[f]);
+  const required = mode === 'line-per-row' ? [...REQUIRED, 'receiptId'] : REQUIRED;
+  const missing = required.filter((f) => !columnMapping?.[f]);
   if (missing.length > 0) {
     return `Missing required mapping: ${missing.join(', ')}`;
   }
@@ -24,7 +27,7 @@ const validateMapping = (upload, columnMapping, itemsMode) => {
   const headers = Array.isArray(upload?.headers) ? upload.headers : [];
   if (headers.length > 0) {
     const invalid = Object.entries(columnMapping || {})
-      .filter(([, value]) => value != null && value !== '' && !headers.includes(value))
+      .filter(([, value]) => value != null && value !== '' && (typeof value !== 'string' || !headers.includes(value)))
       .map(([field, value]) => `${field} -> ${value}`);
     if (invalid.length > 0) {
       return `Mapped columns are not in this file: ${invalid.join(', ')}`;
@@ -38,6 +41,18 @@ const assertImportableResult = (result) => {
   if (result.totalRows === 0) {
     const err = new Error('No transaction rows found in this upload');
     err.statusCode = 400;
+    throw err;
+  }
+
+  if (result.approvedRows === 0) {
+    const err = new Error('No approved transaction rows could be imported with this mapping');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (result.imported === 0 && result.duplicateRows >= result.approvedRows) {
+    const err = new Error('No new transactions were imported; every valid row already exists');
+    err.statusCode = 409;
     throw err;
   }
 
@@ -60,6 +75,39 @@ const assertParsedRowsImportable = (parsed) => {
     err.statusCode = 400;
     throw err;
   }
+
+  const approvedRows = parsed.rows.filter((row) => (row.status || 'approved').toLowerCase() === 'approved');
+  if (approvedRows.length === 0) {
+    const err = new Error('No approved transaction rows could be imported with this mapping');
+    err.statusCode = 400;
+    throw err;
+  }
+};
+
+const lockUploadForParsing = async (upload, cafeId, columnMapping, itemsMode) => {
+  const locked = await Upload.findOneAndUpdate(
+    {
+      _id: upload._id,
+      cafeId,
+      status: upload.status,
+    },
+    {
+      $set: {
+        status: 'parsing',
+        columnMapping,
+        itemsMode: itemsMode || 'packed',
+      },
+    },
+    { new: true }
+  );
+
+  if (!locked) {
+    const err = new Error('Upload status changed while import was starting. Please refresh and try again.');
+    err.statusCode = 409;
+    throw err;
+  }
+
+  return locked;
 };
 
 const duplicateFilterForRow = (cafeId, row) => {
@@ -141,8 +189,10 @@ const confirm = async (req, res, next) => {
     const { columnMapping, itemsMode } = req.body;
     const cafeId = req.user.cafeId;
 
-    const upload = await Upload.findOne({ _id: id, cafeId });
-    if (!upload) return res.status(404).json({ success: false, message: 'Upload not found' });
+    let upload = await Upload.findOne({ _id: id, cafeId });
+    if (!upload || upload.status === 'deleted') {
+      return res.status(404).json({ success: false, message: 'Upload not found' });
+    }
     if (upload.status === 'completed' || upload.status === 'parsing') {
       return res.status(409).json({ success: false, message: `Upload already ${upload.status}` });
     }
@@ -158,13 +208,15 @@ const confirm = async (req, res, next) => {
       itemsMode: upload.itemsMode,
       stats: upload.stats?.toObject ? upload.stats.toObject() : { ...(upload.stats || {}) },
       dateRange: upload.dateRange?.toObject ? upload.dateRange.toObject() : { ...(upload.dateRange || {}) },
+      rowErrors: Array.isArray(upload.rowErrors) ? upload.rowErrors.map((rowError) => (
+        rowError?.toObject ? rowError.toObject() : { ...rowError }
+      )) : [],
       completedAt: upload.completedAt,
     };
 
-    upload.status = 'parsing';
-    upload.columnMapping = columnMapping;
-    upload.itemsMode = itemsMode || 'packed';
-    await upload.save();
+    upload = await lockUploadForParsing(upload, cafeId, columnMapping, itemsMode);
+    let parsed;
+    let result;
 
     try {
       const buffer = await r2.downloadFile(upload.r2Key);
@@ -174,13 +226,17 @@ const confirm = async (req, res, next) => {
         throw err;
       }
       const ext = upload.fileName.split('.').pop().toLowerCase();
-      await Transaction.deleteMany({ cafeId, uploadId: upload._id });
-      const result = await ingestion.ingestParsedRows(buffer, {
-        cafeId,
-        uploadId: upload._id,
+      parsed = await parser.parseBuffer(buffer, {
         columnMapping,
         itemsMode: upload.itemsMode,
         fileExt: ext,
+      });
+      assertParsedRowsImportable(parsed);
+
+      await Transaction.deleteMany({ cafeId, uploadId: upload._id });
+      result = await ingestion.persistParsedRows(parsed, {
+        cafeId,
+        uploadId: upload._id,
       });
       assertImportableResult(result);
 
@@ -192,7 +248,9 @@ const confirm = async (req, res, next) => {
         totalRows: result.totalRows,
       };
       upload.dateRange = result.dateRange;
+      upload.rowErrors = result.rowErrors || parsed.rowErrors || [];
       upload.completedAt = new Date();
+      upload.errorMessage = undefined;
       await upload.save();
 
       // Invalidate planning forecasts so they regenerate with fresh data.
@@ -221,13 +279,18 @@ const confirm = async (req, res, next) => {
         uploadId: upload._id,
         stats: upload.stats,
         dateRange: upload.dateRange,
+        rowErrors: upload.rowErrors,
       });
     } catch (err) {
-      upload.status = previousUploadState.status;
+      const rowErrors = result?.rowErrors || parsed?.rowErrors || previousUploadState.rowErrors;
+      upload.status = ['pending_mapping', 'failed'].includes(previousUploadState.status)
+        ? 'failed'
+        : previousUploadState.status;
       upload.columnMapping = previousUploadState.columnMapping;
       upload.itemsMode = previousUploadState.itemsMode;
       upload.stats = previousUploadState.stats;
       upload.dateRange = previousUploadState.dateRange;
+      upload.rowErrors = rowErrors;
       upload.completedAt = previousUploadState.completedAt;
       upload.errorMessage = err.message;
       await upload.save();
@@ -318,7 +381,7 @@ const remap = async (req, res, next) => {
     const { columnMapping, itemsMode } = req.body;
     const cafeId = req.user.cafeId;
 
-    const upload = await Upload.findOne({ _id: id, cafeId });
+    let upload = await Upload.findOne({ _id: id, cafeId });
     if (!upload || upload.status === 'deleted') {
       return res.status(404).json({ success: false, message: 'Upload not found' });
     }
@@ -337,13 +400,13 @@ const remap = async (req, res, next) => {
       itemsMode: upload.itemsMode,
       stats: upload.stats?.toObject ? upload.stats.toObject() : { ...(upload.stats || {}) },
       dateRange: upload.dateRange?.toObject ? upload.dateRange.toObject() : { ...(upload.dateRange || {}) },
+      rowErrors: Array.isArray(upload.rowErrors) ? upload.rowErrors.map((rowError) => (
+        rowError?.toObject ? rowError.toObject() : { ...rowError }
+      )) : [],
       completedAt: upload.completedAt,
     };
 
-    upload.status = 'parsing';
-    upload.columnMapping = columnMapping;
-    upload.itemsMode = itemsMode || 'packed';
-    await upload.save();
+    upload = await lockUploadForParsing(upload, cafeId, columnMapping, itemsMode);
 
     try {
       // 1. Parse first (read-only — can fail without any side effects)
@@ -354,8 +417,7 @@ const remap = async (req, res, next) => {
         throw err;
       }
       const ext = upload.fileName.split('.').pop().toLowerCase();
-      const { parseBuffer } = require('../services/parser.service');
-      const parsed = await parseBuffer(buffer, {
+      const parsed = await parser.parseBuffer(buffer, {
         columnMapping,
         itemsMode: upload.itemsMode,
         fileExt: ext,
@@ -381,6 +443,7 @@ const remap = async (req, res, next) => {
         totalRows: result.totalRows,
       };
       upload.dateRange = result.dateRange;
+      upload.rowErrors = result.rowErrors || parsed.rowErrors || [];
       upload.completedAt = new Date();
       upload.errorMessage = undefined;
       await upload.save();
@@ -400,6 +463,7 @@ const remap = async (req, res, next) => {
         uploadId: upload._id,
         stats: upload.stats,
         dateRange: upload.dateRange,
+        rowErrors: upload.rowErrors,
       });
     } catch (err) {
       upload.status = previousUploadState.status;
@@ -407,6 +471,7 @@ const remap = async (req, res, next) => {
       upload.itemsMode = previousUploadState.itemsMode;
       upload.stats = previousUploadState.stats;
       upload.dateRange = previousUploadState.dateRange;
+      upload.rowErrors = previousUploadState.rowErrors;
       upload.completedAt = previousUploadState.completedAt;
       upload.errorMessage = err.message;
       await upload.save();

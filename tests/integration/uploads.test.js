@@ -16,6 +16,7 @@ const path = require('path');
 const supertest = require('supertest');
 const { setup, teardown, clearDB, createTestUser, app } = require('../setup');
 const Transaction = require('../../src/models/Transaction.model');
+const Upload = require('../../src/models/Upload.model');
 
 const request = supertest(app);
 
@@ -55,6 +56,88 @@ describe('Uploads API', () => {
       expect(txns[0].uploadId.toString()).toBe(uploadId);
     });
 
+    it('stages and confirms semicolon CSVs with normalised headers', async () => {
+      const csv = Buffer.from([
+        '\uFEFF Sale Date ; Sale Time ; Description ; Amount ',
+        '2026-04-01;09:30;Flat White;R 35,00',
+      ].join('\n'));
+
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', csv, 'semicolon.csv');
+
+      expect(stage.status).toBe(200);
+      expect(stage.body.headers).toEqual(['Sale Date', 'Sale Time', 'Description', 'Amount']);
+
+      const confirm = await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          columnMapping: {
+            date: 'Sale Date',
+            time: 'Sale Time',
+            items: 'Description',
+            total: 'Amount',
+          },
+          itemsMode: 'packed',
+        });
+
+      expect(confirm.status).toBe(200);
+      expect(confirm.body.stats.imported).toBe(1);
+
+      const tx = await Transaction.findOne({ uploadId: stage.body.uploadId }).lean();
+      expect(tx.total).toBe(35);
+      expect(tx.hour).toBe(9);
+    });
+
+    it('persists row-level errors for partially valid uploads', async () => {
+      const csv = Buffer.from([
+        'Receipt,Date,Time,Items,Total',
+        'R500,2026-04-01,08:30,1 x Flat White,35.00',
+        'R501,not-a-date,08:45,1 x Muffin,25.00',
+      ].join('\n'));
+
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', csv, 'partial-errors.csv');
+
+      const confirm = await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          columnMapping: {
+            receiptId: 'Receipt',
+            date: 'Date',
+            time: 'Time',
+            items: 'Items',
+            total: 'Total',
+          },
+          itemsMode: 'packed',
+        });
+
+      expect(confirm.status).toBe(200);
+      expect(confirm.body.stats).toMatchObject({ imported: 1, errors: 1, totalRows: 2 });
+      expect(confirm.body.rowErrors).toEqual([
+        expect.objectContaining({
+          rowNumber: 3,
+          reason: 'Could not parse date or time',
+          raw: expect.objectContaining({ Receipt: 'R501', Date: 'not-a-date' }),
+        }),
+      ]);
+
+      const detail = await request
+        .get(`/api/uploads/${stage.body.uploadId}`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(detail.body.upload.rowErrors).toHaveLength(1);
+      expect(detail.body.upload.rowErrors[0]).toMatchObject({
+        rowNumber: 3,
+        reason: 'Could not parse date or time',
+      });
+    });
+
     it('returns 409 when confirming an already-completed upload', async () => {
       const stage = await request
         .post('/api/transactions/upload')
@@ -82,6 +165,35 @@ describe('Uploads API', () => {
         .set('Authorization', `Bearer ${token}`)
         .send({ columnMapping: { date: 'Date' }, itemsMode: 'packed' });
       expect(res.status).toBe(400);
+    });
+
+    it('returns 400 when line-per-row mapping has no receipt ID', async () => {
+      const csv = Buffer.from([
+        'Date,Time,Item,Qty,Line Total',
+        '2026-04-01,08:30,Flat White,1,35.00',
+      ].join('\n'));
+
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', csv, 'line-without-receipt.csv');
+
+      const res = await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          columnMapping: {
+            date: 'Date',
+            time: 'Time',
+            items: 'Item',
+            quantity: 'Qty',
+            total: 'Line Total',
+          },
+          itemsMode: 'line-per-row',
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/receiptId/i);
     });
 
     it('returns 400 when a mapped column is not present in the staged file', async () => {
@@ -123,6 +235,87 @@ describe('Uploads API', () => {
 
       expect(res.status).toBe(400);
       expect(res.body.message).toMatch(/no transaction rows/i);
+    });
+
+    it('returns 400 when no approved transaction rows are present', async () => {
+      const csv = Buffer.from([
+        'Receipt,Date,Time,Status,Items,Total',
+        'D1,2026-04-01,08:30,declined,1 x Flat White,35.00',
+      ].join('\n'));
+
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', csv, 'declined-only.csv');
+
+      const res = await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          columnMapping: {
+            receiptId: 'Receipt',
+            date: 'Date',
+            time: 'Time',
+            status: 'Status',
+            items: 'Items',
+            total: 'Total',
+          },
+          itemsMode: 'packed',
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/no approved transaction rows/i);
+
+      const txns = await Transaction.find({ uploadId: stage.body.uploadId }).lean();
+      expect(txns).toHaveLength(0);
+    });
+
+    it('does not mark duplicate-only uploads as successful imports', async () => {
+      const firstStage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      const firstConfirm = await request
+        .post(`/api/uploads/${firstStage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: firstStage.body.columnMapping, itemsMode: firstStage.body.itemsMode });
+      expect(firstConfirm.status).toBe(200);
+
+      const secondStage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      const secondConfirm = await request
+        .post(`/api/uploads/${secondStage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: secondStage.body.columnMapping, itemsMode: secondStage.body.itemsMode });
+
+      expect(secondConfirm.status).toBe(409);
+      expect(secondConfirm.body.message).toMatch(/already exists/i);
+
+      const secondTxns = await Transaction.find({ uploadId: secondStage.body.uploadId }).lean();
+      expect(secondTxns).toHaveLength(0);
+
+      const upload = await Upload.findById(secondStage.body.uploadId).lean();
+      expect(upload.status).toBe('failed');
+      expect(upload.errorMessage).toMatch(/already exists/i);
+      expect(await Transaction.countDocuments({})).toBe(4);
+    });
+
+    it('does not allow a deleted upload to be confirmed', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+
+      await Upload.updateOne({ _id: stage.body.uploadId }, { $set: { status: 'deleted' } });
+
+      const res = await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      expect(res.status).toBe(404);
     });
   });
 

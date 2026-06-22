@@ -23,10 +23,18 @@ afterEach(clearDB);
 
 describe('Integrations API', () => {
   let token;
+  let savedAccountingFlag;
 
   beforeEach(async () => {
+    savedAccountingFlag = process.env.ACCOUNTING_INTEGRATIONS_ENABLED;
+    delete process.env.ACCOUNTING_INTEGRATIONS_ENABLED;
     const u = await createTestUser();
     token = u.token;
+  });
+
+  afterEach(() => {
+    if (savedAccountingFlag == null) delete process.env.ACCOUNTING_INTEGRATIONS_ENABLED;
+    else process.env.ACCOUNTING_INTEGRATIONS_ENABLED = savedAccountingFlag;
   });
 
   it('GET /api/integrations returns initial disconnected state for all 3 providers', async () => {
@@ -41,7 +49,18 @@ describe('Integrations API', () => {
     expect(res.body.data.sage.connected).toBe(false);
   });
 
+  it('GET /api/integrations/:provider/auth returns 503 when accounting integrations are disabled', async () => {
+    const res = await request
+      .get('/api/integrations/xero/auth')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe('ACCOUNTING_INTEGRATIONS_NOT_AVAILABLE');
+    expect(res.body.message).toMatch(/coming soon/i);
+  });
+
   it('GET /api/integrations/:provider/auth returns 503 with clear error when env vars missing', async () => {
+    process.env.ACCOUNTING_INTEGRATIONS_ENABLED = 'true';
     // Ensure env vars are absent
     const savedId = process.env.XERO_CLIENT_ID;
     delete process.env.XERO_CLIENT_ID;
@@ -58,6 +77,7 @@ describe('Integrations API', () => {
   });
 
   it('GET /api/integrations/:provider/auth returns URL when env vars set', async () => {
+    process.env.ACCOUNTING_INTEGRATIONS_ENABLED = 'true';
     process.env.XERO_CLIENT_ID = 'test-id';
     process.env.XERO_CLIENT_SECRET = 'test-secret';
     process.env.XERO_REDIRECT_URI = 'http://localhost:5173/integrations/xero/callback';
@@ -76,6 +96,7 @@ describe('Integrations API', () => {
   });
 
   it('GET /api/integrations/unknown/auth returns 400', async () => {
+    process.env.ACCOUNTING_INTEGRATIONS_ENABLED = 'true';
     const res = await request
       .get('/api/integrations/unknown/auth')
       .set('Authorization', `Bearer ${token}`);
@@ -134,13 +155,53 @@ describe('Integrations API', () => {
     expect(after.accountingIntegrations?.xero?.accessToken).toBeFalsy();
   });
 
+  it('POST /api/integrations/:provider/sync returns 503 while accounting integrations are disabled', async () => {
+    const res = await request
+      .post('/api/integrations/xero/sync')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe('ACCOUNTING_INTEGRATIONS_NOT_AVAILABLE');
+  });
+
   it('POST /api/integrations/:provider/sync returns 400 when not connected', async () => {
+    process.env.ACCOUNTING_INTEGRATIONS_ENABLED = 'true';
     const res = await request
       .post('/api/integrations/xero/sync')
       .set('Authorization', `Bearer ${token}`);
 
     expect(res.status).toBe(400);
     expect(res.body.message).toBe('Not connected');
+  });
+
+  it('POST /api/integrations/:provider/sync does not fake success before sales posting is implemented', async () => {
+    process.env.ACCOUNTING_INTEGRATIONS_ENABLED = 'true';
+    const Cafe = require('../../src/models/Cafe.model');
+
+    const meRes = await request
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${token}`);
+    const cafeId =
+      meRes.body.activeCafeId ||
+      meRes.body.cafeId ||
+      (meRes.body.cafeIds && meRes.body.cafeIds[0]);
+
+    await Cafe.findByIdAndUpdate(cafeId, {
+      $set: {
+        'accountingIntegrations.xero.connected': true,
+        'accountingIntegrations.xero.accessToken': 'plain-access-token',
+        'accountingIntegrations.xero.refreshToken': 'plain-refresh-token',
+        'accountingIntegrations.xero.expiresAt': new Date(Date.now() + 3600 * 1000),
+      },
+    });
+
+    const res = await request
+      .post('/api/integrations/xero/sync')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(501);
+    expect(res.body.success).toBe(false);
+    expect(res.body.message).toMatch(/not implemented/i);
   });
 
   it('POST /api/integrations/unknown/disconnect returns 400', async () => {

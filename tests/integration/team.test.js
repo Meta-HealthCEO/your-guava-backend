@@ -71,6 +71,9 @@ describe('Team API', () => {
 
     it('ignores a client-supplied password and generates its own', async () => {
       const cafeId = ownerUser.activeCafeId;
+      const inviteSpy = jest
+        .spyOn(emailService, 'sendTeamInviteEmail')
+        .mockResolvedValue({ sent: true });
 
       const res = await request
         .post('/api/team/invite')
@@ -83,13 +86,42 @@ describe('Team API', () => {
         });
 
       expect(res.status).toBe(201);
-      // No email provider configured → password returned for manual relay
-      expect(res.body.emailSent).toBe(false);
-      expect(res.body.temporaryPassword).toMatch(/^Guava-/);
+      // Passwords are delivered only through the invite email, never the API.
+      expect(res.body.emailSent).toBe(true);
+      expect(res.body.temporaryPassword).toBeUndefined();
 
       const persisted = await User.findOne({ email: 'manager2@yourguava.com' });
+      const sentPassword = inviteSpy.mock.calls[0][0].temporaryPassword;
       await expect(persisted.comparePassword('attacker-chosen-password')).resolves.toBe(false);
-      await expect(persisted.comparePassword(res.body.temporaryPassword)).resolves.toBe(true);
+      await expect(persisted.comparePassword(sentPassword)).resolves.toBe(true);
+    });
+
+    it('rolls back the manager and never returns a password when invite email is skipped', async () => {
+      const cafeId = ownerUser.activeCafeId;
+      jest
+        .spyOn(emailService, 'sendTeamInviteEmail')
+        .mockResolvedValue({ skipped: true, reason: 'resend_not_configured' });
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const res = await request
+        .post('/api/team/invite')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({
+          name: 'No Email Manager',
+          email: 'no-email@yourguava.com',
+          cafeIds: [cafeId],
+        });
+
+      expect(res.status).toBe(503);
+      expect(res.body.success).toBe(false);
+      expect(res.body.emailSent).toBe(false);
+      expect(res.body.message).toMatch(/email is not configured/i);
+      expect(res.body.temporaryPassword).toBeUndefined();
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/blocked because email is not configured/i));
+
+      const persisted = await User.findOne({ email: 'no-email@yourguava.com' });
+      expect(persisted).toBeNull();
+      expect(res.body.seats.used).toBe(1);
     });
 
     it('manager cannot invite (403)', async () => {
@@ -135,6 +167,9 @@ describe('Team API', () => {
   describe('GET /api/team', () => {
     it('lists team members', async () => {
       const cafeId = ownerUser.activeCafeId;
+      jest
+        .spyOn(emailService, 'sendTeamInviteEmail')
+        .mockResolvedValue({ sent: true });
 
       // Invite a manager
       await request
@@ -198,6 +233,9 @@ describe('Team API', () => {
   describe('DELETE /api/team/:id', () => {
     it('removes manager from org', async () => {
       const cafeId = ownerUser.activeCafeId;
+      jest
+        .spyOn(emailService, 'sendTeamInviteEmail')
+        .mockResolvedValue({ sent: true });
 
       // Invite a manager
       const inviteRes = await request

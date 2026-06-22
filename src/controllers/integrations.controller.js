@@ -18,6 +18,16 @@ const getService = (provider) => {
 const isConfigError = (error) =>
   /CLIENT_ID|CLIENT_SECRET|REDIRECT_URI|is not set/i.test(error?.message || '');
 
+const accountingIntegrationsEnabled = () =>
+  String(process.env.ACCOUNTING_INTEGRATIONS_ENABLED || '').toLowerCase() === 'true';
+
+const unavailable = (res) =>
+  res.status(503).json({
+    success: false,
+    code: 'ACCOUNTING_INTEGRATIONS_NOT_AVAILABLE',
+    message: 'Accounting integrations are not available yet. This feature is coming soon.',
+  });
+
 /**
  * GET /api/integrations
  * Returns connection status for all 3 providers. Tokens are never included.
@@ -50,6 +60,8 @@ const list = async (req, res, next) => {
  */
 const getAuthUrl = async (req, res, _next) => {
   try {
+    if (!accountingIntegrationsEnabled()) return unavailable(res);
+
     const { provider } = req.params;
     const service = getService(provider);
     if (!service) return res.status(400).json({ success: false, message: 'Unknown provider' });
@@ -89,6 +101,8 @@ const getAuthUrl = async (req, res, _next) => {
  */
 const callback = async (req, res, _next) => {
   try {
+    if (!accountingIntegrationsEnabled()) return unavailable(res);
+
     const { provider } = req.params;
     const { code, state, ...providerExtras } = req.body;
     const service = getService(provider);
@@ -135,6 +149,8 @@ const callback = async (req, res, _next) => {
  */
 const sync = async (req, res, next) => {
   try {
+    if (!accountingIntegrationsEnabled()) return unavailable(res);
+
     const { provider } = req.params;
     const service = getService(provider);
     if (!service) return res.status(400).json({ success: false, message: 'Unknown provider' });
@@ -208,7 +224,7 @@ const sync = async (req, res, next) => {
     };
     await Cafe.findByIdAndUpdate(req.user.cafeId, { $set: updateFields });
 
-    return res.status(result.ok ? 200 : 500).json({
+    return res.status(result.ok ? 200 : result.statusCode || 500).json({
       success: result.ok,
       providerRef: result.providerRef,
       summary: {

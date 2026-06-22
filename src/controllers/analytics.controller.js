@@ -695,23 +695,6 @@ const getCustomers = async (req, res, next) => {
 };
 
 /**
- * GET /api/analytics/waste
- * Waste analytics — placeholder
- */
-const getWaste = async (_req, res, next) => {
-  try {
-    return res.status(200).json({
-      success: true,
-      message: 'Waste tracking coming soon',
-      data: [],
-      meta: { startDate: null, endDate: null },
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
  * GET /api/analytics/combos
  * Frequently-bought-together item pairs
  */
@@ -840,6 +823,5 @@ module.exports = {
   getItems,
   getHeatmap,
   getCustomers,
-  getWaste,
   getCombos,
 };

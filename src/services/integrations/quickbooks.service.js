@@ -145,12 +145,15 @@ const isTokenExpired = (expiresAt) => {
  * The `cafe` object passed here will have `accessToken` and `realmId`
  * populated from the stored integration fields.
  */
-const pushSalesSummary = async (_cafe, summaryData) => {
+const pushSalesSummary = async () => {
   // TODO: push to QuickBooks — POST {apiBase}/v3/company/{realmId}/salesreceipt
   // Doc: https://developer.intuit.com/app/developer/qbo/docs/api/accounting/all-entities/salesreceipt
   // When implementing: use _cafe.accessToken + _cafe.realmId; pick apiBase via process.env.QUICKBOOKS_ENV.
-  console.log('[quickbooks] would push sales summary:', summaryData);
-  return { ok: true, providerRef: 'stub-quickbooks-' + Date.now() };
+  return {
+    ok: false,
+    statusCode: 501,
+    error: 'QuickBooks sales posting is not implemented yet',
+  };
 };
 
 module.exports = {

@@ -12,6 +12,11 @@ const { proposeColumnMapping } = require('../services/anthropic.service');
 const REQUIRED_UPLOAD_MAPPING = ['date', 'items', 'total'];
 const MIN_HEADER_COUNT = 2;
 
+const requiredUploadMappingForMode = (itemsMode = 'packed') =>
+  itemsMode === 'line-per-row'
+    ? [...REQUIRED_UPLOAD_MAPPING, 'receiptId']
+    : REQUIRED_UPLOAD_MAPPING;
+
 const cleanupLocalFile = (filePath) => {
   if (!filePath) return;
   try { fs.unlinkSync(filePath); } catch {}
@@ -28,8 +33,8 @@ const cleanColumnMapping = (mapping = {}, headers = []) => {
   return cleaned;
 };
 
-const hasRequiredHeaderMapping = (mapping = {}, headers = []) =>
-  REQUIRED_UPLOAD_MAPPING.every((field) => {
+const hasRequiredHeaderMapping = (mapping = {}, headers = [], itemsMode = 'packed') =>
+  requiredUploadMappingForMode(itemsMode).every((field) => {
     const mappedHeader = mapping?.[field];
     return typeof mappedHeader === 'string' && headers.includes(mappedHeader);
   });
@@ -46,6 +51,7 @@ const upload = async (req, res, next) => {
     const userId = req.user.id;
     filePath = req.file.path;
     const fileName = path.basename(req.file.originalname);
+    const safeStorageName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_') || 'upload';
     const ext = path.extname(fileName).toLowerCase().slice(1);
     const buffer = fs.readFileSync(filePath);
 
@@ -57,14 +63,25 @@ const upload = async (req, res, next) => {
     }
 
     // Preview headers + sample rows
-    const { headers, sampleRows } = await ingestion.previewBuffer(buffer, ext);
+    let preview;
+    try {
+      preview = await ingestion.previewBuffer(buffer, ext);
+    } catch (err) {
+      cleanupLocalFile(filePath);
+      return res.status(400).json({
+        success: false,
+        message: 'Could not read this file. Please upload a valid CSV or XLSX export.',
+      });
+    }
+
+    const { headers, sampleRows } = preview;
     if (!headers || headers.length < MIN_HEADER_COUNT) {
       cleanupLocalFile(filePath);
-      return res.status(400).json({ success: false, message: 'Could not parse CSV headers' });
+      return res.status(400).json({ success: false, message: 'Could not parse file headers' });
     }
 
     // Stage to R2
-    const r2Key = `uploads/${cafeId}/${Date.now()}-${crypto.randomBytes(6).toString('hex')}-${fileName}`;
+    const r2Key = `uploads/${cafeId}/${Date.now()}-${crypto.randomBytes(6).toString('hex')}-${safeStorageName}`;
     try {
       await r2.uploadFile(buffer, r2Key, req.file.mimetype || 'text/csv');
       stagedR2Key = r2Key;
@@ -78,7 +95,7 @@ const upload = async (req, res, next) => {
     let posType, columnMapping, itemsMode;
     let usedSavedMapping = false;
     const yoco = ingestion.yocoMapping();
-    if (ingestion.isYocoFormat(headers) && hasRequiredHeaderMapping(yoco.mapping, headers)) {
+    if (ingestion.isYocoFormat(headers) && hasRequiredHeaderMapping(yoco.mapping, headers, yoco.itemsMode)) {
       posType = 'yoco';
       columnMapping = cleanColumnMapping(yoco.mapping, headers);
       itemsMode = yoco.itemsMode;
@@ -117,7 +134,7 @@ const upload = async (req, res, next) => {
     });
     uploadDocCreated = true;
 
-    const hasRequiredMapping = hasRequiredHeaderMapping(columnMapping, headers);
+    const hasRequiredMapping = hasRequiredHeaderMapping(columnMapping, headers, itemsMode);
 
     return res.status(200).json({
       success: true,

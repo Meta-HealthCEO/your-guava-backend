@@ -2,9 +2,15 @@ const fs = require('fs');
 const path = require('path');
 const csv = require('csv-parser');
 const { Readable } = require('stream');
-const XLSX = require('xlsx');
 const Transaction = require('../models/Transaction.model');
-const { parseBuffer } = require('./parser.service');
+const {
+  parseBuffer,
+  normaliseHeader,
+  normaliseCell,
+  normaliseRow,
+  detectCsvSeparator,
+  readWorkbookRows,
+} = require('./parser.service');
 const { computeDedupKey } = require('../utils/dedupKey');
 const {
   rebuildItemsForCafe,
@@ -16,6 +22,7 @@ const YOCO_HEADERS = [
   'Card Reader', 'Items', 'Note', 'Currency', 'Tip', 'Discount', 'VAT',
   'Total (incl. tax)', 'Fee Amount', 'Net Amount',
 ];
+const MAX_ROW_ERRORS = 50;
 
 /**
  * Returns true if the headers strongly match a Yoco export.
@@ -46,21 +53,26 @@ const yocoMapping = () => ({
  * @param {Buffer} buffer
  * @returns {Promise<string[]>}
  */
-const previewWorkbook = (buffer) => {
-  const wb = XLSX.read(buffer, { type: 'buffer' });
-  const sheet = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+const previewWorkbook = async (buffer) => {
+  const rows = await readWorkbookRows(buffer);
   const headers = rows[0] ? Object.keys(rows[0]) : [];
   return { headers, sampleRows: rows.slice(0, 5) };
 };
 
 const extractHeaders = async (buffer, fileExt = 'csv') => {
-  if (fileExt === 'xlsx' || fileExt === 'xls') {
-    return previewWorkbook(buffer).headers;
+  if (fileExt === 'xlsx') {
+    return (await previewWorkbook(buffer)).headers;
+  }
+  if (fileExt === 'xls') {
+    throw new Error('Legacy XLS files are not supported. Please export as CSV or XLSX.');
   }
   return new Promise((resolve, reject) => {
     let captured = false;
-    const stream = Readable.from(buffer).pipe(csv());
+    const stream = Readable.from(buffer).pipe(csv({
+      separator: detectCsvSeparator(buffer),
+      mapHeaders: ({ header, index }) => normaliseHeader(header, index),
+      mapValues: ({ value }) => normaliseCell(value),
+    }));
     stream.on('headers', (h) => {
       captured = true;
       resolve(h);
@@ -77,20 +89,39 @@ const extractHeaders = async (buffer, fileExt = 'csv') => {
  * Returns headers + first 5 rows for AI/preset analysis.
  */
 const previewBuffer = async (buffer, fileExt = 'csv') => {
-  if (fileExt === 'xlsx' || fileExt === 'xls') {
+  if (fileExt === 'xlsx') {
     return previewWorkbook(buffer);
+  }
+  if (fileExt === 'xls') {
+    throw new Error('Legacy XLS files are not supported. Please export as CSV or XLSX.');
   }
   return new Promise((resolve, reject) => {
     const rows = [];
     let headers = [];
     Readable.from(buffer)
-      .pipe(csv())
+      .pipe(csv({
+        separator: detectCsvSeparator(buffer),
+        mapHeaders: ({ header, index }) => normaliseHeader(header, index),
+        mapValues: ({ value }) => normaliseCell(value),
+      }))
       .on('headers', (h) => { headers = h; })
       .on('data', (row) => {
-        if (rows.length < 5) rows.push(row);
+        if (rows.length < 5) rows.push(normaliseRow(row));
       })
       .on('error', reject)
       .on('end', () => resolve({ headers, sampleRows: rows }));
+  });
+};
+
+const cloneRowErrors = (rowErrors) =>
+  Array.isArray(rowErrors) ? rowErrors.slice(0, MAX_ROW_ERRORS) : [];
+
+const addPersistenceRowError = (rowErrors, row, reason) => {
+  if (rowErrors.length >= MAX_ROW_ERRORS) return;
+  const sourceRows = row?.__sourceRowNumbers;
+  rowErrors.push({
+    rowNumber: Array.isArray(sourceRows) ? sourceRows[0] : undefined,
+    reason,
   });
 };
 
@@ -103,20 +134,26 @@ const previewBuffer = async (buffer, fileExt = 'csv') => {
  * @param {object} opts
  * @param {string} opts.cafeId
  * @param {string} opts.uploadId
- * @returns {Promise<{imported: number, skipped: number, errors: number, totalRows: number, dateRange: object}>}
+ * @returns {Promise<{imported: number, skipped: number, errors: number, rowErrors: object[], totalRows: number, dateRange: object}>}
  */
 const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
   let imported = 0;
   let skipped = 0;
   let errors = parsed.errors;
+  const rowErrors = cloneRowErrors(parsed.rowErrors);
+  let approvedRows = 0;
+  let declinedRows = 0;
+  let duplicateRows = 0;
 
   for (const row of parsed.rows) {
     try {
       const status = (row.status || 'approved').toLowerCase();
       if (status !== 'approved') {
         skipped++;
+        declinedRows++;
         continue;
       }
+      approvedRows++;
 
       const dedupKey = row.receiptId ? undefined : computeDedupKey({
         date: row.date.toISOString().slice(0, 10),
@@ -132,6 +169,7 @@ const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
       const existing = await Transaction.findOne(filter).lean();
       if (existing) {
         skipped++;
+        duplicateRows++;
         continue;
       }
 
@@ -157,9 +195,11 @@ const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
     } catch (err) {
       if (err.code === 11000) {
         skipped++;
+        duplicateRows++;
       } else {
         console.error('[ingestion] row error:', err.message);
         errors++;
+        addPersistenceRowError(rowErrors, row, 'Could not save row');
       }
     }
   }
@@ -170,7 +210,11 @@ const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
     imported,
     skipped,
     errors,
+    rowErrors,
     totalRows: parsed.totalRows,
+    approvedRows,
+    declinedRows,
+    duplicateRows,
     dateRange: parsed.dateRange,
   };
 };

@@ -31,13 +31,14 @@ const storeRefreshToken = (user, refreshToken) => {
   user.refreshTokens = [...pruned.slice(-(MAX_REFRESH_TOKENS - 1)), { token: refreshToken }];
 };
 
-const generateTokens = (userId, cafeId, role, orgId) => {
+const generateTokens = (userId, cafeId, role, orgId, tokenVersion = 0) => {
   const accessToken = jwt.sign(
     {
       id: userId,
       cafeId: cafeId ? cafeId.toString() : null,
       role: role || 'owner',
       orgId: orgId ? orgId.toString() : null,
+      tokenVersion: Number(tokenVersion || 0),
     },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
@@ -62,6 +63,12 @@ const register = async (req, res, next) => {
       return res
         .status(400)
         .json({ success: false, message: 'Email, password, and name are required' });
+    }
+
+    if (String(password).length < 8) {
+      return res
+        .status(400)
+        .json({ success: false, message: 'Password must be at least 8 characters' });
     }
 
     const existingUser = await User.findOne({ email: email.toLowerCase().trim() });
@@ -90,12 +97,31 @@ const register = async (req, res, next) => {
     user.cafeIds = [cafe._id];
     user.activeCafeId = cafe._id;
 
-    const { accessToken, refreshToken } = generateTokens(user._id, cafe._id, 'owner', org._id);
+    const { accessToken, refreshToken } = generateTokens(
+      user._id,
+      cafe._id,
+      'owner',
+      org._id,
+      user.tokenVersion
+    );
 
     storeRefreshToken(user, refreshToken);
     await user.save();
 
-    await emailService.sendWelcomeEmail({ user, org, cafe });
+    try {
+      const emailResult = await emailService.sendWelcomeEmail({ user, org, cafe });
+      if (emailResult?.sent === false) {
+        console.warn(
+          '[auth] Welcome email was not sent after registration:',
+          emailResult.error?.message || emailResult.error || 'unknown error'
+        );
+      }
+    } catch (emailError) {
+      console.warn(
+        '[auth] Welcome email failed after registration:',
+        emailError?.message || emailError || 'unknown error'
+      );
+    }
 
     const cookieOptions = {
       ...COOKIE_OPTIONS,
@@ -142,7 +168,13 @@ const login = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
-    const { accessToken, refreshToken } = generateTokens(user._id, user.activeCafeId, user.role, user.orgId);
+    const { accessToken, refreshToken } = generateTokens(
+      user._id,
+      user.activeCafeId,
+      user.role,
+      user.orgId,
+      user.tokenVersion
+    );
 
     storeRefreshToken(user, refreshToken);
     await user.save();
@@ -206,6 +238,7 @@ const refresh = async (req, res, next) => {
         cafeId: user.activeCafeId ? user.activeCafeId.toString() : null,
         role: user.role || 'owner',
         orgId: user.orgId ? user.orgId.toString() : null,
+        tokenVersion: Number(user.tokenVersion || 0),
       },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
@@ -260,6 +293,59 @@ const logout = async (req, res, next) => {
   }
 };
 
+const changePassword = async (req, res, next) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res
+        .status(400)
+        .json({ success: false, message: 'Current password and new password are required' });
+    }
+
+    if (String(newPassword).length < 8) {
+      return res
+        .status(400)
+        .json({ success: false, message: 'New password must be at least 8 characters' });
+    }
+
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const currentMatches = await user.comparePassword(currentPassword);
+    if (!currentMatches) {
+      return res.status(401).json({ success: false, message: 'Current password is incorrect' });
+    }
+
+    const reusedPassword = await user.comparePassword(newPassword);
+    if (reusedPassword) {
+      return res
+        .status(400)
+        .json({ success: false, message: 'New password must be different from the current password' });
+    }
+
+    user.password = newPassword;
+    user.refreshTokens = [];
+    user.tokenVersion = Number(user.tokenVersion || 0) + 1;
+    await user.save();
+
+    res.clearCookie('refreshToken', {
+      httpOnly: true,
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+      secure: process.env.NODE_ENV === 'production',
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Password changed. Please sign in again.',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 const me = async (req, res, next) => {
   try {
     const user = await User.findById(req.user.id).select('-password -refreshTokens');
@@ -280,4 +366,4 @@ const me = async (req, res, next) => {
   }
 };
 
-module.exports = { register, login, refresh, logout, me };
+module.exports = { register, login, refresh, logout, changePassword, me };

@@ -151,25 +151,163 @@ const isPublicHoliday = (date) => {
   return Boolean(getPublicHolidayInfo(date));
 };
 
-// Western Cape school terms by year (approximate WC dates).
-// Extend annually; dates for new years are published by the DBE.
-const SCHOOL_TERMS_BY_YEAR = {
-  2025: [
-    { start: new Date(2025, 0, 15), end: new Date(2025, 2, 28) },  // Term 1
-    { start: new Date(2025, 3, 22), end: new Date(2025, 5, 27) },  // Term 2
-    { start: new Date(2025, 6, 22), end: new Date(2025, 8, 26) },  // Term 3
-    { start: new Date(2025, 9, 7),  end: new Date(2025, 11, 12) }, // Term 4
-  ],
-  2026: [
-    { start: new Date(2026, 0, 14), end: new Date(2026, 2, 27) },  // Term 1
-    { start: new Date(2026, 3, 14), end: new Date(2026, 5, 26) },  // Term 2
-    { start: new Date(2026, 6, 21), end: new Date(2026, 8, 25) },  // Term 3
-    { start: new Date(2026, 9, 6),  end: new Date(2026, 11, 11) }, // Term 4
-  ],
+const parseLocalDateKey = (dateKey) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateKey || '').trim());
+  if (!match) return null;
+
+  const [, yearValue, monthValue, dayValue] = match;
+  const year = Number(yearValue);
+  const month = Number(monthValue);
+  const day = Number(dayValue);
+  const parsed = new Date(year, month - 1, day);
+
+  if (
+    parsed.getFullYear() !== year ||
+    parsed.getMonth() !== month - 1 ||
+    parsed.getDate() !== day
+  ) {
+    return null;
+  }
+
+  return parsed;
+};
+
+const normalizeSchoolTerm = (term) => {
+  const startValue = Array.isArray(term) ? term[0] : term?.start;
+  const endValue = Array.isArray(term) ? term[1] : term?.end;
+  const start = parseLocalDateKey(startValue);
+  const end = parseLocalDateKey(endValue);
+
+  if (!start || !end || end < start) return null;
+  return { start, end };
+};
+
+const normalizeSchoolCalendar = (year, calendar) => {
+  const yearNumber = Number(year);
+  const termsInput = Array.isArray(calendar) ? calendar : calendar?.terms;
+  if (!Number.isInteger(yearNumber) || !Array.isArray(termsInput) || termsInput.length !== 4) {
+    return null;
+  }
+
+  const terms = termsInput.map(normalizeSchoolTerm);
+  if (
+    terms.some((term) => !term) ||
+    terms.some((term) => term.start.getFullYear() !== yearNumber || term.end.getFullYear() !== yearNumber)
+  ) {
+    return null;
+  }
+  terms.sort((a, b) => a.start - b.start);
+  if (terms.some((term, index) => index > 0 && term.start <= terms[index - 1].end)) {
+    return null;
+  }
+
+  const specialSchoolHolidaysInput = Array.isArray(calendar?.specialSchoolHolidays)
+    ? calendar.specialSchoolHolidays
+    : [];
+  const specialSchoolHolidays = [...new Set(
+    specialSchoolHolidaysInput
+      .map((dateKey) => parseLocalDateKey(dateKey))
+      .filter((date) => date && date.getFullYear() === yearNumber)
+      .map(toDateKey)
+  )].sort();
+
+  return { terms, specialSchoolHolidays };
+};
+
+const buildSchoolCalendarMap = (calendars) => {
+  return Object.entries(calendars).reduce((built, [year, calendar]) => {
+    const normalized = normalizeSchoolCalendar(year, calendar);
+    if (normalized) built[year] = normalized;
+    return built;
+  }, {});
+};
+
+// Source-backed South African public school calendars. Learner dates are used
+// for demand signals; educator-only admin days are treated as school holidays.
+const DEFAULT_SCHOOL_CALENDARS_BY_YEAR = buildSchoolCalendarMap({
+  2025: {
+    terms: [
+      ['2025-01-15', '2025-03-28'],
+      ['2025-04-08', '2025-06-27'],
+      ['2025-07-22', '2025-10-03'],
+      ['2025-10-13', '2025-12-10'],
+    ],
+    specialSchoolHolidays: ['2025-04-29', '2025-04-30', '2025-05-02'],
+  },
+  2026: {
+    terms: [
+      ['2026-01-14', '2026-03-27'],
+      ['2026-04-08', '2026-06-26'],
+      ['2026-07-21', '2026-09-23'],
+      ['2026-10-06', '2026-12-09'],
+    ],
+    specialSchoolHolidays: ['2026-06-15'],
+  },
+  2027: {
+    terms: [
+      ['2027-01-13', '2027-03-19'],
+      ['2027-04-06', '2027-06-25'],
+      ['2027-07-20', '2027-09-22'],
+      ['2027-10-05', '2027-12-08'],
+    ],
+    specialSchoolHolidays: ['2027-04-26'],
+  },
+});
+
+let schoolCalendarOverrideCache = { raw: null, value: {} };
+
+const parseSchoolCalendarOverrides = () => {
+  const raw = (
+    process.env.SCHOOL_CALENDAR_OVERRIDES ||
+    process.env.SCHOOL_TERM_OVERRIDES ||
+    process.env.SA_SCHOOL_TERM_OVERRIDES ||
+    ''
+  ).trim();
+
+  if (schoolCalendarOverrideCache.raw === raw) {
+    return schoolCalendarOverrideCache.value;
+  }
+
+  if (!raw) {
+    schoolCalendarOverrideCache = { raw, value: {} };
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    const value = buildSchoolCalendarMap(parsed && typeof parsed === 'object' ? parsed : {});
+    schoolCalendarOverrideCache = { raw, value };
+    return value;
+  } catch (error) {
+    schoolCalendarOverrideCache = { raw, value: {} };
+    return {};
+  }
+};
+
+const getSchoolCalendarDatesForYear = (year) => {
+  const yearNumber = Number(year);
+  if (!Number.isInteger(yearNumber)) return null;
+
+  const overrides = parseSchoolCalendarOverrides();
+  return overrides[yearNumber] || DEFAULT_SCHOOL_CALENDARS_BY_YEAR[yearNumber] || null;
+};
+
+const getSchoolCalendarForYear = (year) => {
+  const calendar = getSchoolCalendarDatesForYear(year);
+  if (!calendar) return null;
+
+  return {
+    terms: calendar.terms.map((term) => ({
+      start: toDateKey(term.start),
+      end: toDateKey(term.end),
+    })),
+    specialSchoolHolidays: [...calendar.specialSchoolHolidays],
+  };
 };
 
 /**
- * Returns true if the given date falls outside school terms.
+ * Returns true if the given date falls outside learner school terms or is a
+ * gazetted special school holiday.
  * Fails safe: when term dates for the date's year are unknown, returns false
  * (no signal) instead of treating every day as a school holiday.
  */
@@ -178,18 +316,23 @@ const isSchoolHoliday = (date) => {
   // Strip time for date-only comparison
   const check = new Date(d.getFullYear(), d.getMonth(), d.getDate());
 
-  const terms = SCHOOL_TERMS_BY_YEAR[check.getFullYear()];
-  if (!terms) {
-    return false; // Unknown year — no school-holiday signal rather than a permanent one
+  const dateKey = toDateKey(check);
+  const calendar = getSchoolCalendarDatesForYear(check.getFullYear());
+  if (!calendar) {
+    return false; // Unknown year: no school-holiday signal rather than a permanent one.
   }
 
-  for (const term of terms) {
+  if (calendar.specialSchoolHolidays.includes(dateKey)) {
+    return true;
+  }
+
+  for (const term of calendar.terms) {
     if (check >= term.start && check <= term.end) {
-      return false; // In a school term — not a school holiday
+      return false; // In a learner school term.
     }
   }
 
-  return true; // Outside all terms — school holiday
+  return true; // Outside all learner terms.
 };
 
 // Cape Town runs its own load shedding schedule; everywhere else follows Eskom national.
@@ -261,6 +404,7 @@ module.exports = {
   isPublicHoliday,
   getPublicHolidayInfo,
   getPublicHolidaysForYear,
+  getSchoolCalendarForYear,
   isSchoolHoliday,
   getLoadSheddingStage,
   getSignalsForDate,

@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const { MongoMemoryServer } = require('mongodb-memory-server');
+const jwt = require('jsonwebtoken');
 
 // Set env vars before requiring app
 process.env.JWT_SECRET = 'test-jwt-secret-key-12345';
@@ -9,6 +10,7 @@ process.env.JWT_REFRESH_EXPIRES_IN = '7d';
 process.env.NODE_ENV = 'test';
 process.env.WEATHER_API_KEY = '';
 process.env.WEATHER_API_URL = '';
+delete process.env.YOCO_INTEGRATION_ENABLED;
 delete process.env.RESEND_API_KEY;
 delete process.env.RESEND_FROM_EMAIL;
 delete process.env.RESEND_REPLY_TO;
@@ -65,39 +67,38 @@ const createTestUser = async (overrides = {}) => {
   };
 };
 
-// Helper to create a manager via the team invite.
-// The server generates the temporary password; with no email provider
-// configured in tests it is returned in the invite response.
+// Helper to create a manager directly. Invite endpoints never expose generated
+// temporary passwords, so tests should not depend on production invite secrets.
 const createTestManager = async (ownerToken, cafeIds) => {
   const supertest = require('supertest');
   const request = supertest(app);
+  const User = require('../src/models/User.model');
 
-  const inviteRes = await request
-    .post('/api/team/invite')
-    .set('Authorization', `Bearer ${ownerToken}`)
-    .send({
-      name: 'Test Manager',
-      email: 'manager@yourguava.com',
-      cafeIds,
-    });
+  const decoded = jwt.verify(ownerToken, process.env.JWT_SECRET);
+  const owner = await User.findById(decoded.id).lean();
+  const password = 'password123';
+  const email = 'manager@yourguava.com';
 
-  if (!inviteRes.body.temporaryPassword) {
-    throw new Error(
-      `createTestManager: temporaryPassword missing from invite response (emailSent=${inviteRes.body.emailSent}). ` +
-        'Ensure no email provider is configured in the test environment.'
-    );
-  }
+  await User.create({
+    name: 'Test Manager',
+    email,
+    password,
+    role: 'manager',
+    orgId: owner.orgId,
+    cafeIds,
+    activeCafeId: cafeIds[0],
+  });
 
   // Login as manager to get token
   const loginRes = await request.post('/api/auth/login').send({
-    email: 'manager@yourguava.com',
-    password: inviteRes.body.temporaryPassword,
+    email,
+    password,
   });
 
   return {
     token: loginRes.body.accessToken,
     user: loginRes.body.user,
-    temporaryPassword: inviteRes.body.temporaryPassword,
+    password,
   };
 };
 

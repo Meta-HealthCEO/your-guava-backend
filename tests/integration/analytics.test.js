@@ -298,6 +298,18 @@ describe('Analytics API', () => {
     });
   });
 
+  describe('GET /api/analytics/waste', () => {
+    it('does not expose the waste placeholder endpoint for MVP', async () => {
+      const res = await request
+        .get('/api/analytics/waste')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(404);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toMatch(/not found/i);
+    });
+  });
+
   describe('GET /api/analytics/combos', () => {
     it('returns top item pairs', async () => {
       await uploadTestData();

@@ -136,7 +136,7 @@ const sendTeamInviteEmail = async ({ manager, owner, cafes = [], temporaryPasswo
         <tr><td style="padding:14px;color:#888888;font-size:12px;">Email</td><td style="padding:14px;color:#f0f0f0;font-size:14px;">${escapeHtml(manager.email)}</td></tr>
         <tr><td style="padding:14px;color:#888888;font-size:12px;border-top:1px solid #2a2a2a;">Temporary password</td><td style="padding:14px;color:#f0f0f0;font-size:14px;border-top:1px solid #2a2a2a;"><strong>${escapeHtml(temporaryPassword)}</strong></td></tr>
       </table>
-      <p style="margin:0;color:#b8b8b8;">After signing in, keep this password private and ask the owner for a new temporary password if needed.</p>
+      <p style="margin:0;color:#b8b8b8;">After signing in, change this temporary password from Account settings.</p>
     `,
   });
 
@@ -147,6 +147,7 @@ const sendTeamInviteEmail = async ({ manager, owner, cafes = [], temporaryPasswo
     `Email: ${manager.email}`,
     `Temporary password: ${temporaryPassword}`,
     `Sign in: ${loginUrl}`,
+    'After signing in, change this temporary password from Account settings.',
   ]);
 
   return sendEmail({

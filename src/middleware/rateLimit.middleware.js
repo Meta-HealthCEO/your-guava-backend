@@ -33,4 +33,19 @@ const refreshLimiter = rateLimit({
   message: { success: false, message: 'Too many refresh attempts, please try again later' },
 });
 
-module.exports = { globalLimiter, authLimiter, refreshLimiter };
+// Per-user limiter for authenticated write actions (e.g. logging tickets),
+// keyed by user id so one busy user can't exhaust a shared IP's budget.
+const writeLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  skip: isTest,
+  // Always runs after authMiddleware, so req.user.id is the real key; the IP
+  // fallback is a safety net only, hence the IP-fallback validation is disabled.
+  keyGenerator: (req) => req.user?.id || req.ip,
+  validate: { keyGeneratorIpFallback: false },
+  message: { success: false, message: 'You are doing that too quickly. Please slow down.' },
+});
+
+module.exports = { globalLimiter, authLimiter, refreshLimiter, writeLimiter };

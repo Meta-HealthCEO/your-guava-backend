@@ -576,7 +576,7 @@ const proposeColumnMappingWithClaude = async (headers, sampleRows) => {
   const prompt = `You are mapping CSV columns from a coffee-shop POS export to a canonical schema.
 
 Canonical fields (target keys):
-- receiptId (optional): unique transaction/receipt ID
+- receiptId (required for line-per-row mode, optional for packed mode): unique transaction/receipt/order ID
 - date (REQUIRED): transaction date
 - time (optional): transaction time
 - items (REQUIRED): item description column. May be packed like "1 x Flat White,2 x Muffin", or one row per line item.
@@ -606,7 +606,7 @@ Return ONLY valid JSON with this exact shape, no markdown, no preamble:
   "itemsMode": "packed" | "line-per-row"
 }
 
-Use null for fields you cannot confidently identify. Choose itemsMode "line-per-row" if each row appears to be a single line item rather than a full receipt.`;
+Use null for fields you cannot confidently identify. Choose itemsMode "line-per-row" only if each row appears to be a single line item and you can identify a reliable receiptId/order column; otherwise choose "packed".`;
 
   const message = await client.messages.create({
     model: 'claude-haiku-4-5-20251001',
