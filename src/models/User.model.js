@@ -30,6 +30,20 @@ const userSchema = new mongoose.Schema(
       enum: ['owner', 'manager'],
       default: 'owner',
     },
+    emailVerified: {
+      type: Boolean,
+      default: true,
+    },
+    emailVerifiedAt: {
+      type: Date,
+      default: Date.now,
+    },
+    permissions: {
+      canSpendCredits: {
+        type: Boolean,
+        default: false,
+      },
+    },
     orgId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Organization',

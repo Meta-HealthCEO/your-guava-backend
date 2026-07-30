@@ -13,7 +13,17 @@ jest.mock('../../src/services/anthropic.service', () => ({
 }));
 
 const supertest = require('supertest');
-const { setup, teardown, clearDB, createTestUser, app } = require('../setup');
+const {
+  setup,
+  teardown,
+  clearDB,
+  createTestUser,
+  createTestManager,
+  app,
+} = require('../setup');
+const {
+  consumeIntegrationOAuthState,
+} = require('../../src/services/integrationOAuthState.service');
 
 const request = supertest(app);
 
@@ -95,6 +105,68 @@ describe('Integrations API', () => {
     delete process.env.XERO_REDIRECT_URI;
   });
 
+  it('issues an opaque, cafe/user/provider-bound, single-use OAuth state', async () => {
+    process.env.ACCOUNTING_INTEGRATIONS_ENABLED = 'true';
+    process.env.XERO_CLIENT_ID = 'test-id';
+    process.env.XERO_CLIENT_SECRET = 'test-secret';
+    process.env.XERO_REDIRECT_URI = 'http://localhost:5173/integrations/xero/callback';
+
+    const authRes = await request
+      .get('/api/integrations/xero/auth')
+      .set('Authorization', `Bearer ${token}`);
+    const state = new URL(authRes.body.url).searchParams.get('state');
+    const meRes = await request
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(state).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+    expect(state).not.toContain(String(meRes.body.activeCafeId));
+
+    const firstUse = await consumeIntegrationOAuthState({
+      state,
+      cafeId: meRes.body.activeCafeId,
+      userId: meRes.body.id,
+      provider: 'xero',
+    });
+    const replay = await consumeIntegrationOAuthState({
+      state,
+      cafeId: meRes.body.activeCafeId,
+      userId: meRes.body.id,
+      provider: 'xero',
+    });
+
+    expect(firstUse).toBe(true);
+    expect(replay).toBe(false);
+
+    delete process.env.XERO_CLIENT_ID;
+    delete process.env.XERO_CLIENT_SECRET;
+    delete process.env.XERO_REDIRECT_URI;
+  });
+
+  it('rejects a tampered OAuth state before contacting the provider', async () => {
+    process.env.ACCOUNTING_INTEGRATIONS_ENABLED = 'true';
+    process.env.XERO_CLIENT_ID = 'test-id';
+    process.env.XERO_CLIENT_SECRET = 'test-secret';
+    process.env.XERO_REDIRECT_URI = 'http://localhost:5173/integrations/xero/callback';
+
+    const authRes = await request
+      .get('/api/integrations/xero/auth')
+      .set('Authorization', `Bearer ${token}`);
+    const state = new URL(authRes.body.url).searchParams.get('state');
+
+    const callbackRes = await request
+      .post('/api/integrations/xero/callback')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ code: 'test-code', state: `${state}tampered` });
+
+    expect(callbackRes.status).toBe(400);
+    expect(callbackRes.body.message).toMatch(/invalid or expired/i);
+
+    delete process.env.XERO_CLIENT_ID;
+    delete process.env.XERO_CLIENT_SECRET;
+    delete process.env.XERO_REDIRECT_URI;
+  });
+
   it('GET /api/integrations/unknown/auth returns 400', async () => {
     process.env.ACCOUNTING_INTEGRATIONS_ENABLED = 'true';
     const res = await request
@@ -108,6 +180,27 @@ describe('Integrations API', () => {
   it('GET /api/integrations requires auth', async () => {
     const res = await request.get('/api/integrations');
     expect(res.status).toBe(401);
+  });
+
+  it('allows managers to view status but reserves accounting mutations for owners', async () => {
+    const meRes = await request
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${token}`);
+    const manager = await createTestManager(token, [meRes.body.activeCafeId]);
+
+    const listRes = await request
+      .get('/api/integrations')
+      .set('Authorization', `Bearer ${manager.token}`);
+    const authRes = await request
+      .get('/api/integrations/xero/auth')
+      .set('Authorization', `Bearer ${manager.token}`);
+    const disconnectRes = await request
+      .post('/api/integrations/xero/disconnect')
+      .set('Authorization', `Bearer ${manager.token}`);
+
+    expect(listRes.status).toBe(200);
+    expect(authRes.status).toBe(403);
+    expect(disconnectRes.status).toBe(403);
   });
 
   it('POST /api/integrations/:provider/disconnect clears tokens', async () => {

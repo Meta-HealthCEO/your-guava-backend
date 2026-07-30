@@ -24,7 +24,7 @@ const authMiddleware = async (req, res, next) => {
     const token = authHeader.split(' ')[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const user = await User.findById(decoded.id)
-      .select('tokenVersion role orgId cafeIds activeCafeId')
+      .select('tokenVersion role orgId cafeIds activeCafeId permissions')
       .lean();
 
     if (!user) {
@@ -71,6 +71,10 @@ const authMiddleware = async (req, res, next) => {
       cafeId: tokenCafeId,
       cafeIds: liveCafeIds,
       activeCafeId: user.activeCafeId ? String(user.activeCafeId) : null,
+      permissions: {
+        canSpendCredits:
+          user.role === 'owner' || Boolean(user.permissions?.canSpendCredits),
+      },
     };
     req.billing = billing;
 

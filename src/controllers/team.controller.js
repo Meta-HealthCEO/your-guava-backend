@@ -5,6 +5,9 @@ const User = require('../models/User.model');
 const Cafe = require('../models/Cafe.model');
 const Organization = require('../models/Organization.model');
 const TeamInvitation = require('../models/TeamInvitation.model');
+const PendingRegistration = require('../models/PendingRegistration.model');
+const AuthSession = require('../models/AuthSession.model');
+const AccessAuditEvent = require('../models/AccessAuditEvent.model');
 const { getPlan } = require('../services/billingPlans.service');
 const emailService = require('../services/email.service');
 
@@ -56,10 +59,37 @@ const invitationDto = (invitation) => ({
   email: invitation.email,
   name: invitation.name,
   cafeIds: invitation.cafeIds,
+  permissions: {
+    canSpendCredits: Boolean(invitation.permissions?.canSpendCredits),
+  },
   status: invitation.status,
   expiresAt: invitation.expiresAt,
   createdAt: invitation.createdAt,
 });
+
+const memberPermissions = (user) => ({
+  canSpendCredits: user?.role === 'owner' || Boolean(user?.permissions?.canSpendCredits),
+});
+
+const recordAccessAudit = async ({
+  orgId,
+  actorUserId,
+  targetUserId,
+  action,
+  targetEmail,
+  details,
+  requestId,
+  session,
+}) =>
+  AccessAuditEvent.create([{
+    orgId,
+    actorUserId,
+    targetUserId,
+    action,
+    targetEmail,
+    details: details || {},
+    requestId,
+  }], session ? { session } : undefined);
 
 const expirePendingInvitations = async (orgId, session = null) => {
   const query = {
@@ -107,7 +137,7 @@ const validateCafeAccess = async (orgId, cafeIds = [], session = null) => {
 const inviteManager = async (req, res, next) => {
   let session;
   try {
-    const { email, name, cafeIds } = req.body;
+    const { email, name, cafeIds, canSpendCredits = false } = req.body;
 
     const normalizedEmail = typeof email === 'string' ? email.toLowerCase().trim() : '';
     const normalizedName = typeof name === 'string' ? name.trim() : '';
@@ -124,6 +154,9 @@ const inviteManager = async (req, res, next) => {
       requestedCafeIds.length !== new Set(submittedCafeIds).size
     ) {
       return res.status(400).json({ success: false, message: 'Select valid cafe access' });
+    }
+    if (typeof canSpendCredits !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'canSpendCredits must be a boolean' });
     }
 
     const owner = await User.findById(req.user.id);
@@ -142,7 +175,7 @@ const inviteManager = async (req, res, next) => {
       // Concurrent invites then conflict and retry against the committed count.
       const org = await Organization.findOneAndUpdate(
         { _id: owner.orgId },
-        { $set: { updatedAt: new Date() } },
+        { $set: { updatedAt: new Date() }, $inc: { __v: 1 } },
         { new: true, session }
       );
       if (!org) {
@@ -209,9 +242,19 @@ const inviteManager = async (req, res, next) => {
         orgId: owner.orgId,
         invitedByUserId: owner._id,
         cafeIds: validCafeIds,
+        permissions: { canSpendCredits },
         tokenHash,
         expiresAt: new Date(Date.now() + inviteTtlMs()),
       }], { session });
+      await recordAccessAudit({
+        orgId: owner.orgId,
+        actorUserId: owner._id,
+        action: 'invitation.created',
+        targetEmail: normalizedEmail,
+        details: { invitationId: invitation._id, cafeIds: validCafeIds, canSpendCredits },
+        requestId: req.id,
+        session,
+      });
     });
 
     const assignedCafes = await Cafe.find({
@@ -259,6 +302,19 @@ const inviteManager = async (req, res, next) => {
       });
     }
 
+    // Only discard an unfinished public signup once the owner-directed
+    // invitation is deliverable. A failed invite must leave the existing
+    // signup verification link usable.
+    await PendingRegistration.deleteOne({ email: normalizedEmail }).catch((error) => {
+      // The active invitation blocks public verification for this address, so
+      // cleanup can safely retry through TTL expiry without turning a delivered
+      // invitation into an ambiguous 500 response.
+      console.error(
+        `[team] delivered invitation ${invitation._id} could not clean up pending registration:`,
+        error.code || error.name
+      );
+    });
+
     const updatedSeats = await buildSeatSummary(owner.orgId);
 
     return res.status(201).json({
@@ -296,21 +352,66 @@ const listTeam = async (req, res, next) => {
     const user = await User.findById(req.user.id);
     await expirePendingInvitations(user.orgId);
     const members = await User.find({ orgId: user.orgId })
-      .select('name email role cafeIds activeCafeId createdAt')
+      .select('name email role cafeIds activeCafeId permissions createdAt')
       .populate('cafeIds', 'name')
       .lean();
     const invitations = await TeamInvitation.find({
       orgId: user.orgId,
-      status: 'pending',
-      expiresAt: { $gt: new Date() },
+      status: { $in: ['pending', 'expired'] },
     })
-      .select('name email cafeIds status expiresAt createdAt')
+      .select('name email cafeIds permissions status expiresAt createdAt')
       .populate('cafeIds', 'name')
       .sort({ createdAt: -1 })
+      .limit(100)
       .lean();
     const seats = await buildSeatSummary(user.orgId);
 
-    return res.status(200).json({ success: true, members, invitations, seats });
+    return res.status(200).json({
+      success: true,
+      members: members.map((member) => ({
+        ...member,
+        permissions: memberPermissions(member),
+      })),
+      invitations,
+      seats,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/team/audit-events - Durable owner-visible access history.
+const listAccessAudit = async (req, res, next) => {
+  try {
+    const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit, 10) || 50));
+    const filter = { orgId: req.user.orgId };
+    if (req.query.before) {
+      const before = new Date(req.query.before);
+      if (Number.isNaN(before.getTime())) {
+        return res.status(400).json({ success: false, message: 'before must be a valid date' });
+      }
+      filter.createdAt = { $lt: before };
+    }
+
+    const events = await AccessAuditEvent.find(filter)
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit + 1)
+      .populate('actorUserId', 'name email')
+      .populate('targetUserId', 'name email')
+      .lean();
+    const hasMore = events.length > limit;
+    if (hasMore) events.pop();
+
+    return res.status(200).json({
+      success: true,
+      events,
+      pagination: {
+        hasMore,
+        nextBefore: hasMore && events.length > 0
+          ? events[events.length - 1].createdAt
+          : null,
+      },
+    });
   } catch (error) {
     next(error);
   }
@@ -352,6 +453,8 @@ const previewInvitation = async (req, res, next) => {
         name: invitation.name,
         organizationName: org.name,
         cafeNames: cafes.map((cafe) => cafe.name),
+        role: 'manager',
+        canSpendCredits: Boolean(invitation.permissions?.canSpendCredits),
         expiresAt: invitation.expiresAt,
       },
     });
@@ -403,7 +506,10 @@ const acceptInvitation = async (req, res, next) => {
       // Serializing on the organization makes concurrent seat acceptance exact.
       const org = await Organization.findOneAndUpdate(
         { _id: candidate.orgId, ownerId: candidate.invitedByUserId },
-        { $set: { updatedAt: new Date() } },
+        {
+          $set: { updatedAt: new Date() },
+          $inc: { __v: 1 },
+        },
         { new: true, session }
       );
       if (!org) throw invitationError();
@@ -448,6 +554,11 @@ const acceptInvitation = async (req, res, next) => {
         name: invitation.name,
         password,
         role: 'manager',
+        emailVerified: true,
+        emailVerifiedAt: new Date(),
+        permissions: {
+          canSpendCredits: Boolean(invitation.permissions?.canSpendCredits),
+        },
         orgId: invitation.orgId,
         cafeIds: validCafeIds,
         activeCafeId: validCafeIds[0],
@@ -456,6 +567,20 @@ const acceptInvitation = async (req, res, next) => {
       invitation.status = 'accepted';
       invitation.acceptedAt = new Date();
       await invitation.save({ session });
+      await recordAccessAudit({
+        orgId: invitation.orgId,
+        actorUserId: manager._id,
+        targetUserId: manager._id,
+        action: 'invitation.accepted',
+        targetEmail: manager.email,
+        details: {
+          invitationId: invitation._id,
+          cafeIds: validCafeIds,
+          canSpendCredits: Boolean(invitation.permissions?.canSpendCredits),
+        },
+        requestId: req.id,
+        session,
+      });
     });
 
     return res.status(201).json({
@@ -500,7 +625,7 @@ const resendInvitation = async (req, res, next) => {
     await session.withTransaction(async () => {
       const org = await Organization.findOneAndUpdate(
         { _id: owner.orgId, ownerId: owner._id },
-        { $set: { updatedAt: new Date() } },
+        { $set: { updatedAt: new Date() }, $inc: { __v: 1 } },
         { new: true, session }
       );
       if (!org) throw invitationError(404, 'Invitation not found');
@@ -543,6 +668,15 @@ const resendInvitation = async (req, res, next) => {
       invitation.revokedAt = undefined;
       invitation.acceptedAt = undefined;
       await invitation.save({ session });
+      await recordAccessAudit({
+        orgId: owner.orgId,
+        actorUserId: owner._id,
+        action: 'invitation.resent',
+        targetEmail: invitation.email,
+        details: { invitationId: invitation._id, cafeIds: validCafeIds },
+        requestId: req.id,
+        session,
+      });
     });
 
     const assignedCafes = await Cafe.find({
@@ -596,19 +730,34 @@ const resendInvitation = async (req, res, next) => {
 
 // DELETE /api/team/invitations/:invitationId - Revoke an unused invite token.
 const revokeInvitation = async (req, res, next) => {
+  let session;
   try {
     if (!mongoose.isValidObjectId(req.params.invitationId)) {
       return res.status(404).json({ success: false, message: 'Invitation not found' });
     }
-    const invitation = await TeamInvitation.findOneAndUpdate(
-      {
-        _id: req.params.invitationId,
+    let invitation;
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      invitation = await TeamInvitation.findOneAndUpdate(
+        {
+          _id: req.params.invitationId,
+          orgId: req.user.orgId,
+          status: { $in: ['pending', 'expired'] },
+        },
+        { $set: { status: 'revoked', revokedAt: new Date() } },
+        { new: true, session }
+      );
+      if (!invitation) return;
+      await recordAccessAudit({
         orgId: req.user.orgId,
-        status: 'pending',
-      },
-      { $set: { status: 'revoked', revokedAt: new Date() } },
-      { new: true }
-    );
+        actorUserId: req.user.id,
+        action: 'invitation.revoked',
+        targetEmail: invitation.email,
+        details: { invitationId: invitation._id },
+        requestId: req.id,
+        session,
+      });
+    });
     if (!invitation) {
       return res.status(404).json({ success: false, message: 'Invitation not found' });
     }
@@ -619,106 +768,301 @@ const revokeInvitation = async (req, res, next) => {
     });
   } catch (error) {
     return next(error);
+  } finally {
+    if (session) await session.endSession();
   }
 };
 
 // DELETE /api/team/:userId - Owner removes a manager from the organisation.
 const removeMember = async (req, res, next) => {
+  let session;
   try {
-    const owner = await User.findById(req.user.id);
-    const target = await User.findById(req.params.userId);
-
+    if (!mongoose.isValidObjectId(req.params.userId)) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    let target;
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      target = await User.findOne({
+        _id: req.params.userId,
+        orgId: req.user.orgId,
+      }).session(session);
+      if (!target) return;
+      if (target.role === 'owner') {
+        const error = new Error('Cannot remove the owner');
+        error.statusCode = 403;
+        throw error;
+      }
+      await User.deleteOne({ _id: target._id, orgId: req.user.orgId }, { session });
+      await AuthSession.deleteMany({ userId: target._id }, { session });
+      await recordAccessAudit({
+        orgId: req.user.orgId,
+        actorUserId: req.user.id,
+        targetUserId: target._id,
+        action: 'member.removed',
+        targetEmail: target.email,
+        details: {
+          role: target.role,
+          cafeIds: target.cafeIds,
+          permissions: memberPermissions(target),
+        },
+        requestId: req.id,
+        session,
+      });
+    });
     if (!target) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
-
-    if (target.orgId.toString() !== owner.orgId.toString()) {
-      return res.status(403).json({ success: false, message: 'User not in your organization' });
-    }
-
-    if (target.role === 'owner') {
-      return res.status(403).json({ success: false, message: 'Cannot remove the owner' });
-    }
-
-    await User.findByIdAndDelete(target._id);
-    const seats = await buildSeatSummary(owner.orgId);
+    const seats = await buildSeatSummary(req.user.orgId);
 
     return res.status(200).json({ success: true, message: 'Member removed', seats });
   } catch (error) {
+    if (error?.statusCode && error.statusCode < 500) {
+      return res.status(error.statusCode).json({ success: false, message: error.message });
+    }
     next(error);
+  } finally {
+    if (session) await session.endSession();
   }
 };
 
 // PUT /api/team/:userId/cafes - Owner updates a manager's cafe access.
 const updateMemberCafes = async (req, res, next) => {
-  try {
-    const { cafeIds } = req.body;
-    const owner = await User.findById(req.user.id);
-    const target = await User.findById(req.params.userId);
-
-    if (!target || target.orgId.toString() !== owner.orgId.toString()) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-    if (target.role === 'owner') {
-      return res.status(403).json({ success: false, message: 'Owner cafe access cannot be changed here' });
-    }
-
-    const validCafeIds = await validateCafeAccess(owner.orgId, cafeIds || []);
-    if (validCafeIds.length === 0) {
-      return res.status(400).json({ success: false, message: 'At least one valid cafe must be assigned' });
-    }
-    target.cafeIds = validCafeIds;
-    if (!validCafeIds.includes(target.activeCafeId?.toString())) {
-      target.activeCafeId = validCafeIds[0] || null;
-    }
-    await target.save();
-
-    return res.status(200).json({ success: true, cafeIds: target.cafeIds });
-  } catch (error) {
-    next(error);
-  }
+  return updateMember(req, res, next);
 };
 
 // PATCH /api/team/:userId - Owner updates member profile and cafe access.
 const updateMember = async (req, res, next) => {
+  let session;
   try {
-    const { name, cafeIds } = req.body;
-    const owner = await User.findById(req.user.id);
-    const target = await User.findById(req.params.userId);
+    if (!mongoose.isValidObjectId(req.params.userId)) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    const body = req.body || {};
+    const hasName = Object.prototype.hasOwnProperty.call(body, 'name');
+    const hasCafeIds = Object.prototype.hasOwnProperty.call(body, 'cafeIds');
+    const hasSpendPermission = Object.prototype.hasOwnProperty.call(body, 'canSpendCredits');
+    if (!hasName && !hasCafeIds && !hasSpendPermission) {
+      return res.status(400).json({ success: false, message: 'No supported member fields were provided' });
+    }
+    const cleanName = typeof body.name === 'string' ? body.name.trim() : null;
+    if (hasName && (!cleanName || cleanName.length < 2 || cleanName.length > 120)) {
+      return res.status(400).json({ success: false, message: 'Name must be between 2 and 120 characters' });
+    }
+    const requestedCafeIds = hasCafeIds ? normalizeCafeIds(body.cafeIds) : null;
+    const submittedCafeIds = hasCafeIds && Array.isArray(body.cafeIds)
+      ? body.cafeIds.map(String)
+      : [];
+    if (
+      hasCafeIds &&
+      (requestedCafeIds.length === 0 ||
+        requestedCafeIds.length !== new Set(submittedCafeIds).size)
+    ) {
+      return res.status(400).json({ success: false, message: 'Select valid cafe access' });
+    }
+    if (hasSpendPermission && typeof body.canSpendCredits !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'canSpendCredits must be a boolean' });
+    }
 
-    if (!target || target.orgId.toString() !== owner.orgId.toString()) {
+    let target;
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      target = await User.findOne({
+        _id: req.params.userId,
+        orgId: req.user.orgId,
+      }).session(session);
+      if (!target) return;
+      if (target.role === 'owner') {
+        const error = new Error('Owner details must be changed from My Account');
+        error.statusCode = 403;
+        throw error;
+      }
+      const before = {
+        name: target.name,
+        cafeIds: target.cafeIds.map(String),
+        permissions: memberPermissions(target),
+      };
+      if (hasName) target.name = cleanName;
+      if (hasCafeIds) {
+        const validCafeIds = await validateCafeAccess(req.user.orgId, requestedCafeIds, session);
+        if (validCafeIds.length !== requestedCafeIds.length) {
+          const error = new Error('Select valid cafe access');
+          error.statusCode = 400;
+          throw error;
+        }
+        target.cafeIds = validCafeIds;
+        if (!validCafeIds.includes(target.activeCafeId?.toString())) {
+          target.activeCafeId = validCafeIds[0];
+        }
+      }
+      if (hasSpendPermission) {
+        target.permissions = target.permissions || {};
+        target.permissions.canSpendCredits = body.canSpendCredits;
+      }
+      await target.save({ session });
+      await recordAccessAudit({
+        orgId: req.user.orgId,
+        actorUserId: req.user.id,
+        targetUserId: target._id,
+        action: 'member.updated',
+        targetEmail: target.email,
+        details: {
+          before,
+          after: {
+            name: target.name,
+            cafeIds: target.cafeIds.map(String),
+            permissions: memberPermissions(target),
+          },
+        },
+        requestId: req.id,
+        session,
+      });
+    });
+    if (!target) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    if (target.role === 'owner') {
-      return res.status(403).json({ success: false, message: 'Owner details must be changed from My Account' });
-    }
-
-    if (name && name.trim().length >= 2) {
-      target.name = name.trim();
-    }
-
-    if (Array.isArray(cafeIds)) {
-      const validCafeIds = await validateCafeAccess(owner.orgId, cafeIds);
-      if (validCafeIds.length === 0) {
-        return res.status(400).json({ success: false, message: 'At least one valid cafe must be assigned' });
-      }
-      target.cafeIds = validCafeIds;
-      if (!validCafeIds.includes(target.activeCafeId?.toString())) {
-        target.activeCafeId = validCafeIds[0];
-      }
-    }
-
-    await target.save();
-
     const member = await User.findById(target._id)
-      .select('name email role cafeIds activeCafeId createdAt')
+      .select('name email role cafeIds activeCafeId permissions createdAt')
       .populate('cafeIds', 'name')
       .lean();
 
-    return res.status(200).json({ success: true, member });
+    return res.status(200).json({
+      success: true,
+      member: { ...member, permissions: memberPermissions(member) },
+    });
   } catch (error) {
+    if (error?.statusCode && error.statusCode < 500) {
+      return res.status(error.statusCode).json({ success: false, message: error.message });
+    }
     next(error);
+  } finally {
+    if (session) await session.endSession();
+  }
+};
+
+// POST /api/team/transfer-ownership - Atomically make one manager the sole owner.
+const transferOwnership = async (req, res, next) => {
+  let session;
+  try {
+    const { userId, currentPassword } = req.body || {};
+    if (!mongoose.isValidObjectId(userId) || String(userId) === String(req.user.id)) {
+      return res.status(400).json({ success: false, message: 'Select a manager to become the owner' });
+    }
+    if (typeof currentPassword !== 'string' || !currentPassword) {
+      return res.status(400).json({ success: false, message: 'Current password is required' });
+    }
+    if (Buffer.byteLength(currentPassword, 'utf8') > MAX_PASSWORD_BYTES) {
+      return res.status(401).json({ success: false, message: 'Current password is incorrect' });
+    }
+
+    let target;
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      const currentOwner = await User.findOne({
+        _id: req.user.id,
+        orgId: req.user.orgId,
+        role: 'owner',
+      }).select('+password').session(session);
+      if (!currentOwner || !(await currentOwner.comparePassword(currentPassword))) {
+        const error = new Error('Current password is incorrect');
+        error.statusCode = 401;
+        throw error;
+      }
+      target = await User.findOne({
+        _id: userId,
+        orgId: req.user.orgId,
+        role: 'manager',
+      }).session(session);
+      if (!target) {
+        const error = new Error('Manager not found');
+        error.statusCode = 404;
+        throw error;
+      }
+      const org = await Organization.findOneAndUpdate(
+        { _id: req.user.orgId, ownerId: currentOwner._id },
+        { $set: { ownerId: target._id, updatedAt: new Date() } },
+        { new: true, session }
+      );
+      if (!org) {
+        const error = new Error('Ownership changed. Refresh and try again.');
+        error.statusCode = 409;
+        throw error;
+      }
+      const cafes = await Cafe.find({ orgId: org._id }).select('_id').session(session);
+      const allCafeIds = cafes.map((cafe) => cafe._id);
+      if (allCafeIds.length === 0) {
+        const error = new Error('An organization must have at least one cafe');
+        error.statusCode = 409;
+        throw error;
+      }
+
+      currentOwner.role = 'manager';
+      currentOwner.permissions = { canSpendCredits: false };
+      currentOwner.cafeIds = allCafeIds;
+      if (!allCafeIds.map(String).includes(String(currentOwner.activeCafeId))) {
+        currentOwner.activeCafeId = allCafeIds[0];
+      }
+      currentOwner.tokenVersion = Number(currentOwner.tokenVersion || 0) + 1;
+
+      target.role = 'owner';
+      target.cafeIds = allCafeIds;
+      if (!allCafeIds.map(String).includes(String(target.activeCafeId))) {
+        target.activeCafeId = allCafeIds[0];
+      }
+      target.tokenVersion = Number(target.tokenVersion || 0) + 1;
+      await currentOwner.save({ session });
+      await target.save({ session });
+      // Pending and expired invitations remain manageable after ownership
+      // changes. Their capability tokens are organization-bound, and preview /
+      // acceptance validates the current owner against invitedByUserId.
+      const reassignedInvitations = await TeamInvitation.updateMany(
+        {
+          orgId: org._id,
+          invitedByUserId: currentOwner._id,
+          status: { $in: ['pending', 'expired'] },
+        },
+        { $set: { invitedByUserId: target._id } },
+        { session }
+      );
+      await AuthSession.updateMany(
+        { userId: { $in: [currentOwner._id, target._id] }, revokedAt: null },
+        { $set: { revokedAt: new Date(), revokeReason: 'ownership_transfer' } },
+        { session }
+      );
+      await recordAccessAudit({
+        orgId: org._id,
+        actorUserId: currentOwner._id,
+        targetUserId: target._id,
+        action: 'ownership.transferred',
+        targetEmail: target.email,
+        details: {
+          previousOwnerId: currentOwner._id,
+          newOwnerId: target._id,
+          invitationsReassigned: reassignedInvitations.modifiedCount,
+        },
+        requestId: req.id,
+        session,
+      });
+    });
+
+    res.clearCookie('refreshToken', {
+      httpOnly: true,
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+      secure: process.env.NODE_ENV === 'production',
+      path: '/api/auth',
+    });
+    return res.status(200).json({
+      success: true,
+      message: `${target.name} is now the account owner. Both users must sign in again.`,
+    });
+  } catch (error) {
+    if (error?.statusCode && error.statusCode < 500) {
+      return res.status(error.statusCode).json({ success: false, message: error.message });
+    }
+    return next(error);
+  } finally {
+    if (session) await session.endSession();
   }
 };
 
@@ -726,9 +1070,15 @@ const updateMember = async (req, res, next) => {
 const switchCafe = async (req, res, next) => {
   try {
     const { cafeId } = req.body;
+    if (!mongoose.isValidObjectId(cafeId)) {
+      return res.status(400).json({ success: false, message: 'Select a valid cafe' });
+    }
     const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'Session expired. Please sign in again' });
+    }
 
-    if (!user.cafeIds.map((id) => id.toString()).includes(cafeId)) {
+    if (!user.cafeIds.map((id) => id.toString()).includes(String(cafeId))) {
       return res.status(403).json({ success: false, message: 'You do not have access to this cafe' });
     }
 
@@ -760,8 +1110,17 @@ const addCafe = async (req, res, next) => {
     const { name, address, city, lat, lng } = req.body;
     const owner = await User.findById(req.user.id);
 
-    if (!name) {
-      return res.status(400).json({ success: false, message: 'Cafe name is required' });
+    const cleanName = typeof name === 'string' ? name.trim() : '';
+    const cleanAddress = address == null ? '' : typeof address === 'string' ? address.trim() : null;
+    const cleanCity = city == null ? '' : typeof city === 'string' ? city.trim() : null;
+    if (cleanName.length < 2 || cleanName.length > 120) {
+      return res.status(400).json({ success: false, message: 'Cafe name must be between 2 and 120 characters' });
+    }
+    if (cleanAddress === null || cleanAddress.length > 240) {
+      return res.status(400).json({ success: false, message: 'Address must be text up to 240 characters' });
+    }
+    if (cleanCity === null || cleanCity.length > 120) {
+      return res.status(400).json({ success: false, message: 'City must be text up to 120 characters' });
     }
 
     const parsedLat = lat == null || lat === '' ? undefined : Number(lat);
@@ -781,7 +1140,7 @@ const addCafe = async (req, res, next) => {
     await session.withTransaction(async () => {
       const org = await Organization.findOneAndUpdate(
         { _id: owner.orgId },
-        { $set: { updatedAt: new Date() } },
+        { $set: { updatedAt: new Date() }, $inc: { __v: 1 } },
         { new: true, session }
       );
       if (!org) {
@@ -806,11 +1165,11 @@ const addCafe = async (req, res, next) => {
       }
 
       [cafe] = await Cafe.create([{
-        name: String(name).trim(),
+        name: cleanName,
         orgId: owner.orgId,
         location: {
-          ...(address ? { address: String(address).trim() } : {}),
-          ...(city ? { city: String(city).trim() } : {}),
+          ...(cleanAddress ? { address: cleanAddress } : {}),
+          ...(cleanCity ? { city: cleanCity } : {}),
           ...(parsedLat !== undefined ? { lat: parsedLat, lng: parsedLng } : {}),
         },
       }], { session });
@@ -820,6 +1179,14 @@ const addCafe = async (req, res, next) => {
         { $addToSet: { cafeIds: cafe._id } },
         { session }
       );
+      await recordAccessAudit({
+        orgId: owner.orgId,
+        actorUserId: owner._id,
+        action: 'location.created',
+        details: { cafeId: cafe._id, name: cafe.name },
+        requestId: req.id,
+        session,
+      });
     });
 
     return res.status(201).json({ success: true, cafe });
@@ -844,9 +1211,11 @@ module.exports = {
   resendInvitation,
   revokeInvitation,
   listTeam,
+  listAccessAudit,
   removeMember,
   updateMemberCafes,
   updateMember,
+  transferOwnership,
   switchCafe,
   addCafe,
 };

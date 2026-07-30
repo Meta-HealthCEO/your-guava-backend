@@ -1192,9 +1192,26 @@ const groupLinePerRow = (rawRows, mapping, timezone) => {
           discount,
           paymentMethod: paymentMethod || undefined,
           status: mapping.status ? String(raw[mapping.status] || 'approved').trim().toLowerCase() : 'approved',
+          invalidReason: undefined,
         }, []));
       }
       const group = groups.get(groupKey);
+      const status = mapping.status
+        ? String(raw[mapping.status] || 'approved').trim().toLowerCase()
+        : 'approved';
+      const inconsistent =
+        group.date.getTime() !== date.getTime() ||
+        Number(group.tip || 0) !== Number(tip || 0) ||
+        Number(group.discount || 0) !== Number(discount || 0) ||
+        String(group.paymentMethod || '') !== String(paymentMethod || '') ||
+        String(group.status || 'approved') !== status;
+      if (inconsistent) {
+        errors++;
+        group.invalidReason =
+          'Rows sharing a receipt ID have conflicting date, time, payment, status, tip, or discount values';
+        addRowError(rowErrors, rowNumber, group.invalidReason, { receiptId });
+        continue;
+      }
       if (group.items.length >= limits.maxItemsPerTransaction) {
         errors++;
         addRowError(
@@ -1215,11 +1232,22 @@ const groupLinePerRow = (rawRows, mapping, timezone) => {
   }
   const rows = [];
   for (const row of groups.values()) {
+    if (row.invalidReason) continue;
     const totalQty = row.items.reduce((sum, item) => sum + item.quantity, 0);
     const uniqueTotals = [...new Set(row.totals.map((total) => Number(total.toFixed(2))))];
-    const total = !totalsAreLineAmounts && uniqueTotals.length === 1
-      ? uniqueTotals[0]
-      : row.totals.reduce((sum, value) => sum + value, 0);
+    if (!totalsAreLineAmounts && uniqueTotals.length !== 1) {
+      errors++;
+      addRowError(
+        rowErrors,
+        row[SOURCE_ROW_NUMBERS]?.[0] || 1,
+        'Rows sharing a receipt ID have conflicting receipt totals. Map a column labelled as a line/item amount when each row is a line amount.',
+        { receiptId: row.receiptId }
+      );
+      continue;
+    }
+    const total = totalsAreLineAmounts
+      ? row.totals.reduce((sum, value) => sum + value, 0)
+      : uniqueTotals[0];
     if (!Number.isFinite(total) || Math.abs(total) > limits.maxAbsoluteAmount) {
       errors++;
       addRowError(
@@ -1231,7 +1259,7 @@ const groupLinePerRow = (rawRows, mapping, timezone) => {
       continue;
     }
     const averageUnitPrice = totalQty > 0 ? parseFloat((total / totalQty).toFixed(2)) : 0;
-    const { totals, ...cleanRow } = row;
+    const { totals, invalidReason, ...cleanRow } = row;
     rows.push(setSourceRowNumbers({
       ...cleanRow,
       total,

@@ -35,6 +35,9 @@ const teamInvitationSchema = new mongoose.Schema(
         required: true,
       },
     ],
+    permissions: {
+      canSpendCredits: { type: Boolean, default: false },
+    },
     tokenHash: {
       type: String,
       required: true,

@@ -33,6 +33,31 @@ describe('Insight Chats API', () => {
 
     expect(listRes.status).toBe(200);
     expect(listRes.body.chats).toHaveLength(1);
+    expect(listRes.body.chats[0].messages).toBeUndefined();
+    expect(listRes.body.pagination).toEqual(expect.objectContaining({
+      page: 1,
+      limit: 20,
+      total: 1,
+      hasMore: false,
+    }));
+
+    const compatibilityList = await request
+      .get('/api/insight-chats')
+      .query({ includeMessages: 'true', limit: 50 })
+      .set('Authorization', `Bearer ${token}`);
+    expect(compatibilityList.status).toBe(200);
+    expect(compatibilityList.body.chats[0].messages).toHaveLength(1);
+    expect(compatibilityList.body.pagination.limit).toBe(10);
+    expect(compatibilityList.body.meta).toEqual(expect.objectContaining({
+      includeMessages: true,
+      messagePreviewLimit: 20,
+    }));
+
+    const detailRes = await request
+      .get(`/api/insight-chats/${chatId}`)
+      .set('Authorization', `Bearer ${token}`);
+    expect(detailRes.status).toBe(200);
+    expect(detailRes.body.chat.messages).toHaveLength(1);
 
     const renameRes = await request
       .patch(`/api/insight-chats/${chatId}`)

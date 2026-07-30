@@ -6,10 +6,26 @@ const mongoose = require('mongoose');
 const app = require('./app');
 const connectDB = require('./config/db');
 const validateEnv = require('./config/validateEnv');
-const { cleanupAbandonedPendingUploads } = require('./controllers/uploads.controller');
+const {
+  cleanupAbandonedPendingUploads,
+  recoverPendingUploadMaintenance,
+} = require('./controllers/uploads.controller');
 const PaymentSession = require('./models/PaymentSession.model');
 const TeamInvitation = require('./models/TeamInvitation.model');
 const UsageLedger = require('./models/UsageLedger.model');
+const Transaction = require('./models/Transaction.model');
+const Forecast = require('./models/Forecast.model');
+const Upload = require('./models/Upload.model');
+const AuthSession = require('./models/AuthSession.model');
+const PendingRegistration = require('./models/PendingRegistration.model');
+const PasswordResetToken = require('./models/PasswordResetToken.model');
+const GeneratedInsight = require('./models/GeneratedInsight.model');
+const IntegrationOAuthState = require('./models/IntegrationOAuthState.model');
+const AccessAuditEvent = require('./models/AccessAuditEvent.model');
+const User = require('./models/User.model');
+const Item = require('./models/Item.model');
+const Improvement = require('./models/Improvement.model');
+const LeaveBalance = require('./models/LeaveBalance.model');
 const { reconcilePendingOneGatePayments } = require('./services/billingPayments.service');
 const { reconcileStaleUsageReservations } = require('./services/usage.service');
 
@@ -38,9 +54,15 @@ const runPendingUploadCleanup = () => {
   if (cleanupPromise) return cleanupPromise;
   cleanupPromise = (async () => {
     try {
-      const summary = await cleanupAbandonedPendingUploads();
+      const [summary, maintenance] = await Promise.all([
+        cleanupAbandonedPendingUploads(),
+        recoverPendingUploadMaintenance(),
+      ]);
       if (summary.deleted > 0 || summary.storageRetried > 0 || summary.failed > 0) {
         console.log('[uploads] abandoned upload cleanup:', summary);
+      }
+      if (maintenance.completed > 0 || maintenance.failed > 0) {
+        console.log('[uploads] maintenance recovery:', maintenance);
       }
     } catch (error) {
       console.error('[uploads] abandoned upload cleanup failed:', error.message);
@@ -137,9 +159,26 @@ const start = async () => {
   try {
     validateEnv();
     await connectDB();
-    // Exactly-once guarantees depend on these unique indexes. Do not accept
-    // traffic until MongoDB confirms they exist.
-    await Promise.all([PaymentSession.init(), TeamInvitation.init(), UsageLedger.init()]);
+    // Correctness, lifecycle cleanup, and exactly-once guarantees depend on
+    // these indexes. Do not accept traffic until MongoDB confirms they exist.
+    await Promise.all([
+      PaymentSession.init(),
+      TeamInvitation.init(),
+      UsageLedger.init(),
+      Transaction.init(),
+      Forecast.init(),
+      Upload.init(),
+      AuthSession.init(),
+      PendingRegistration.init(),
+      PasswordResetToken.init(),
+      GeneratedInsight.init(),
+      IntegrationOAuthState.init(),
+      AccessAuditEvent.init(),
+      User.init(),
+      Item.init(),
+      Improvement.init(),
+      LeaveBalance.init(),
+    ]);
     httpServer = app.listen(PORT);
     const candidateServer = httpServer;
     await new Promise((resolve, reject) => {

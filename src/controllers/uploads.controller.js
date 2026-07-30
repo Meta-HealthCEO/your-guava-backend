@@ -1,9 +1,11 @@
 const mongoose = require('mongoose');
 const fs = require('fs');
+const crypto = require('crypto');
 const Upload = require('../models/Upload.model');
 const Transaction = require('../models/Transaction.model');
 const Cafe = require('../models/Cafe.model');
 const Forecast = require('../models/Forecast.model');
+const GeneratedInsight = require('../models/GeneratedInsight.model');
 const r2 = require('../services/r2.service');
 const ingestion = require('../services/ingestion.service');
 const parser = require('../services/parser.service');
@@ -16,11 +18,47 @@ const VALID_ITEMS_MODES = new Set(['packed', 'line-per-row']);
 const DEFAULT_PARSING_LEASE_MS = 15 * 60 * 1000;
 const MAX_PARSING_LEASE_MS = 60 * 60 * 1000;
 const DEFAULT_PENDING_RETENTION_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_MAINTENANCE_RETRY_MS = 5 * 60 * 1000;
+const MAX_MAINTENANCE_RETRY_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_MAINTENANCE_MAX_ATTEMPTS = 5;
 const MAX_CLEANUP_BATCH = 100;
 const MAX_ACTUALS_REFRESH_FORECASTS = 366;
 const MAX_LIST_PAGE = 10000;
 const STORAGE_CLEANUP_PENDING = 'Stored file cleanup pending; background cleanup will retry.';
 const ABANDONED_CLEANUP_CLAIM = 'Removing an abandoned unconfirmed upload.';
+const SEVERE_PARTIAL_MIN_ERRORS = 10;
+const SEVERE_PARTIAL_ERROR_RATIO = 0.25;
+const CONFIRMATION_KEY_MAX_LENGTH = 160;
+const MAPPING_FIELDS = [
+  'receiptId', 'date', 'time', 'items', 'total', 'tip', 'discount',
+  'paymentMethod', 'status', 'quantity',
+];
+
+const sha256 = (value) =>
+  crypto.createHash('sha256').update(String(value)).digest('hex');
+
+const confirmationMappingHash = (columnMapping, itemsMode) => sha256(JSON.stringify({
+  itemsMode,
+  columnMapping: Object.fromEntries(
+    MAPPING_FIELDS.map((field) => [field, columnMapping?.[field] || null])
+  ),
+}));
+
+const sanitizeRowErrors = (rowErrors) =>
+  (Array.isArray(rowErrors) ? rowErrors : []).slice(0, 50).map((rowError) => ({
+    rowNumber: rowError?.rowNumber,
+    reason: String(rowError?.reason || 'Could not import row').slice(0, 500),
+  }));
+
+const confirmationResponse = (upload, { replayed = false } = {}) => ({
+  success: true,
+  uploadId: upload._id,
+  stats: upload.stats,
+  dateRange: upload.dateRange,
+  rowErrors: sanitizeRowErrors(upload.rowErrors),
+  maintenance: upload.maintenance || { status: 'queued' },
+  replayed,
+});
 
 const boundedInteger = (value, fallback, min, max) => {
   const parsed = Number.parseInt(value, 10);
@@ -41,6 +79,26 @@ const pendingRetentionMs = () => boundedInteger(
   60 * 60 * 1000,
   30 * 24 * 60 * 60 * 1000
 );
+
+const maintenanceMaxAttempts = () => boundedInteger(
+  process.env.UPLOAD_MAINTENANCE_MAX_ATTEMPTS,
+  DEFAULT_MAINTENANCE_MAX_ATTEMPTS,
+  1,
+  10
+);
+
+const maintenanceRetryDelayMs = (attempts) => {
+  const baseDelay = boundedInteger(
+    process.env.UPLOAD_MAINTENANCE_RETRY_MS,
+    DEFAULT_MAINTENANCE_RETRY_MS,
+    1000,
+    MAX_MAINTENANCE_RETRY_MS
+  );
+  return Math.min(
+    MAX_MAINTENANCE_RETRY_MS,
+    baseDelay * (2 ** Math.max(0, Number(attempts || 1) - 1))
+  );
+};
 
 const validateMapping = (upload, columnMapping, itemsMode) => {
   const mode = itemsMode || 'packed';
@@ -93,7 +151,7 @@ const assertImportableResult = (result) => {
   }
 };
 
-const assertParsedRowsImportable = (parsed) => {
+const assertParsedRowsImportable = (parsed, { allowSeverePartial = false } = {}) => {
   if (parsed.totalRows === 0) {
     const err = new Error('No transaction rows found in this upload');
     err.statusCode = 400;
@@ -110,6 +168,26 @@ const assertParsedRowsImportable = (parsed) => {
   if (approvedRows.length === 0) {
     const err = new Error('No approved transaction rows could be imported with this mapping');
     err.statusCode = 400;
+    throw err;
+  }
+
+  const errorRatio = parsed.totalRows > 0 ? parsed.errors / parsed.totalRows : 0;
+  if (
+    !allowSeverePartial &&
+    parsed.errors >= SEVERE_PARTIAL_MIN_ERRORS &&
+    errorRatio >= SEVERE_PARTIAL_ERROR_RATIO
+  ) {
+    const err = new Error(
+      `${parsed.errors} of ${parsed.totalRows} rows could not be parsed. Fix the mapping or explicitly allow a partial import.`
+    );
+    err.statusCode = 422;
+    err.code = 'SEVERE_PARTIAL_IMPORT';
+    err.details = {
+      errors: parsed.errors,
+      totalRows: parsed.totalRows,
+      errorRatio: Number(errorRatio.toFixed(4)),
+      rowErrors: sanitizeRowErrors(parsed.rowErrors),
+    };
     throw err;
   }
 };
@@ -191,7 +269,7 @@ const touchParsingLease = async (uploadId, cafeId, expectedUpdatedAt) => {
   return touched;
 };
 
-const duplicateFilterForRow = (cafeId, row) => {
+const duplicateFilterForRow = (cafeId, row, sourceFingerprint) => {
   if (row.receiptId) return { cafeId, receiptId: row.receiptId };
 
   const dedupKey = computeDedupKey({
@@ -199,11 +277,13 @@ const duplicateFilterForRow = (cafeId, row) => {
     time: row.date.toISOString().slice(11, 16),
     total: row.total,
     items: row.items,
+    sourceFingerprint,
+    sourceRowNumbers: row.__sourceRowNumbers,
   });
   return { cafeId, dedupKey };
 };
 
-const assertRemapHasImportableRows = async (parsed, cafeId, uploadId) => {
+const assertRemapHasImportableRows = async (parsed, cafeId, uploadId, sourceFingerprint) => {
   const approvedRows = parsed.rows.filter((row) => (row.status || 'approved').toLowerCase() === 'approved');
   if (approvedRows.length === 0) {
     const err = new Error('No approved transaction rows could be imported with this mapping');
@@ -211,7 +291,7 @@ const assertRemapHasImportableRows = async (parsed, cafeId, uploadId) => {
     throw err;
   }
 
-  const identities = approvedRows.map((row) => duplicateFilterForRow(cafeId, row));
+  const identities = approvedRows.map((row) => duplicateFilterForRow(cafeId, row, sourceFingerprint));
   const receiptIds = [...new Set(identities.map((identity) => identity.receiptId).filter(Boolean))];
   const dedupKeys = [...new Set(identities.map((identity) => identity.dedupKey).filter(Boolean))];
   const existingIdentities = new Set();
@@ -318,7 +398,7 @@ const restoreUploadAfterFailure = async ({
     itemsMode: previousState.itemsMode,
     stats: previousState.stats,
     dateRange: previousState.dateRange,
-    rowErrors: rowErrors || previousState.rowErrors,
+    rowErrors: sanitizeRowErrors(rowErrors || previousState.rowErrors),
     errorMessage: error.message,
   };
   const update = { $set: set };
@@ -338,6 +418,9 @@ const commitParsedUpload = async ({
   columnMapping,
   itemsMode,
   persistMapping,
+  mappingHash,
+  idempotencyKeyHash,
+  timezone,
 }) => {
   let result;
   let committedUpload;
@@ -354,6 +437,7 @@ const commitParsedUpload = async ({
         itemsAlreadyReconciled: true,
         rebuildItems: false,
         failOnPersistenceError: true,
+        sourceFingerprint: upload.fileFingerprint || sha256(upload.r2Key),
       });
       assertImportableResult(result);
       await ingestion.rebuildItemsForCafe(cafeId, { session });
@@ -376,9 +460,26 @@ const commitParsedUpload = async ({
               errors: result.errors,
               totalRows: result.totalRows,
             },
-            dateRange: result.dateRange,
-            rowErrors: result.rowErrors || parsed.rowErrors || [],
+            dateRange: {
+              ...result.dateRange,
+              firstDateKey: result.dateRange?.firstDate
+                ? parser.zonedDateKey(result.dateRange.firstDate, timezone)
+                : undefined,
+              lastDateKey: result.dateRange?.lastDate
+                ? parser.zonedDateKey(result.dateRange.lastDate, timezone)
+                : undefined,
+            },
+            rowErrors: sanitizeRowErrors(result.rowErrors || parsed.rowErrors),
             completedAt: new Date(),
+            confirmation: {
+              mappingHash,
+              idempotencyKeyHash,
+              replayCount: 0,
+            },
+            maintenance: {
+              status: 'queued',
+              errors: [],
+            },
           },
           $unset: { errorMessage: '' },
         },
@@ -404,6 +505,17 @@ const commitParsedUpload = async ({
         err.statusCode = 404;
         throw err;
       }
+
+      // Readers must never observe forecasts or generated insights based on
+      // the pre-import dataset, even if the asynchronous regeneration worker
+      // starts later or this process exits immediately after commit.
+      const today = parser.zonedDayStart(new Date(), timezone);
+      await Forecast.deleteMany({ cafeId, date: { $gte: today } }).session(session);
+      await GeneratedInsight.updateOne(
+        { cafeId },
+        { $set: { invalidatedAt: new Date() } },
+        { session }
+      );
     }, {
       readConcern: { level: 'snapshot' },
       writeConcern: { w: 'majority' },
@@ -414,17 +526,220 @@ const commitParsedUpload = async ({
   return { upload: committedUpload, result };
 };
 
-const runPostImportMaintenance = async (cafeId, dateRange, timezone) => {
+const invalidateAiInsights = async (cafeId) => {
+  try {
+    const { invalidateInsights } = require('../services/anthropic.service');
+    if (typeof invalidateInsights === 'function') await invalidateInsights(cafeId);
+  } catch (error) {
+    throw new Error(`AI insight invalidation: ${error.message}`);
+  }
+};
+
+const runPostImportMaintenance = async (claimedUpload, timezone) => {
+  const uploadId = claimedUpload._id;
+  const cafeId = claimedUpload.cafeId;
+  const dateRange = claimedUpload.dateRange;
+  const attemptCount = Number(claimedUpload.maintenance?.attempts || 1);
+  const claimStartedAt = claimedUpload.maintenance?.startedAt;
+  const errors = [];
   const safely = async (label, operation) => {
     try {
       await operation();
     } catch (error) {
       console.error(`[uploads] ${label} failed:`, error.message);
+      errors.push(`${label}: ${error.message}`.slice(0, 500));
     }
   };
   await safely('forecast invalidation', () => invalidatePlanningForecasts(cafeId, timezone));
   await safely('week forecast regeneration', () => generateWeekForecast(cafeId));
   await safely('forecast actuals refresh', () => fillActualsForRange(cafeId, dateRange, timezone));
+  await safely('AI insight invalidation', () => invalidateAiInsights(cafeId));
+  clearApiCache();
+
+  const maxAttempts = maintenanceMaxAttempts();
+  const canRetry = errors.length > 0 && attemptCount < maxAttempts;
+  const completedAt = new Date();
+  const update = {
+    $set: {
+      'maintenance.status': errors.length === 0 ? 'completed' : 'partial_failure',
+      'maintenance.completedAt': completedAt,
+      'maintenance.errors': errors,
+    },
+    $unset: {
+      'maintenance.nextRetryAt': '',
+      'maintenance.retryExhaustedAt': '',
+    },
+  };
+  if (canRetry) {
+    update.$set['maintenance.nextRetryAt'] = new Date(
+      completedAt.getTime() + maintenanceRetryDelayMs(attemptCount)
+    );
+    delete update.$unset['maintenance.nextRetryAt'];
+  } else if (errors.length > 0) {
+    update.$set['maintenance.retryExhaustedAt'] = completedAt;
+    delete update.$unset['maintenance.retryExhaustedAt'];
+  }
+
+  await Upload.updateOne(
+    {
+      _id: uploadId,
+      cafeId,
+      status: 'completed',
+      'maintenance.status': 'running',
+      'maintenance.startedAt': claimStartedAt,
+    },
+    update
+  );
+  return errors;
+};
+
+const claimPostImportMaintenance = async (candidate) => {
+  const now = new Date();
+  const maxAttempts = maintenanceMaxAttempts();
+  const query = {
+    _id: candidate._id,
+    cafeId: candidate.cafeId,
+    status: 'completed',
+    'maintenance.status': candidate.maintenance?.status || 'queued',
+    $and: [{
+      $or: [
+        { 'maintenance.attempts': { $exists: false } },
+        { 'maintenance.attempts': { $lt: maxAttempts } },
+      ],
+    }],
+  };
+  if (candidate.maintenance?.status === 'running' && candidate.maintenance?.startedAt) {
+    query['maintenance.startedAt'] = candidate.maintenance.startedAt;
+  }
+  if (candidate.maintenance?.status === 'partial_failure') {
+    query.$and.push({
+      $or: [
+        { 'maintenance.nextRetryAt': { $exists: false } },
+        { 'maintenance.nextRetryAt': { $lte: now } },
+      ],
+    });
+  }
+  return Upload.findOneAndUpdate(
+    query,
+    {
+      $set: {
+        'maintenance.status': 'running',
+        'maintenance.startedAt': now,
+        'maintenance.errors': [],
+      },
+      $inc: { 'maintenance.attempts': 1 },
+      $unset: {
+        'maintenance.completedAt': '',
+        'maintenance.nextRetryAt': '',
+        'maintenance.retryExhaustedAt': '',
+      },
+    },
+    { new: true }
+  );
+};
+
+const claimAndRunPostImportMaintenance = async (candidate, timezone) => {
+  const claimed = await claimPostImportMaintenance(candidate);
+  if (!claimed) return false;
+  const resolvedTimezone = timezone || await getCafeTimezone(claimed.cafeId);
+  const errors = await runPostImportMaintenance(claimed, resolvedTimezone);
+  return { status: errors.length === 0 ? 'completed' : 'partial_failure', errors };
+};
+
+const schedulePostImportMaintenance = async (uploadId, cafeId, dateRange, timezone) => {
+  const candidate = {
+    _id: uploadId,
+    cafeId,
+    dateRange,
+    maintenance: { status: 'queued' },
+  };
+  if (process.env.NODE_ENV === 'test') {
+    await claimAndRunPostImportMaintenance(candidate, timezone);
+    return;
+  }
+  setImmediate(() => {
+    claimAndRunPostImportMaintenance(candidate, timezone).catch((error) => {
+      console.error('[uploads] post-import maintenance failed:', error.message);
+    });
+  });
+};
+
+const recoverPendingUploadMaintenance = async ({
+  limit = 10,
+  staleAfterMs = parsingLeaseMs(),
+} = {}) => {
+  const batchLimit = boundedInteger(limit, 10, 1, 50);
+  const maxAttempts = maintenanceMaxAttempts();
+  const now = new Date();
+  const staleBefore = new Date(Date.now() - boundedInteger(
+    staleAfterMs,
+    parsingLeaseMs(),
+    60 * 1000,
+    MAX_PARSING_LEASE_MS
+  ));
+  await Upload.updateMany(
+    {
+      status: 'completed',
+      'maintenance.status': 'running',
+      'maintenance.startedAt': { $lte: staleBefore },
+      'maintenance.attempts': { $gte: maxAttempts },
+    },
+    {
+      $set: {
+        'maintenance.status': 'partial_failure',
+        'maintenance.completedAt': now,
+        'maintenance.retryExhaustedAt': now,
+        'maintenance.errors': [
+          `Maintenance stopped after ${maxAttempts} interrupted attempts; manual review is required.`,
+        ],
+      },
+      $unset: { 'maintenance.nextRetryAt': '' },
+    }
+  );
+  const candidates = await Upload.find({
+    status: 'completed',
+    $and: [
+      {
+        $or: [
+          { 'maintenance.attempts': { $exists: false } },
+          { 'maintenance.attempts': { $lt: maxAttempts } },
+        ],
+      },
+      {
+        $or: [
+          { 'maintenance.status': 'queued' },
+          {
+            'maintenance.status': 'running',
+            'maintenance.startedAt': { $lte: staleBefore },
+          },
+          {
+            'maintenance.status': 'partial_failure',
+            $or: [
+              { 'maintenance.nextRetryAt': { $exists: false } },
+              { 'maintenance.nextRetryAt': { $lte: now } },
+            ],
+          },
+        ],
+      },
+    ],
+  })
+    .select('_id cafeId dateRange maintenance')
+    .sort({ updatedAt: 1 })
+    .limit(batchLimit)
+    .lean();
+
+  const summary = { scanned: candidates.length, completed: 0, failed: 0 };
+  for (const candidate of candidates) {
+    try {
+      const result = await claimAndRunPostImportMaintenance(candidate);
+      if (result?.status === 'completed') summary.completed++;
+      if (result?.status === 'partial_failure') summary.failed++;
+    } catch (error) {
+      summary.failed++;
+      console.error('[uploads] maintenance recovery failed:', error.message);
+    }
+  }
+  return summary;
 };
 
 const cleanupAbandonedPendingUploads = async ({
@@ -501,6 +816,19 @@ const cleanupAbandonedPendingUploads = async ({
           $set: {
             status: 'deleted',
             errorMessage: 'Unconfirmed upload expired and its stored file was removed.',
+            r2Key: `deleted/${claimed._id}`,
+            fileName: 'deleted-upload',
+            fileSize: 0,
+            headers: [],
+            sampleRows: [],
+            rowErrors: [],
+            columnMapping: {},
+          },
+          $unset: {
+            fileFingerprint: '',
+            confirmation: '',
+            dateRange: '',
+            completedAt: '',
           },
         }
       );
@@ -566,8 +894,18 @@ const localDownload = async (req, res, next) => {
 const confirm = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { columnMapping, itemsMode = 'packed' } = req.body;
+    const {
+      columnMapping,
+      itemsMode = 'packed',
+      allowPartialImport = false,
+    } = req.body;
     const cafeId = req.user.cafeId;
+    const idempotencyKey = String(req.get?.('Idempotency-Key') || '').trim();
+    if (idempotencyKey.length > CONFIRMATION_KEY_MAX_LENGTH) {
+      return res.status(400).json({ success: false, message: 'Idempotency-Key is too long' });
+    }
+    const mappingHash = confirmationMappingHash(columnMapping, itemsMode);
+    const idempotencyKeyHash = idempotencyKey ? sha256(idempotencyKey) : undefined;
 
     let upload = await Upload.findOne({ _id: id, cafeId });
     if (!upload || upload.status === 'deleted') {
@@ -575,7 +913,18 @@ const confirm = async (req, res, next) => {
     }
     upload = await recoverStaleParsingUpload(upload, cafeId);
     if (upload.status === 'completed') {
-      return res.status(409).json({ success: false, message: 'Upload already completed' });
+      if (upload.confirmation?.mappingHash && upload.confirmation.mappingHash !== mappingHash) {
+        return res.status(409).json({
+          success: false,
+          message: 'Upload already completed with a different mapping. Use remap to change it.',
+        });
+      }
+      upload = await Upload.findOneAndUpdate(
+        { _id: upload._id, cafeId, status: 'completed' },
+        { $inc: { 'confirmation.replayCount': 1 } },
+        { new: true }
+      );
+      return res.status(200).json(confirmationResponse(upload, { replayed: true }));
     }
 
     const mappingError = validateMapping(upload, columnMapping, itemsMode);
@@ -604,7 +953,7 @@ const confirm = async (req, res, next) => {
         fileExt: ext,
         timezone,
       });
-      assertParsedRowsImportable(parsed);
+      assertParsedRowsImportable(parsed, { allowSeverePartial: allowPartialImport === true });
       upload = await touchParsingLease(upload._id, cafeId, expectedUpdatedAt);
       expectedUpdatedAt = upload.updatedAt;
 
@@ -615,6 +964,9 @@ const confirm = async (req, res, next) => {
         columnMapping,
         itemsMode,
         persistMapping: upload.posType === 'wizard',
+        mappingHash,
+        idempotencyKeyHash,
+        timezone,
       });
       upload = committed.upload;
       result = committed.result;
@@ -632,15 +984,9 @@ const confirm = async (req, res, next) => {
       throw err;
     }
 
-    await runPostImportMaintenance(cafeId, result.dateRange, timezone);
     clearApiCache();
-    return res.status(200).json({
-      success: true,
-      uploadId: upload._id,
-      stats: upload.stats,
-      dateRange: upload.dateRange,
-      rowErrors: upload.rowErrors,
-    });
+    await schedulePostImportMaintenance(upload._id, cafeId, result.dateRange, timezone);
+    return res.status(200).json(confirmationResponse(upload));
   } catch (error) {
     next(error);
   }
@@ -680,6 +1026,24 @@ const detail = async (req, res, next) => {
       .lean();
     if (!upload || upload.status === 'deleted') {
       return res.status(404).json({ success: false, message: 'Upload not found' });
+    }
+    const maintenanceIsStale = upload.maintenance?.status === 'running' &&
+      upload.maintenance?.startedAt &&
+      new Date(upload.maintenance.startedAt) <= new Date(Date.now() - parsingLeaseMs());
+    const maintenanceRetryIsDue = upload.maintenance?.status === 'partial_failure' &&
+      Number(upload.maintenance?.attempts || 0) < maintenanceMaxAttempts() &&
+      (
+        !upload.maintenance?.nextRetryAt ||
+        new Date(upload.maintenance.nextRetryAt) <= new Date()
+      );
+    if (upload.status === 'completed' && (
+      upload.maintenance?.status === 'queued' || maintenanceIsStale || maintenanceRetryIsDue
+    )) {
+      setImmediate(() => {
+        claimAndRunPostImportMaintenance(upload).catch((error) => {
+          console.error('[uploads] request-triggered maintenance recovery failed:', error.message);
+        });
+      });
     }
     const downloadUrl = await r2.getSignedDownloadUrl(upload.r2Key, 900);
     return res.status(200).json({ success: true, upload, downloadUrl });
@@ -722,7 +1086,7 @@ const rows = async (req, res, next) => {
 const remap = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { columnMapping, itemsMode = 'packed' } = req.body;
+    const { columnMapping, itemsMode = 'packed', allowPartialImport = false } = req.body;
     const cafeId = req.user.cafeId;
 
     let upload = await Upload.findOne({ _id: id, cafeId });
@@ -761,8 +1125,13 @@ const remap = async (req, res, next) => {
         fileExt: ext,
         timezone,
       });
-      assertParsedRowsImportable(parsed);
-      await assertRemapHasImportableRows(parsed, cafeId, upload._id);
+      assertParsedRowsImportable(parsed, { allowSeverePartial: allowPartialImport === true });
+      await assertRemapHasImportableRows(
+        parsed,
+        cafeId,
+        upload._id,
+        upload.fileFingerprint || sha256(upload.r2Key)
+      );
 
       // 2. Parse succeeded — now safe to delete existing transactions
       upload = await touchParsingLease(upload._id, cafeId, expectedUpdatedAt);
@@ -775,6 +1144,9 @@ const remap = async (req, res, next) => {
         columnMapping,
         itemsMode,
         persistMapping: false,
+        mappingHash: confirmationMappingHash(columnMapping, itemsMode),
+        idempotencyKeyHash: undefined,
+        timezone,
       });
       upload = committed.upload;
       result = committed.result;
@@ -794,15 +1166,9 @@ const remap = async (req, res, next) => {
       throw err;
     }
 
-    await runPostImportMaintenance(cafeId, result.dateRange, timezone);
     clearApiCache();
-    return res.status(200).json({
-      success: true,
-      uploadId: upload._id,
-      stats: upload.stats,
-      dateRange: upload.dateRange,
-      rowErrors: upload.rowErrors,
-    });
+    await schedulePostImportMaintenance(upload._id, cafeId, result.dateRange, timezone);
+    return res.status(200).json(confirmationResponse(upload));
   } catch (error) {
     next(error);
   }
@@ -819,11 +1185,23 @@ const remove = async (req, res, next) => {
 
     const dateRange = upload.dateRange;
     const timezone = await getCafeTimezone(cafeId);
+    const today = parser.zonedDayStart(new Date(), timezone);
     const session = await mongoose.startSession();
     try {
       await session.withTransaction(async () => {
         await Transaction.deleteMany({ cafeId, uploadId: upload._id }).session(session);
         await ingestion.rebuildItemsForCafe(cafeId, { session });
+        await Forecast.deleteMany({ cafeId, date: { $gte: today } }).session(session);
+        await GeneratedInsight.updateOne(
+          { cafeId },
+          { $set: { invalidatedAt: new Date() } },
+          { session }
+        );
+        const remainingTransactions = await Transaction.countDocuments({ cafeId }).session(session);
+        const cafeStateUpdate = remainingTransactions > 0
+          ? { $set: { dataUploaded: true, lastSyncAt: new Date() } }
+          : { $set: { dataUploaded: false }, $unset: { lastSyncAt: '' } };
+        await Cafe.updateOne({ _id: cafeId }, cafeStateUpdate, { session });
         const deletedUpload = await Upload.findOneAndUpdate(
           {
             _id: upload._id,
@@ -835,6 +1213,18 @@ const remove = async (req, res, next) => {
             $set: {
               status: 'deleted',
               errorMessage: STORAGE_CLEANUP_PENDING,
+              fileName: 'deleted-upload',
+              fileSize: 0,
+              headers: [],
+              sampleRows: [],
+              rowErrors: [],
+              columnMapping: {},
+            },
+            $unset: {
+              fileFingerprint: '',
+              confirmation: '',
+              dateRange: '',
+              completedAt: '',
             },
           },
           { new: true, session }
@@ -853,9 +1243,6 @@ const remove = async (req, res, next) => {
       await session.endSession();
     }
 
-    try { await invalidatePlanningForecasts(cafeId, timezone); } catch (error) {
-      console.error('[uploads] delete forecast invalidation failed:', error.message);
-    }
     try { await fillActualsForRange(cafeId, dateRange, timezone); } catch (error) {
       console.error('[uploads] delete actuals refresh failed:', error.message);
     }
@@ -863,12 +1250,20 @@ const remove = async (req, res, next) => {
       await r2.deleteFile(upload.r2Key);
       await Upload.updateOne(
         { _id: upload._id, status: 'deleted', errorMessage: STORAGE_CLEANUP_PENDING },
-        { $unset: { errorMessage: '' } }
+        {
+          $set: { r2Key: `deleted/${upload._id}` },
+          $unset: { errorMessage: '' },
+        }
       );
     } catch (error) {
       console.error('[uploads] stored file cleanup deferred:', error.message);
     }
 
+    try {
+      await invalidateAiInsights(cafeId);
+    } catch (error) {
+      console.error('[uploads] delete AI insight invalidation failed:', error.message);
+    }
     clearApiCache();
     return res.status(200).json({ success: true });
   } catch (error) {
@@ -885,4 +1280,5 @@ module.exports = {
   remap,
   remove,
   cleanupAbandonedPendingUploads,
+  recoverPendingUploadMaintenance,
 };

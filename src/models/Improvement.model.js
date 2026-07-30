@@ -36,7 +36,7 @@ const STATUSES = ['open', 'planned', 'in_progress', 'done', 'declined'];
 const improvementSchema = new mongoose.Schema(
   {
     // Sequential, human-friendly ticket number (1, 2, 3, ...). Assigned on create.
-    ticketNumber: { type: Number, unique: true, index: true },
+    ticketNumber: { type: Number, unique: true },
     type: {
       type: String,
       enum: IMPROVEMENT_TYPES,

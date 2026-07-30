@@ -155,7 +155,7 @@ const addPersistenceRowError = (rowErrors, row, reason) => {
   });
 };
 
-const transactionIdentity = (row) => {
+const transactionIdentity = (row, sourceFingerprint) => {
   if (row.receiptId) return { type: 'receiptId', value: row.receiptId };
   return {
     type: 'dedupKey',
@@ -164,6 +164,8 @@ const transactionIdentity = (row) => {
       time: row.date.toISOString().slice(11, 16),
       total: row.total,
       items: row.items,
+      sourceFingerprint,
+      sourceRowNumbers: row.__sourceRowNumbers,
     }),
   };
 };
@@ -237,7 +239,7 @@ const reconcileParsedRows = async (parsed, { cafeId, session }) => {
 
 const persistParsedRowsBulk = async (
   parsed,
-  { cafeId, uploadId, session, itemsAlreadyReconciled = false }
+  { cafeId, uploadId, session, itemsAlreadyReconciled = false, sourceFingerprint }
 ) => {
   let skipped = 0;
   let errors = parsed.errors;
@@ -260,7 +262,7 @@ const persistParsedRowsBulk = async (
       if (!itemsAlreadyReconciled) {
         row.items = await reconcileTransactionItems(cafeId, row.items, { session });
       }
-      const identity = transactionIdentity(row);
+      const identity = transactionIdentity(row, sourceFingerprint);
       const identityKey = `${identity.type}:${identity.value}`;
       if (seen.has(identityKey)) {
         skipped++;
@@ -325,6 +327,7 @@ const persistParsedRows = async (
     itemsAlreadyReconciled = false,
     rebuildItems = true,
     failOnPersistenceError = false,
+    sourceFingerprint,
   }
 ) => {
   if (bulk) {
@@ -333,6 +336,7 @@ const persistParsedRows = async (
       uploadId,
       session,
       itemsAlreadyReconciled,
+      sourceFingerprint,
     });
     if (rebuildItems) await rebuildItemsForCafe(cafeId, { session });
     return result;
@@ -361,6 +365,8 @@ const persistParsedRows = async (
         time: row.date.toISOString().slice(11, 16),
         total: row.total,
         items: row.items,
+        sourceFingerprint,
+        sourceRowNumbers: row.__sourceRowNumbers,
       });
 
       const filter = row.receiptId
@@ -441,10 +447,18 @@ const persistParsedRows = async (
  */
 const ingestParsedRows = async (
   buffer,
-  { cafeId, uploadId, columnMapping, itemsMode, fileExt = 'csv', timezone }
+  {
+    cafeId,
+    uploadId,
+    columnMapping,
+    itemsMode,
+    fileExt = 'csv',
+    timezone,
+    sourceFingerprint,
+  }
 ) => {
   const parsed = await parseBuffer(buffer, { columnMapping, itemsMode, fileExt, timezone });
-  return persistParsedRows(parsed, { cafeId, uploadId });
+  return persistParsedRows(parsed, { cafeId, uploadId, sourceFingerprint });
 };
 
 /**

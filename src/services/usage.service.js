@@ -16,6 +16,47 @@ const DEFAULT_TRIAL_DAYS = 14;
 const DEFAULT_TRIAL_MS = DEFAULT_TRIAL_DAYS * 24 * 60 * 60 * 1000;
 const DEFAULT_USAGE_RESERVATION_LEASE_MS = 5 * 60 * 1000;
 const DEFAULT_USAGE_RECONCILIATION_BATCH_SIZE = 50;
+const USAGE_DIAGNOSTICS_FIELD = '__usageDiagnostics';
+const AI_FEATURE_KEYS = new Set([
+  'ask_guava_chat',
+  'import_column_mapping',
+  'menu_item_ai_review',
+  'insight_refresh',
+]);
+
+const boundedPolicyInteger = (value, fallback, min, max) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed)
+    ? Math.max(min, Math.min(max, parsed))
+    : fallback;
+};
+
+const aiUsagePolicy = () => ({
+  userDailyCredits: boundedPolicyInteger(
+    process.env.AI_USER_DAILY_CREDIT_LIMIT,
+    500,
+    10,
+    100_000
+  ),
+  orgDailyCredits: boundedPolicyInteger(
+    process.env.AI_ORG_DAILY_CREDIT_LIMIT,
+    2_000,
+    10,
+    1_000_000
+  ),
+  userConcurrency: boundedPolicyInteger(
+    process.env.AI_USER_CONCURRENCY_LIMIT,
+    2,
+    1,
+    20
+  ),
+  orgConcurrency: boundedPolicyInteger(
+    process.env.AI_ORG_CONCURRENCY_LIMIT,
+    8,
+    1,
+    100
+  ),
+});
 
 const asDate = (value) => {
   if (!value) return null;
@@ -468,6 +509,129 @@ const usageReplayError = (ledger) => {
   return err;
 };
 
+const hasStoredResult = (ledger) =>
+  ledger && ledger.get('resultPayload') !== undefined;
+
+const splitMeteredRunResult = (rawResult) => {
+  if (
+    !rawResult ||
+    typeof rawResult !== 'object' ||
+    Array.isArray(rawResult) ||
+    !Object.prototype.hasOwnProperty.call(rawResult, USAGE_DIAGNOSTICS_FIELD)
+  ) {
+    return { result: rawResult, providerDiagnostics: undefined };
+  }
+
+  const {
+    [USAGE_DIAGNOSTICS_FIELD]: providerDiagnostics,
+    ...result
+  } = rawResult;
+  return { result, providerDiagnostics };
+};
+
+const withUsageDiagnostics = (result, providerDiagnostics) => {
+  if (!providerDiagnostics || !result || typeof result !== 'object' || Array.isArray(result)) {
+    return result;
+  }
+  return {
+    ...result,
+    [USAGE_DIAGNOSTICS_FIELD]: providerDiagnostics,
+  };
+};
+
+const aiPolicyError = (code, message, details) => {
+  const error = new Error(message);
+  error.statusCode = 429;
+  error.code = code;
+  error.details = { code, ...details };
+  return error;
+};
+
+const enforceAiUsagePolicy = async ({ orgId, userId, featureKey, credits }, session) => {
+  if (!AI_FEATURE_KEYS.has(featureKey)) return;
+  const limits = aiUsagePolicy();
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const activeStatuses = ['reserved', 'recovering'];
+  const policyOrgId = mongoose.Types.ObjectId.isValid(orgId)
+    ? new mongoose.Types.ObjectId(orgId)
+    : orgId;
+  const policyUserId = mongoose.Types.ObjectId.isValid(userId)
+    ? new mongoose.Types.ObjectId(userId)
+    : userId;
+
+  const [userDaily, orgDaily, userConcurrent, orgConcurrent] = await Promise.all([
+    UsageLedger.aggregate([
+      {
+        $match: {
+          orgId: policyOrgId,
+          userId: policyUserId,
+          featureKey: { $in: [...AI_FEATURE_KEYS] },
+          status: { $in: ['reserved', 'recovering', 'committed'] },
+          $expr: {
+            $gte: [{ $ifNull: ['$reservedAt', '$createdAt'] }, since],
+          },
+        },
+      },
+      { $group: { _id: null, credits: { $sum: '$credits' } } },
+    ]).session(session),
+    UsageLedger.aggregate([
+      {
+        $match: {
+          orgId: policyOrgId,
+          featureKey: { $in: [...AI_FEATURE_KEYS] },
+          status: { $in: ['reserved', 'recovering', 'committed'] },
+          $expr: {
+            $gte: [{ $ifNull: ['$reservedAt', '$createdAt'] }, since],
+          },
+        },
+      },
+      { $group: { _id: null, credits: { $sum: '$credits' } } },
+    ]).session(session),
+    UsageLedger.countDocuments({
+      orgId: policyOrgId,
+      userId: policyUserId,
+      featureKey: { $in: [...AI_FEATURE_KEYS] },
+      status: { $in: activeStatuses },
+    }).session(session),
+    UsageLedger.countDocuments({
+      orgId: policyOrgId,
+      featureKey: { $in: [...AI_FEATURE_KEYS] },
+      status: { $in: activeStatuses },
+    }).session(session),
+  ]);
+
+  const userUsed = Number(userDaily[0]?.credits) || 0;
+  const orgUsed = Number(orgDaily[0]?.credits) || 0;
+  if (userUsed + credits > limits.userDailyCredits) {
+    throw aiPolicyError(
+      'AI_USER_DAILY_BUDGET_REACHED',
+      'Your daily AI credit safety limit has been reached',
+      { limit: limits.userDailyCredits, used: userUsed, required: credits }
+    );
+  }
+  if (orgUsed + credits > limits.orgDailyCredits) {
+    throw aiPolicyError(
+      'AI_ORG_DAILY_BUDGET_REACHED',
+      'The organization daily AI credit safety limit has been reached',
+      { limit: limits.orgDailyCredits, used: orgUsed, required: credits }
+    );
+  }
+  if (userConcurrent >= limits.userConcurrency) {
+    throw aiPolicyError(
+      'AI_USER_CONCURRENCY_LIMIT',
+      'You already have the maximum number of AI requests in progress',
+      { limit: limits.userConcurrency }
+    );
+  }
+  if (orgConcurrent >= limits.orgConcurrency) {
+    throw aiPolicyError(
+      'AI_ORG_CONCURRENCY_LIMIT',
+      'The organization already has the maximum number of AI requests in progress',
+      { limit: limits.orgConcurrency }
+    );
+  }
+};
+
 const createMeteredReservation = async ({ idempotencyKey, credits, ...payload }) => {
   const key = cleanIdempotencyKey(idempotencyKey);
   const requestFingerprint = usageRequestFingerprint({ credits, ...payload });
@@ -480,6 +644,8 @@ const createMeteredReservation = async ({ idempotencyKey, credits, ...payload })
   let ledger;
   let reservedOrg;
   let creditAllocation;
+  let replayed = false;
+  let replayResult;
   try {
     await session.withTransaction(async () => {
       let existing = null;
@@ -497,8 +663,24 @@ const createMeteredReservation = async ({ idempotencyKey, credits, ...payload })
           conflict.details.code = 'USAGE_IDEMPOTENCY_FINGERPRINT_CONFLICT';
           throw conflict;
         }
+        if (existing.status === 'committed' && hasStoredResult(existing)) {
+          ledger = existing;
+          replayed = true;
+          replayResult = existing.resultPayload;
+          reservedOrg = await Organization.findById(payload.orgId).session(session);
+          return;
+        }
         if (existing.status !== 'refunded') throw usageReplayError(existing);
 
+        await enforceAiUsagePolicy(
+          {
+            orgId: payload.orgId,
+            userId: payload.userId,
+            featureKey: payload.featureKey,
+            credits,
+          },
+          session
+        );
         ledger = await UsageLedger.findOneAndUpdate(
           { _id: existing._id, status: 'refunded' },
           {
@@ -516,6 +698,15 @@ const createMeteredReservation = async ({ idempotencyKey, credits, ...payload })
         );
         if (!ledger) throw usageReplayError(existing);
       } else {
+        await enforceAiUsagePolicy(
+          {
+            orgId: payload.orgId,
+            userId: payload.userId,
+            featureKey: payload.featureKey,
+            credits,
+          },
+          session
+        );
         [ledger] = await UsageLedger.create(
           [{
             ...payload,
@@ -528,6 +719,8 @@ const createMeteredReservation = async ({ idempotencyKey, credits, ...payload })
           { session }
         );
       }
+
+      if (replayed) return;
 
       const reservation = await reserveCreditsAtomic(payload.orgId, credits, now, session);
       if (!reservation) {
@@ -571,13 +764,22 @@ const createMeteredReservation = async ({ idempotencyKey, credits, ...payload })
     credits: creditSnapshot(reservedOrg, now),
     creditWindowResetAt: asDate(reservedOrg.aiCredits?.resetAt),
     creditAllocation,
+    replayed,
+    replayResult,
   };
 };
 
-const finishUsage = (ledger, status) =>
+const finishUsage = (ledger, status, { resultPayload, providerDiagnostics } = {}) =>
   UsageLedger.findOneAndUpdate(
     { _id: ledger._id, status: 'reserved' },
-    { $set: { status, completedAt: new Date() } },
+    {
+      $set: {
+        status,
+        completedAt: new Date(),
+        ...(resultPayload !== undefined ? { resultPayload } : {}),
+        ...(providerDiagnostics !== undefined ? { providerDiagnostics } : {}),
+      },
+    },
     { new: true }
   );
 
@@ -760,11 +962,31 @@ const meterGuavaCredits = async ({
     metadata,
     idempotencyKey,
   });
-  const { ledger, creditWindowResetAt, creditAllocation } = reservation;
+  const {
+    ledger,
+    creditWindowResetAt,
+    creditAllocation,
+    replayed,
+    replayResult,
+  } = reservation;
+
+  if (replayed) {
+    return {
+      result: replayResult,
+      guavaCredits: reservation.credits,
+      usage: ledger,
+      replayed: true,
+    };
+  }
 
   let runCompleted = false;
+  let completedResult;
+  let completedProviderDiagnostics;
   try {
-    const result = await run();
+    const rawResult = await run();
+    const { result, providerDiagnostics } = splitMeteredRunResult(rawResult);
+    completedResult = result;
+    completedProviderDiagnostics = providerDiagnostics;
     if (signal?.aborted) {
       const abortError = signal.reason instanceof Error
         ? signal.reason
@@ -773,10 +995,18 @@ const meterGuavaCredits = async ({
       throw abortError;
     }
     runCompleted = true;
-    const committed = await finishUsage(ledger, 'committed');
+    const committed = await finishUsage(ledger, 'committed', {
+      resultPayload: result,
+      providerDiagnostics,
+    });
     if (!committed) throw new Error('Could not commit Guava Credit usage');
     const org = await Organization.findById(orgId);
-    return { result, guavaCredits: creditSnapshot(org), usage: committed };
+    return {
+      result,
+      guavaCredits: creditSnapshot(org),
+      usage: committed,
+      replayed: false,
+    };
   } catch (error) {
     if (!runCompleted) {
       await refundAndFinishUsage({
@@ -787,7 +1017,13 @@ const meterGuavaCredits = async ({
         creditAllocation,
       }).catch(() => null);
     } else {
-      await finishUsage(ledger, 'committed').catch(() => null);
+      // Preserve the delivered provider result during commit recovery. A
+      // status-only recovery would charge successfully but make a retry
+      // impossible to replay, recreating the paid-without-an-answer failure.
+      await finishUsage(ledger, 'committed', {
+        resultPayload: completedResult,
+        providerDiagnostics: completedProviderDiagnostics,
+      }).catch(() => null);
     }
     throw error;
   }
@@ -872,4 +1108,5 @@ module.exports = {
   refundGuavaCredits,
   reserveGuavaCredits,
   usageSummary,
+  withUsageDiagnostics,
 };

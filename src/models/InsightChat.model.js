@@ -12,6 +12,13 @@ const insightChatMessageSchema = new mongoose.Schema(
       required: true,
       maxlength: 20000,
     },
+    // Set only by the paid AI controller. It makes answer persistence
+    // idempotent when a client retries after losing the original response.
+    requestKey: {
+      type: String,
+      maxlength: 160,
+      select: false,
+    },
   },
   { _id: false, timestamps: true }
 );

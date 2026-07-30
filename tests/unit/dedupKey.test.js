@@ -1,11 +1,11 @@
 const { computeDedupKey } = require('../../src/utils/dedupKey');
 
 describe('computeDedupKey', () => {
-  it('produces a deterministic SHA1 hex string for identical inputs', () => {
+  it('produces a deterministic SHA-256 hex string for identical inputs', () => {
     const a = computeDedupKey({ date: '2026-04-01', time: '08:30', total: 45.5, items: [{ name: 'Flat White', quantity: 1 }] });
     const b = computeDedupKey({ date: '2026-04-01', time: '08:30', total: 45.5, items: [{ name: 'Flat White', quantity: 1 }] });
     expect(a).toBe(b);
-    expect(a).toMatch(/^[a-f0-9]{40}$/);
+    expect(a).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it('produces different keys when any field differs', () => {
@@ -28,5 +28,20 @@ describe('computeDedupKey', () => {
     const a = computeDedupKey({ date: '2026-04-01', total: 50, items: items1 });
     const b = computeDedupKey({ date: '2026-04-01', total: 50, items: items2 });
     expect(a).toBe(b);
+  });
+
+  it('keeps legitimate identical sales distinct by source row while replaying the same row idempotently', () => {
+    const sale = {
+      date: '2026-04-01',
+      time: '',
+      total: 45.5,
+      items: [{ name: 'Flat White', quantity: 1 }],
+      sourceFingerprint: 'a'.repeat(64),
+    };
+    const first = computeDedupKey({ ...sale, sourceRowNumbers: [2] });
+    const replay = computeDedupKey({ ...sale, sourceRowNumbers: [2] });
+    const secondLegitimateSale = computeDedupKey({ ...sale, sourceRowNumbers: [3] });
+    expect(first).toBe(replay);
+    expect(first).not.toBe(secondLegitimateSale);
   });
 });

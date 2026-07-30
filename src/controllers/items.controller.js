@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Item = require('../models/Item.model');
+const Organization = require('../models/Organization.model');
 const {
   normalizeItemName,
   buildAliasKeys,
@@ -12,6 +13,9 @@ const {
   MAX_AI_REVIEW_ITEMS,
   suggestMenuItemReviews,
 } = require('../services/menuItemReviewAi.service');
+const { scheduleForecastRefreshAfterMenuChange } = require('../services/forecast.service');
+const { clearApiCache } = require('../middleware/cache.middleware');
+const { creditSnapshot } = require('../services/usage.service');
 
 const VALID_CATEGORIES = new Set(['coffee', 'food', 'cold_drink', 'water', 'retail', 'other']);
 const VALID_REVIEW_STATUSES = new Set(['matched', 'needs_review', 'ignored', 'merged']);
@@ -230,6 +234,8 @@ const update = async (req, res, next) => {
     await item.save();
     await updateTransactionMenuItemLinks(req.user.cafeId, item, item);
     await rebuildItemsForCafe(req.user.cafeId);
+    await scheduleForecastRefreshAfterMenuChange(req.user.cafeId);
+    clearApiCache();
 
     return res.status(200).json({ success: true, item });
   } catch (error) {
@@ -272,6 +278,19 @@ const reconciliation = async (req, res, next) => {
 
 const generateReconciliationSuggestions = async (req, res, next) => {
   try {
+    const idempotencyKey = String(req.get('Idempotency-Key') || '').trim();
+    if (!idempotencyKey) {
+      return res.status(400).json({
+        success: false,
+        message: 'Idempotency-Key is required for paid AI requests',
+      });
+    }
+    if (idempotencyKey.length > 120) {
+      return res.status(400).json({
+        success: false,
+        message: 'Idempotency-Key is too long',
+      });
+    }
     const itemIds = Array.isArray(req.body.itemIds) ? [...new Set(req.body.itemIds.map(String))] : [];
     if (itemIds.length === 0) {
       return res.status(400).json({ success: false, message: 'itemIds is required' });
@@ -302,20 +321,31 @@ const generateReconciliationSuggestions = async (req, res, next) => {
       orgId: req.user.orgId,
       userId: req.user.id,
       useAi: true,
-      idempotencyPrefix: `menu-review:${req.user.id}:${req.id}`,
+      idempotencyPrefix: `menu-review:${req.user.id}:${idempotencyKey}`,
     });
     suggestions.forEach((suggestion, index) => {
-      enriched[index].aiSuggestion = suggestion;
+      const {
+        guavaCredits: _credits,
+        ...publicSuggestion
+      } = suggestion;
+      enriched[index].aiSuggestion = publicSuggestion;
     });
     const paidAiCount = suggestions.filter((suggestion) => suggestion.source === 'ai').length;
+    const creditsCharged = suggestions.reduce(
+      (sum, suggestion) => sum + (Number(suggestion.aiCreditsCharged) || 0),
+      0
+    );
+    const organization = await Organization.findById(req.user.orgId);
 
     return res.status(200).json({
       success: true,
       items: enriched,
+      guavaCredits: organization ? creditSnapshot(organization) : null,
       meta: {
         requested: itemIds.length,
         paidAiUsed: paidAiCount > 0,
         paidAiCount,
+        creditsCharged,
       },
     });
   } catch (error) {
@@ -338,6 +368,8 @@ const resolve = async (req, res, next) => {
     }
 
     const item = await resolveMenuItem(req.user.cafeId, req.params.id, req.body);
+    await scheduleForecastRefreshAfterMenuChange(req.user.cafeId);
+    clearApiCache();
     return res.status(200).json({ success: true, item });
   } catch (error) {
     next(error);

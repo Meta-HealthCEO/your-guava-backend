@@ -4,6 +4,7 @@ const User = require('../../src/models/User.model');
 const Staff = require('../../src/models/Staff.model');
 const Cafe = require('../../src/models/Cafe.model');
 const Organization = require('../../src/models/Organization.model');
+const AuthSession = require('../../src/models/AuthSession.model');
 const { createOAuthState, verifyOAuthState } = require('../../src/services/yoco.service');
 
 const request = supertest(app);
@@ -59,7 +60,7 @@ describe('Yoco OAuth state', () => {
 });
 
 describe('Refresh token rotation', () => {
-  it('rotates the refresh cookie and keeps the stored list bounded', async () => {
+  it('rotates the refresh cookie and keeps active session families bounded', async () => {
     const { user, cookie } = await createTestUser();
 
     const res = await request.post('/api/auth/refresh').set('Cookie', cookie);
@@ -70,8 +71,10 @@ describe('Refresh token rotation', () => {
     expect(newCookie).toBeDefined();
     expect(String(newCookie)).toContain('refreshToken=');
 
-    const persisted = await User.findById(user.id).select('+refreshTokens');
-    expect(persisted.refreshTokens.length).toBeLessThanOrEqual(10);
+    expect(await AuthSession.countDocuments({
+      userId: user.id,
+      revokedAt: null,
+    })).toBeLessThanOrEqual(10);
 
     // Run many refreshes — the list must stay bounded
     let currentCookie = newCookie;
@@ -80,43 +83,87 @@ describe('Refresh token rotation', () => {
       expect(r.status).toBe(200);
       currentCookie = r.headers['set-cookie'] || currentCookie;
     }
-    const after = await User.findById(user.id).select('+refreshTokens');
-    expect(after.refreshTokens.length).toBeLessThanOrEqual(10);
+    expect(await AuthSession.countDocuments({
+      userId: user.id,
+      revokedAt: null,
+    })).toBeLessThanOrEqual(10);
   });
 
-  it('invalidates the consumed refresh token after rotation (no replay)', async () => {
+  it('allows a concurrent duplicate briefly, then revokes a replayed refresh family', async () => {
     const { cookie } = await createTestUser();
 
     // First refresh succeeds and rotates the token
     const first = await request.post('/api/auth/refresh').set('Cookie', cookie);
     expect(first.status).toBe(200);
 
-    // Replaying the ORIGINAL (now consumed) cookie must be rejected
+    // A second tab can have sent the same cookie before the first response
+    // arrived. It receives the same replacement rather than killing the login.
+    const concurrent = await request.post('/api/auth/refresh').set('Cookie', cookie);
+    expect(concurrent.status).toBe(200);
+    expect(String(concurrent.headers['set-cookie'])).toBe(String(first.headers['set-cookie']));
+
+    await AuthSession.updateOne(
+      { revokedAt: null },
+      { $set: { previousValidUntil: new Date(Date.now() - 1000) } }
+    );
+
+    // Outside the concurrency grace, the consumed token is a replay signal.
     const replay = await request.post('/api/auth/refresh').set('Cookie', cookie);
     expect(replay.status).toBe(401);
 
-    // The freshly issued cookie still works
+    // Replay revokes the entire family, including its freshly issued token.
     const next = await request.post('/api/auth/refresh').set('Cookie', first.headers['set-cookie']);
-    expect(next.status).toBe(200);
+    expect(next.status).toBe(401);
   });
 
-  it('stores only a one-way digest of newly issued refresh tokens', async () => {
+  it('stores only one-way token digests, including during rotation grace', async () => {
     const { user, cookie } = await createTestUser();
     const rawToken = String(cookie).match(/refreshToken=([^;]+)/)?.[1];
     const defaultView = await User.findById(user.id).lean();
     expect(defaultView.password).toBeUndefined();
     expect(defaultView.refreshTokens).toBeUndefined();
 
-    const persisted = await User.findById(user.id)
-      .select('+password +refreshTokens')
+    const persisted = await User.findById(user.id).select('+password +refreshTokens').lean();
+    const session = await AuthSession.findOne({ userId: user.id })
+      .select('+currentTokenHash')
       .lean();
 
     expect(rawToken).toBeDefined();
     expect(persisted.password).toMatch(/^\$2[aby]\$/);
-    expect(persisted.refreshTokens).toHaveLength(1);
-    expect(persisted.refreshTokens[0].token).toBeUndefined();
-    expect(persisted.refreshTokens[0].tokenHash).toMatch(/^[a-f0-9]{64}$/);
-    expect(persisted.refreshTokens[0].tokenHash).not.toBe(rawToken);
+    expect(persisted.refreshTokens).toHaveLength(0);
+    expect(session.currentTokenHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(session.currentTokenHash).not.toBe(rawToken);
+
+    const rotated = await request.post('/api/auth/refresh').set('Cookie', cookie);
+    const rotatedRawToken = String(rotated.headers['set-cookie'])
+      .match(/refreshToken=([^;]+)/)?.[1];
+    const rotatedSession = await AuthSession.findOne({ userId: user.id })
+      .select('+currentTokenHash +previousTokenHash +graceTokenId +graceTokenIssuedAt')
+      .lean();
+    expect(rotatedSession.currentTokenHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(rotatedSession.previousTokenHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(rotatedSession.graceTokenId).toBeTruthy();
+    expect(JSON.stringify(rotatedSession)).not.toContain(rawToken);
+    expect(JSON.stringify(rotatedSession)).not.toContain(rotatedRawToken);
+  });
+
+  it('keeps independent device families valid when one device logs out', async () => {
+    const owner = await createTestUser();
+    const secondLogin = await request.post('/api/auth/login').send({
+      email: owner.user.email,
+      password: 'password123',
+    });
+    const secondCookie = secondLogin.headers['set-cookie'];
+    expect(await AuthSession.countDocuments({
+      userId: owner.user.id,
+      revokedAt: null,
+    })).toBe(2);
+
+    await request.post('/api/auth/logout').set('Cookie', owner.cookie);
+    const firstRefresh = await request.post('/api/auth/refresh').set('Cookie', owner.cookie);
+    const secondRefresh = await request.post('/api/auth/refresh').set('Cookie', secondCookie);
+    expect(firstRefresh.status).toBe(401);
+    expect(secondRefresh.status).toBe(200);
   });
 });
 

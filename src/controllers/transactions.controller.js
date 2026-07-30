@@ -9,6 +9,7 @@ const r2 = require('../services/r2.service');
 const ingestion = require('../services/ingestion.service');
 const parser = require('../services/parser.service');
 const { proposeColumnMapping } = require('../services/anthropic.service');
+const { canSpendCredits } = require('../middleware/rbac.middleware');
 
 const REQUIRED_UPLOAD_MAPPING = ['date', 'items', 'total'];
 const MIN_HEADER_COUNT = 2;
@@ -62,6 +63,7 @@ const upload = async (req, res, next) => {
     const safeStorageName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_') || 'upload';
     const ext = path.extname(fileName).toLowerCase().slice(1);
     const buffer = await fs.promises.readFile(filePath);
+    const fileFingerprint = crypto.createHash('sha256').update(buffer).digest('hex');
 
     // Validate size
     const maxBytes = typeof r2.maxObjectBytes === 'function'
@@ -112,6 +114,8 @@ const upload = async (req, res, next) => {
     // Detect format
     let posType, columnMapping, itemsMode;
     let usedSavedMapping = false;
+    let mappingAssistedByAi = false;
+    let mappingCreditsUsed = 0;
     const cafe = await Cafe.findById(cafeId).lean();
     const yoco = ingestion.yocoMapping();
     if (ingestion.isYocoFormat(headers) && hasRequiredHeaderMapping(yoco.mapping, headers, yoco.itemsMode)) {
@@ -131,9 +135,12 @@ const upload = async (req, res, next) => {
           orgId: req.user.orgId,
           cafeId,
           userId,
+          allowPaidAi: canSpendCredits(req.user),
         });
         columnMapping = cleanColumnMapping(proposal.mapping, headers);
         itemsMode = proposal.itemsMode;
+        mappingAssistedByAi = Object.keys(columnMapping).length > 0;
+        mappingCreditsUsed = Number(proposal.aiCreditsCharged) || 0;
       }
     }
 
@@ -143,6 +150,7 @@ const upload = async (req, res, next) => {
       fileName,
       fileSize: buffer.length,
       r2Key,
+      fileFingerprint,
       posType,
       columnMapping,
       itemsMode,
@@ -163,6 +171,8 @@ const upload = async (req, res, next) => {
       headers,
       preview: sampleRows,
       needsConfirmation: posType !== 'yoco' && !(usedSavedMapping && hasRequiredMapping),
+      mappingAssistedByAi,
+      mappingCreditsUsed,
     });
   } catch (error) {
     await cleanupLocalFile(filePath);

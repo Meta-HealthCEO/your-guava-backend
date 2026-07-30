@@ -3,6 +3,7 @@ const User = require('../models/User.model');
 const Cafe = require('../models/Cafe.model');
 const Organization = require('../models/Organization.model');
 const PaymentSession = require('../models/PaymentSession.model');
+const TeamInvitation = require('../models/TeamInvitation.model');
 const {
   getPlan,
   getPlans,
@@ -25,6 +26,7 @@ const {
   usageSummary,
 } = require('../services/usage.service');
 const oneGate = require('../services/onegate.service');
+const { assertPlanChangeCapacity } = require('../services/planCapacity.service');
 const { clearApiCache } = require('../middleware/cache.middleware');
 
 const PROFILE_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -95,12 +97,19 @@ const buildAccountPayload = async (userId) => {
     throw err;
   }
 
-  const [seatCount, locationCount] = await Promise.all([
+  const [activeSeatCount, pendingSeatCount, locationCount] = await Promise.all([
     User.countDocuments({ orgId: org._id }),
+    TeamInvitation.countDocuments({
+      orgId: org._id,
+      status: 'pending',
+      expiresAt: { $gt: new Date() },
+    }),
     Cafe.countDocuments({ orgId: org._id }),
   ]);
+  const seatCount = activeSeatCount + pendingSeatCount;
 
   const plan = getPlan(org.plan);
+  const isOwner = user.role === 'owner';
   const credits = creditSnapshot(org);
   const usageLedger = await usageSummary(org._id);
 
@@ -113,6 +122,10 @@ const buildAccountPayload = async (userId) => {
       orgId: user.orgId,
       cafeIds: user.cafeIds,
       activeCafeId: user.activeCafeId,
+      emailVerified: user.emailVerified !== false,
+      permissions: {
+        canSpendCredits: user.role === 'owner' || Boolean(user.permissions?.canSpendCredits),
+      },
     },
     organization: {
       _id: org._id,
@@ -121,8 +134,7 @@ const buildAccountPayload = async (userId) => {
       plan: normalisePlanId(org.plan),
       billingStatus: org.billingStatus,
       billingCycle: org.billingCycle,
-      billingEmail: org.billingEmail,
-      paymentMethod: org.paymentMethod,
+      ...(isOwner ? { billingEmail: org.billingEmail, paymentMethod: org.paymentMethod } : {}),
       trialStartedAt: org.trialStartedAt,
       trialEndsAt: org.trialEndsAt,
       subscriptionStartedAt: org.subscriptionStartedAt,
@@ -134,6 +146,8 @@ const buildAccountPayload = async (userId) => {
     usage: {
       seats: {
         used: seatCount,
+        active: activeSeatCount,
+        pending: pendingSeatCount,
         included: plan.includedSeats,
         remaining: Math.max(0, plan.includedSeats - seatCount),
       },
@@ -144,9 +158,9 @@ const buildAccountPayload = async (userId) => {
       },
       aiCredits: credits,
       guavaCredits: credits,
-      creditLedger: usageLedger,
+      ...(isOwner ? { creditLedger: usageLedger } : {}),
     },
-    plans: getPlans(),
+    plans: isOwner ? getPlans() : [],
   };
 };
 
@@ -330,6 +344,7 @@ const checkout = async (req, res, next) => {
     if (!org) {
       return res.status(404).json({ success: false, message: 'Organization not found' });
     }
+    await assertPlanChangeCapacity(org._id, org.plan, selectedPlan.id);
 
     if (oneGate.isOneGateEnabled()) {
       const cycle = billingCycle === 'annual' ? 'annual' : 'monthly';
@@ -369,6 +384,14 @@ const checkout = async (req, res, next) => {
       account,
     });
   } catch (error) {
+    if (error?.code === 'PLAN_LIMIT_EXCEEDED') {
+      return res.status(409).json({
+        success: false,
+        code: error.code,
+        message: error.message,
+        capacity: error.details?.capacity,
+      });
+    }
     next(error);
   }
 };

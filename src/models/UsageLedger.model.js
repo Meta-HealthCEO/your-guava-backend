@@ -62,6 +62,14 @@ const usageLedgerSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       default: {},
     },
+    resultPayload: {
+      type: mongoose.Schema.Types.Mixed,
+      default: undefined,
+    },
+    providerDiagnostics: {
+      type: mongoose.Schema.Types.Mixed,
+      default: undefined,
+    },
     idempotencyKey: {
       type: String,
       maxlength: 160,

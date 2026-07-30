@@ -5,6 +5,7 @@ const Organization = require('../models/Organization.model');
 const PaymentSession = require('../models/PaymentSession.model');
 const { addBillingCycle, getPlan, nextCreditResetDate } = require('./billingPlans.service');
 const oneGate = require('./onegate.service');
+const { assertPlanChangeCapacity } = require('./planCapacity.service');
 const { bonusUsedForCredits } = require('./usage.service');
 const { safeTimezone, zonedDayStart } = require('./parser.service');
 
@@ -122,6 +123,7 @@ const applyPlanPayment = async (paymentSession, transaction) => {
     }
 
     const selectedPlan = getPlan(paymentSession.plan);
+    await assertPlanChangeCapacity(org._id, org.plan, selectedPlan.id);
     const planChanged = org.plan !== selectedPlan.id;
     const now = new Date();
     const period = billingPeriodForPayment(org, paymentSession.billingCycle, now);

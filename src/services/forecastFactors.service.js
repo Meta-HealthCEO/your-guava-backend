@@ -432,11 +432,14 @@ const eventImpactPct = (event, settings) => {
 };
 
 const eventsFactor = (events, settings) => {
-  if (!settings.enabled || !events || events.length === 0) {
+  // Closure records are operational constraints, not demand-generating events.
+  // They are applied by the forecast service's trading-hours multiplier.
+  const demandEvents = (events || []).filter((event) => !event.type || event.type === 'event');
+  if (!settings.enabled || demandEvents.length === 0) {
     return factor({ key: 'events', label: 'Events' });
   }
 
-  const strongest = events
+  const strongest = demandEvents
     .map((event) => ({ event, adjustmentPct: eventImpactPct(event, settings) }))
     .sort((a, b) => Math.abs(b.adjustmentPct) - Math.abs(a.adjustmentPct))[0];
 

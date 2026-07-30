@@ -1,6 +1,10 @@
 const InsightChat = require('../models/InsightChat.model');
 
 const MAX_MESSAGES = 80;
+const DEFAULT_LIST_LIMIT = 20;
+const MAX_LIST_LIMIT = 30;
+const MAX_LIST_WITH_MESSAGES = 10;
+const LIST_MESSAGE_PREVIEW_LIMIT = 20;
 
 const buildTitle = (title, messages = []) => {
   if (typeof title === 'string' && title.trim()) {
@@ -26,6 +30,29 @@ const sanitizeMessages = (messages = []) =>
       content: message.content.trim().slice(0, 20000),
     }));
 
+const preserveServerRequestKeys = async (req, messages) => {
+  if (messages.length === 0) return messages;
+  const existing = await InsightChat.findOne(chatScope(req, { _id: req.params.id }))
+    .select('+messages.requestKey')
+    .lean();
+  if (!existing) return messages;
+
+  const keysByMessage = new Map();
+  for (const message of existing.messages || []) {
+    if (!message.requestKey) continue;
+    const signature = JSON.stringify([message.role, message.content]);
+    const keys = keysByMessage.get(signature) || [];
+    keys.push(message.requestKey);
+    keysByMessage.set(signature, keys);
+  }
+
+  return messages.map((message) => {
+    const signature = JSON.stringify([message.role, message.content]);
+    const requestKey = keysByMessage.get(signature)?.shift();
+    return requestKey ? { ...message, requestKey } : message;
+  });
+};
+
 const chatScope = (req, extra = {}) => ({
   ...extra,
   userId: req.user.id,
@@ -35,15 +62,43 @@ const chatScope = (req, extra = {}) => ({
 const list = async (req, res, next) => {
   try {
     const includeArchived = req.query.archived === 'true';
+    const includeMessages = req.query.includeMessages === 'true';
+    const parsedPage = Number.parseInt(req.query.page, 10);
+    const parsedLimit = Number.parseInt(req.query.limit, 10);
+    const page = Number.isFinite(parsedPage) ? Math.max(1, parsedPage) : 1;
+    const maxLimit = includeMessages ? MAX_LIST_WITH_MESSAGES : MAX_LIST_LIMIT;
+    const limit = Number.isFinite(parsedLimit)
+      ? Math.max(1, Math.min(maxLimit, parsedLimit))
+      : Math.min(DEFAULT_LIST_LIMIT, maxLimit);
     const filter = chatScope(req, includeArchived ? {} : { archived: false });
 
-    const chats = await InsightChat.find(filter)
-      .sort({ updatedAt: -1 })
-      .limit(60)
-      .select('title messages contextStats archived updatedAt createdAt')
-      .lean();
+    const query = InsightChat.find(filter)
+      .sort({ updatedAt: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .select(`title contextStats archived updatedAt createdAt${includeMessages ? ' messages' : ''}`);
+    if (includeMessages) query.slice('messages', -LIST_MESSAGE_PREVIEW_LIMIT);
 
-    return res.status(200).json({ success: true, chats });
+    const [chats, total] = await Promise.all([
+      query.lean(),
+      InsightChat.countDocuments(filter),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      chats,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.max(1, Math.ceil(total / limit)),
+        hasMore: page * limit < total,
+      },
+      meta: {
+        includeMessages,
+        messagePreviewLimit: includeMessages ? LIST_MESSAGE_PREVIEW_LIMIT : 0,
+      },
+    });
   } catch (error) {
     next(error);
   }
@@ -87,7 +142,9 @@ const update = async (req, res, next) => {
     const updates = {};
 
     if (typeof req.body.title === 'string') updates.title = buildTitle(req.body.title);
-    if (Array.isArray(req.body.messages)) updates.messages = sanitizeMessages(req.body.messages);
+    if (Array.isArray(req.body.messages)) {
+      updates.messages = await preserveServerRequestKeys(req, sanitizeMessages(req.body.messages));
+    }
     if (req.body.contextStats && typeof req.body.contextStats === 'object') {
       updates.contextStats = req.body.contextStats;
     }

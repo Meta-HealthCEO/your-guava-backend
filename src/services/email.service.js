@@ -120,6 +120,66 @@ const sendWelcomeEmail = async ({ user, org, cafe }) => {
   });
 };
 
+const sendVerificationEmail = async ({ registration, verificationToken }) => {
+  if (!verificationToken) throw new Error('Verification token is required');
+  const verificationUrl = `${appUrl()}/verify-email#token=${encodeURIComponent(verificationToken)}`;
+  const html = baseHtml({
+    title: 'Verify your email address',
+    intro: `Hi ${registration.name}, confirm this email to finish creating your Your Guava workspace.`,
+    ctaLabel: 'Verify email',
+    ctaUrl: verificationUrl,
+    children: `
+      <p style="margin:0 0 14px;">Your workspace is not active yet. Verification prevents another person from registering with your email address.</p>
+      <p style="margin:0;color:#b8b8b8;">This single-use link expires in 24 hours.</p>
+    `,
+  });
+  const text = plainLines([
+    `Hi ${registration.name},`,
+    'Verify your email to finish creating your Your Guava workspace.',
+    `Verify email: ${verificationUrl}`,
+    'This single-use link expires in 24 hours.',
+  ]);
+  return sendEmail({
+    to: registration.email,
+    subject: 'Verify your Your Guava email',
+    html,
+    text,
+    tags: [{ name: 'email_type', value: 'email_verification' }],
+  });
+};
+
+const sendPasswordResetEmail = async ({ user, resetToken, expiresAt }) => {
+  if (!resetToken) throw new Error('Password reset token is required');
+  const resetUrl = `${appUrl()}/reset-password#token=${encodeURIComponent(resetToken)}`;
+  const expiry = new Date(expiresAt).toLocaleString('en-ZA', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  });
+  const html = baseHtml({
+    title: 'Reset your password',
+    intro: `Hi ${user.name}, use this secure link to choose a new password.`,
+    ctaLabel: 'Reset password',
+    ctaUrl: resetUrl,
+    children: `
+      <p style="margin:0 0 14px;">This link expires at ${escapeHtml(expiry)} and works once.</p>
+      <p style="margin:0;color:#b8b8b8;">If you did not request a reset, your password has not changed.</p>
+    `,
+  });
+  const text = plainLines([
+    `Hi ${user.name},`,
+    `Reset your password: ${resetUrl}`,
+    `This single-use link expires at ${expiry}.`,
+    'If you did not request this, your password has not changed.',
+  ]);
+  return sendEmail({
+    to: user.email,
+    subject: 'Reset your Your Guava password',
+    html,
+    text,
+    tags: [{ name: 'email_type', value: 'password_reset' }],
+  });
+};
+
 const sendTeamInviteEmail = async ({ invitation, owner, cafes = [], invitationToken }) => {
   if (!invitationToken) throw new Error('Invitation token is required');
   const invitationUrl = `${appUrl()}/accept-invite#token=${encodeURIComponent(invitationToken)}`;
@@ -170,6 +230,8 @@ const _resetClient = () => {
 
 module.exports = {
   sendWelcomeEmail,
+  sendVerificationEmail,
+  sendPasswordResetEmail,
   sendTeamInviteEmail,
   sendEmail,
   isConfigured,

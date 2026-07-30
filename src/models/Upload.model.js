@@ -41,6 +41,11 @@ const uploadSchema = new mongoose.Schema(
     fileName: { type: String, required: true },
     fileSize: { type: Number, required: true },
     r2Key: { type: String, required: true },
+    fileFingerprint: {
+      type: String,
+      match: /^[a-f0-9]{64}$/,
+      index: true,
+    },
     posType: {
       type: String,
       enum: ['yoco', 'wizard'],
@@ -67,16 +72,37 @@ const uploadSchema = new mongoose.Schema(
     dateRange: {
       firstDate: { type: Date },
       lastDate: { type: Date },
+      firstDateKey: { type: String, match: /^\d{4}-\d{2}-\d{2}$/ },
+      lastDateKey: { type: String, match: /^\d{4}-\d{2}-\d{2}$/ },
     },
     errorMessage: { type: String },
     rowErrors: { type: [rowErrorSchema], default: [] },
     headers: [{ type: String }],
     sampleRows: [{ type: mongoose.Schema.Types.Mixed }],
     completedAt: { type: Date },
+    confirmation: {
+      mappingHash: { type: String },
+      idempotencyKeyHash: { type: String },
+      replayCount: { type: Number, default: 0 },
+    },
+    maintenance: {
+      status: {
+        type: String,
+        enum: ['not_started', 'queued', 'running', 'completed', 'partial_failure'],
+        default: 'not_started',
+      },
+      attempts: { type: Number, default: 0, min: 0 },
+      startedAt: { type: Date },
+      completedAt: { type: Date },
+      nextRetryAt: { type: Date },
+      retryExhaustedAt: { type: Date },
+      errors: [{ type: String }],
+    },
   },
   { timestamps: true }
 );
 
 uploadSchema.index({ cafeId: 1, createdAt: -1 });
+uploadSchema.index({ cafeId: 1, fileFingerprint: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Upload', uploadSchema);

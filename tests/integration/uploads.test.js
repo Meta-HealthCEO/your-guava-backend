@@ -131,9 +131,9 @@ describe('Uploads API', () => {
         expect.objectContaining({
           rowNumber: 3,
           reason: 'Could not parse date or time',
-          raw: expect.objectContaining({ Receipt: 'R501', Date: 'not-a-date' }),
         }),
       ]);
+      expect(confirm.body.rowErrors[0]).not.toHaveProperty('raw');
 
       const detail = await request
         .get(`/api/uploads/${stage.body.uploadId}`)
@@ -146,7 +146,7 @@ describe('Uploads API', () => {
       });
     });
 
-    it('returns 409 when confirming an already-completed upload', async () => {
+    it('replays a completed confirmation without importing duplicate transactions', async () => {
       const stage = await request
         .post('/api/transactions/upload')
         .set('Authorization', `Bearer ${token}`)
@@ -160,7 +160,10 @@ describe('Uploads API', () => {
         .post(`/api/uploads/${uploadId}/confirm`)
         .set('Authorization', `Bearer ${token}`)
         .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
-      expect(second.status).toBe(409);
+      expect(second.status).toBe(200);
+      expect(second.body.replayed).toBe(true);
+      expect(second.body.stats.imported).toBe(4);
+      expect(await Transaction.countDocuments({ uploadId })).toBe(4);
     });
 
     it('returns 400 when required fields are missing from mapping', async () => {
@@ -324,6 +327,43 @@ describe('Uploads API', () => {
         .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
 
       expect(res.status).toBe(404);
+    });
+  });
+
+  describe('post-import maintenance recovery', () => {
+    it('retries a due partial failure and records the bounded attempt', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      await Upload.updateOne(
+        { _id: stage.body.uploadId },
+        {
+          $set: {
+            'maintenance.status': 'partial_failure',
+            'maintenance.attempts': 1,
+            'maintenance.nextRetryAt': new Date(Date.now() - 1000),
+            'maintenance.errors': ['weather provider unavailable'],
+          },
+          $unset: {
+            'maintenance.retryExhaustedAt': '',
+          },
+        }
+      );
+
+      const { recoverPendingUploadMaintenance } = require('../../src/controllers/uploads.controller');
+      const summary = await recoverPendingUploadMaintenance({ limit: 1 });
+      const upload = await Upload.findById(stage.body.uploadId).lean();
+
+      expect(summary).toMatchObject({ scanned: 1, completed: 1, failed: 0 });
+      expect(upload.maintenance.status).toBe('completed');
+      expect(upload.maintenance.attempts).toBe(2);
+      expect(upload.maintenance.nextRetryAt).toBeUndefined();
     });
   });
 
@@ -644,7 +684,20 @@ describe('Uploads API', () => {
 
       expect(summary).toMatchObject({ scanned: 1, deleted: 1, failed: 0 });
       expect(mockR2Files.has(staged.r2Key)).toBe(false);
-      expect((await Upload.findById(staged._id).lean()).status).toBe('deleted');
+      const deleted = await Upload.findById(staged._id).lean();
+      expect(deleted).toEqual(expect.objectContaining({
+        status: 'deleted',
+        r2Key: `deleted/${staged._id}`,
+        fileName: 'deleted-upload',
+        fileSize: 0,
+        headers: [],
+        sampleRows: [],
+        rowErrors: [],
+        columnMapping: {},
+      }));
+      expect(deleted.fileFingerprint).toBeUndefined();
+      expect(deleted.confirmation).toBeUndefined();
+      expect(deleted.dateRange).toBeUndefined();
     });
   });
 

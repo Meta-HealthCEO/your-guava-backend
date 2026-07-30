@@ -4,6 +4,8 @@ const mockCafeFindById = jest.fn();
 const mockCafeFindOne = jest.fn();
 const mockTransactionAggregate = jest.fn();
 const mockGenerateForecast = jest.fn();
+const mockUpdateForecastActuals = jest.fn();
+const mockClearApiCache = jest.fn();
 
 jest.mock('../../src/models/Forecast.model', () => ({
   findOne: (...args) => mockForecastFindOne(...args),
@@ -19,10 +21,11 @@ jest.mock('../../src/models/Transaction.model', () => ({
   aggregate: (...args) => mockTransactionAggregate(...args),
 }));
 jest.mock('../../src/services/forecast.service', () => ({
+  FORECAST_MODEL_VERSION: 'test-model',
   generateForecast: (...args) => mockGenerateForecast(...args),
-  updateForecastActuals: jest.fn(),
+  updateForecastActuals: (...args) => mockUpdateForecastActuals(...args),
 }));
-jest.mock('../../src/middleware/cache.middleware', () => ({ clearApiCache: jest.fn() }));
+jest.mock('../../src/middleware/cache.middleware', () => ({ clearApiCache: (...args) => mockClearApiCache(...args) }));
 jest.mock('../../src/services/forecastFactors.service', () => ({
   DEFAULT_FORECAST_SETTINGS: {},
   getFactorEntitlements: jest.fn(),
@@ -114,7 +117,8 @@ describe('forecast controller cafe-local dates', () => {
     );
     expect(mockGenerateForecast).toHaveBeenCalledWith(
       cafeId,
-      new Date('2026-03-08T05:00:00.000Z')
+      new Date('2026-03-08T05:00:00.000Z'),
+      { origin: 'manual' }
     );
   });
 
@@ -155,5 +159,50 @@ describe('forecast controller cafe-local dates', () => {
       startDate: '2026-03-08',
       endDate: '2026-03-08',
     }));
+  });
+
+  it('clears response caches after a synchronous history batch generates a forecast', async () => {
+    jest.setSystemTime(new Date('2026-03-10T12:00:00.000Z'));
+    mockCafeFindOne.mockReturnValue(timezoneQuery());
+    mockTransactionAggregate.mockResolvedValue([{
+      _id: '2026-03-08',
+      actualRevenue: 100,
+      transactionCount: 1,
+    }]);
+    mockForecastFind.mockReturnValue({ lean: jest.fn().mockResolvedValue([]) });
+    mockForecastFindOne.mockResolvedValue(null);
+    mockGenerateForecast.mockResolvedValue({
+      _id: 'forecast-1',
+      date: new Date('2026-03-08T05:00:00.000Z'),
+      dateKey: '2026-03-08',
+      origin: 'backfill',
+      modelVersion: 'test-model',
+      totalPredictedRevenue: 90,
+      items: [],
+      factors: [
+        { key: 'weather', label: 'Weather', active: false },
+        { key: 'loadShedding', label: 'Load shedding', active: false },
+        { key: 'holiday', label: 'Holiday', active: false },
+        { key: 'payday', label: 'Payday', active: false },
+        { key: 'events', label: 'Events', active: false },
+      ],
+      factorSettings: {},
+      factorEntitlements: {},
+      calibration: { sampleSize: 0, overallMultiplier: 1 },
+      signals: { weather: null, events: [] },
+    });
+    mockUpdateForecastActuals.mockResolvedValue(null);
+
+    await controller.getHistory(req({
+      query: {
+        startDate: '2026-03-08',
+        endDate: '2026-03-08',
+        backfill: 'sync',
+        backfillLimit: '1',
+      },
+    }), response(), jest.fn());
+
+    expect(mockGenerateForecast).toHaveBeenCalledTimes(1);
+    expect(mockClearApiCache).toHaveBeenCalledTimes(1);
   });
 });

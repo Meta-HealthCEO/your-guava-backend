@@ -54,6 +54,7 @@ const clearDB = async () => {
 // Helper to create a test user and get auth token
 const createTestUser = async (overrides = {}) => {
   const supertest = require('supertest');
+  const emailService = require('../src/services/email.service');
   const request = supertest(app);
 
   const data = {
@@ -65,13 +66,47 @@ const createTestUser = async (overrides = {}) => {
     ...overrides,
   };
 
-  const res = await request.post('/api/auth/register').send(data);
+  let verificationToken;
+  const verificationSpy = jest
+    .spyOn(emailService, 'sendVerificationEmail')
+    .mockImplementation(async ({ verificationToken: token }) => {
+      verificationToken = token;
+      return { sent: true };
+    });
 
-  return {
-    token: res.body.accessToken,
-    user: res.body.user,
-    cookie: res.headers['set-cookie'],
-  };
+  try {
+    const registration = await request.post('/api/auth/register').send(data);
+    if (registration.status !== 202 || !verificationToken) {
+      throw new Error(
+        `Test registration failed (${registration.status}): ${JSON.stringify(registration.body)}`
+      );
+    }
+
+    const verification = await request
+      .post('/api/auth/verify-email')
+      .send({ token: verificationToken });
+    if (verification.status !== 201) {
+      throw new Error(
+        `Test email verification failed (${verification.status}): ${JSON.stringify(verification.body)}`
+      );
+    }
+
+    const login = await request.post('/api/auth/login').send({
+      email: data.email,
+      password: data.password,
+    });
+    if (login.status !== 200) {
+      throw new Error(`Test login failed (${login.status}): ${JSON.stringify(login.body)}`);
+    }
+
+    return {
+      token: login.body.accessToken,
+      user: login.body.user,
+      cookie: login.headers['set-cookie'],
+    };
+  } finally {
+    verificationSpy.mockRestore();
+  }
 };
 
 // Helper to create a manager directly when a test is not exercising the

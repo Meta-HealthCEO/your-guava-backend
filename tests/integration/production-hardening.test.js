@@ -205,8 +205,14 @@ describe('production hardening regressions', () => {
       },
     });
 
-    await expect(operation()).resolves.toEqual(expect.objectContaining({ result: 'done' }));
-    await expect(operation()).rejects.toMatchObject({ statusCode: 409 });
+    await expect(operation()).resolves.toEqual(expect.objectContaining({
+      result: 'done',
+      replayed: false,
+    }));
+    await expect(operation()).resolves.toEqual(expect.objectContaining({
+      result: 'done',
+      replayed: true,
+    }));
 
     const org = await Organization.findById(owner.user.orgId).lean();
     expect(executions).toBe(1);
@@ -511,6 +517,7 @@ describe('production hardening regressions', () => {
     const bounded = await request
       .post('/api/items/reconciliation/suggestions')
       .set('Authorization', `Bearer ${owner.token}`)
+      .set('Idempotency-Key', 'bounded-menu-review')
       .send({ itemIds: items.slice(0, 1).map((item) => item._id) });
     expect(bounded.status).toBe(200);
     expect(bounded.body.meta).toEqual(
@@ -521,6 +528,7 @@ describe('production hardening regressions', () => {
     const oversized = await request
       .post('/api/items/reconciliation/suggestions')
       .set('Authorization', `Bearer ${owner.token}`)
+      .set('Idempotency-Key', 'oversized-menu-review')
       .send({ itemIds: items.map((item) => item._id) });
     expect(oversized.status).toBe(400);
     expect(oversized.body.message).toMatch(/maximum of 10/i);

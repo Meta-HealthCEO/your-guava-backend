@@ -3,6 +3,7 @@ const Forecast = require('../models/Forecast.model');
 const Transaction = require('../models/Transaction.model');
 const Cafe = require('../models/Cafe.model');
 const { getForecastSettings, eventImpactPct } = require('../services/forecastFactors.service');
+const { clearApiCache } = require('../middleware/cache.middleware');
 
 const DEFAULT_TIMEZONE = 'Africa/Johannesburg';
 const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -88,6 +89,7 @@ const invalidatePlanningForecastsFrom = async (cafeId, date) => {
   if (start < today) start.setTime(today.getTime());
 
   await Forecast.deleteMany({ cafeId, date: { $gte: start } });
+  clearApiCache();
 };
 
 const parseImpactPct = (impactPct) => {

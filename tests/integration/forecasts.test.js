@@ -477,6 +477,18 @@ describe('Forecasts API', () => {
       expect(res.body.meta.overallRevenueAccuracy).toEqual(expect.any(Number));
       expect(res.body.meta.avgDailyRevenueAccuracy).toEqual(expect.any(Number));
       expect(res.body.meta.avgRevenueAccuracy).toBe(res.body.meta.avgDailyRevenueAccuracy);
+      expect(res.body.meta.liveAccuracy).toEqual(expect.objectContaining({
+        rowCount: 0,
+        overallRevenueAccuracy: null,
+      }));
+      expect(res.body.meta.backtestAccuracy).toEqual(expect.objectContaining({
+        rowCount: 1,
+        overallRevenueAccuracy: expect.any(Number),
+      }));
+      expect(res.body.meta.combinedAccuracy).toEqual(expect.objectContaining({
+        rowCount: 1,
+        overallRevenueAccuracy: res.body.meta.overallRevenueAccuracy,
+      }));
       expect(res.body.pagination).toEqual(
         expect.objectContaining({ total: 1, page: 1, limit: 30, pages: 1 })
       );
@@ -552,6 +564,15 @@ describe('Forecasts API', () => {
       expect(res.body.meta.totalRows).toBe(5);
       expect(res.body.meta.totalPredictedRevenue).toBe(500);
       expect(res.body.meta.totalActualRevenue).toBe(600);
+      expect(res.body.meta.liveAccuracy).toEqual(expect.objectContaining({
+        rowCount: 5,
+        totalPredictedRevenue: 500,
+        totalActualRevenue: 600,
+      }));
+      expect(res.body.meta.backtestAccuracy).toEqual(expect.objectContaining({
+        rowCount: 0,
+        overallRevenueAccuracy: null,
+      }));
     });
 
     it('returns quickly with pending metadata when history needs backfill', async () => {
@@ -582,7 +603,8 @@ describe('Forecasts API', () => {
       expect(res.body.meta.totalTradingDays).toBe(1);
       expect(res.body.meta.pendingDays).toBe(1);
       expect(res.body.meta.isPartial).toBe(true);
-      expect(res.body.meta.backfill.status).toBe('running');
+      expect(res.body.meta.backfill.status).toBe('pending');
+      expect(res.body.meta.backfill.resumable).toBe(true);
       expect(res.body.meta.overallRevenueAccuracy).toBeNull();
       expect(res.body.meta.avgDailyRevenueAccuracy).toBeNull();
     });

@@ -10,6 +10,7 @@ const {
   safeTimezone,
   zonedDayStart,
   addZonedDays,
+  zonedDateKey,
   zonedDayOrdinal,
   zonedDayOfWeek,
   processLocalCalendarDate,
@@ -22,11 +23,15 @@ const {
   buildItemFactors,
   multiplyFactors,
 } = require('./forecastFactors.service');
+const { getCafeTradingHours, parseTime } = require('../utils/tradingHours');
 
 const CALIBRATION_LOOKBACK_DAYS = 60;
 const MIN_OVERALL_CALIBRATION_SAMPLES = 3;
 const MIN_FACTOR_CALIBRATION_SAMPLES = 3;
 const MIN_ITEM_CALIBRATION_SAMPLES = 3;
+const MIN_HISTORY_WEEKS = 3;
+const FORECAST_MODEL_VERSION = '2026-07-30.1';
+const MAX_STORED_FORECAST_ITEMS = 25;
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
@@ -65,16 +70,24 @@ const computeForecastCalibration = async (cafeId, targetDate, timezone) => {
     cafeId,
     date: { $gte: lookbackStart, $lt: targetDate },
     actualsUpdatedAt: { $exists: true, $ne: null },
+    origin: { $ne: 'backfill' },
+    'availability.status': { $ne: 'insufficient_data' },
   })
-    .select('items')
+    .select('date items')
     .lean();
 
   const overall = { weightedRatio: 0, totalWeight: 0, sampleSize: 0 };
   const factorBuckets = new Map();
   const itemBuckets = new Map();
-  const observations = [];
+  const dailyObservations = [];
+  const itemObservations = [];
 
   for (const forecast of pastForecasts) {
+    let dailyPredicted = 0;
+    let dailyActual = 0;
+    let hasActual = false;
+    const dailyFactors = new Map();
+
     for (const item of forecast.items || []) {
       if (item.actualQty == null || !Number.isFinite(item.predictedQty) || item.predictedQty <= 0) continue;
 
@@ -82,9 +95,24 @@ const computeForecastCalibration = async (cafeId, targetDate, timezone) => {
       const weight = Math.max(item.actualQty || 0, item.predictedQty || 0, 1);
       const activeFactors = (item.factors || []).filter((factor) => factor.active && factor.key !== 'learning');
 
-      accumulateRatio(overall, ratio, weight);
-      observations.push({ ratio, weight, activeFactors, itemName: item.itemName });
+      dailyPredicted += item.predictedQty;
+      dailyActual += item.actualQty;
+      hasActual = true;
+      itemObservations.push({ ratio, weight, itemName: item.itemName });
+      for (const activeFactor of activeFactors) {
+        if (!dailyFactors.has(activeFactor.key)) dailyFactors.set(activeFactor.key, activeFactor);
+      }
+    }
 
+    if (hasActual && dailyPredicted > 0) {
+      const ratio = clamp(dailyActual / dailyPredicted, 0.25, 2);
+      const weight = Math.max(dailyActual, dailyPredicted, 1);
+      accumulateRatio(overall, ratio, weight);
+      dailyObservations.push({
+        ratio,
+        weight,
+        activeFactors: [...dailyFactors.values()],
+      });
     }
   }
 
@@ -93,7 +121,7 @@ const computeForecastCalibration = async (cafeId, targetDate, timezone) => {
     ? calibratedMultiplier(rawOverallRatio, 0.5, 0.85, 1.15)
     : 1;
 
-  for (const observation of observations) {
+  for (const observation of itemObservations) {
     const residualRatio = rawOverallRatio > 0 ? observation.ratio / rawOverallRatio : observation.ratio;
     if (observation.itemName) {
       if (!itemBuckets.has(observation.itemName)) {
@@ -102,6 +130,12 @@ const computeForecastCalibration = async (cafeId, targetDate, timezone) => {
       accumulateRatio(itemBuckets.get(observation.itemName), residualRatio, observation.weight);
     }
 
+  }
+
+  // A factor receives at most one observation per trading day. Counting every
+  // item as a separate sample would create false confidence from one outcome.
+  for (const observation of dailyObservations) {
+    const residualRatio = rawOverallRatio > 0 ? observation.ratio / rawOverallRatio : observation.ratio;
     for (const activeFactor of observation.activeFactors) {
       if (!factorBuckets.has(activeFactor.key)) {
         factorBuckets.set(activeFactor.key, {
@@ -157,11 +191,15 @@ const calibrationMultiplierForItem = (calibration, itemName, factors) => {
   const itemCalibration = (calibration.itemMultipliers || []).find((entry) => entry.itemName === itemName);
   if (itemCalibration) multiplier *= itemCalibration.multiplier;
 
-  for (const factor of factors) {
-    if (!factor.active) continue;
-    const factorCalibration = (calibration.factorMultipliers || []).find((entry) => entry.key === factor.key);
-    if (factorCalibration) multiplier *= factorCalibration.multiplier;
-  }
+  // Active factors on one day are confounded. Apply only the strongest learned
+  // residual instead of multiplying several corrections learned from the same
+  // underlying outcome.
+  const factorCalibration = factors
+    .filter((factor) => factor.active)
+    .map((factor) => (calibration.factorMultipliers || []).find((entry) => entry.key === factor.key))
+    .filter(Boolean)
+    .sort((a, b) => Math.abs(b.multiplier - 1) - Math.abs(a.multiplier - 1))[0];
+  if (factorCalibration) multiplier *= factorCalibration.multiplier;
 
   return clamp(multiplier, 0.7, 1.3);
 };
@@ -170,31 +208,43 @@ const calibrationMultiplierForItem = (calibration, itemName, factors) => {
  * Groups transactions by week bucket (most recent = bucket 0) and by item name.
  * Returns: Map<itemName, number[]> where each number is the quantity sold that week.
  */
-const groupByWeekAndItem = (transactions, targetDate, timezone) => {
+const groupByWeekAndItem = (transactions, targetDate, timezone, maxWeeks) => {
   const targetOrdinal = zonedDayOrdinal(targetDate, timezone);
 
   // Bucket index: 0 = this week, 1 = last week, etc.
   const getBucket = (txDate) => {
     const diffDays = targetOrdinal - zonedDayOrdinal(txDate, timezone);
-    return Math.floor(diffDays / 7);
+    if (diffDays <= 0) return -1;
+    return Math.floor((diffDays - 1) / 7);
   };
 
-  const itemWeekMap = new Map(); // itemName -> { bucketIndex: qty }
+  const itemWeekMap = new Map();
+  const observedBuckets = new Set();
 
   for (const tx of transactions) {
     if (!tx.items || tx.items.length === 0) continue;
     const bucket = getBucket(tx.date);
+    if (bucket < 0 || bucket >= maxWeeks) continue;
+    observedBuckets.add(bucket);
     for (const item of tx.items) {
       if (!item.name) continue;
       if (!itemWeekMap.has(item.name)) {
-        itemWeekMap.set(item.name, {});
+        itemWeekMap.set(item.name, Array(maxWeeks).fill(null));
       }
       const buckets = itemWeekMap.get(item.name);
       buckets[bucket] = (buckets[bucket] || 0) + item.quantity;
     }
   }
 
-  return itemWeekMap;
+  // An observed trading day with no sale for an item is a real zero. A bucket
+  // with no transactions at all remains null (missing data), not zero.
+  for (const buckets of itemWeekMap.values()) {
+    for (const bucket of observedBuckets) {
+      if (buckets[bucket] == null) buckets[bucket] = 0;
+    }
+  }
+
+  return { itemWeekMap, observedBuckets };
 };
 
 /**
@@ -206,35 +256,36 @@ const groupByWeekAndItem = (transactions, targetDate, timezone) => {
  */
 const buildHistoryWeights = (numWeeks, historySettings) => {
   if (numWeeks === 1) return [1.0];
-  if (numWeeks === 2) return historySettings.twoWeekWeights;
+  if (numWeeks === 2) {
+    const weights = historySettings.twoWeekWeights;
+    const total = weights.reduce((sum, weight) => sum + weight, 0);
+    return weights.map((weight) => weight / total);
+  }
 
   const recentWeights = historySettings.recentWeights.slice(0, 3);
   const remainingWeight = Math.max(0, 1.0 - recentWeights.reduce((sum, weight) => sum + weight, 0));
   const olderWeeks = numWeeks - recentWeights.length;
   const olderWeightPerWeek = olderWeeks > 0 ? remainingWeight / olderWeeks : 0;
-  return Array.from({ length: numWeeks }, (_value, index) =>
+  const weights = Array.from({ length: numWeeks }, (_value, index) =>
     index < recentWeights.length ? recentWeights[index] : olderWeightPerWeek
   );
+  const total = weights.reduce((sum, weight) => sum + weight, 0);
+  return total > 0 ? weights.map((weight) => weight / total) : Array(numWeeks).fill(1 / numWeeks);
 };
 
 const weightedAverage = (buckets, historySettings) => {
-  // Use the ACTUAL populated bucket indices, sorted from most recent (smallest) to oldest.
-  const sortedKeys = Object.keys(buckets)
-    .map(Number)
-    .sort((a, b) => a - b)
-    .slice(0, historySettings.maxWeeks);
-  const numWeeks = sortedKeys.length;
-  if (numWeeks === 0) return 0;
-
-  const weights = buildHistoryWeights(numWeeks, historySettings);
-
-  let total = 0;
-  for (let i = 0; i < numWeeks; i++) {
-    const bucketKey = sortedKeys[i];
-    const qty = buckets[bucketKey] || 0;
-    total += qty * weights[i];
-  }
-  return total;
+  const window = Array.isArray(buckets)
+    ? buckets.slice(0, historySettings.maxWeeks)
+    : Array.from({ length: historySettings.maxWeeks }, (_, index) => buckets[index] ?? null);
+  const weights = buildHistoryWeights(window.length, historySettings);
+  let weightedTotal = 0;
+  let observedWeight = 0;
+  window.forEach((qty, index) => {
+    if (qty == null) return;
+    weightedTotal += qty * weights[index];
+    observedWeight += weights[index];
+  });
+  return observedWeight > 0 ? weightedTotal / observedWeight : 0;
 };
 
 const buildHistoricalPriceMap = (transactions) => {
@@ -364,6 +415,64 @@ const computeSuggestedStockMap = async (
   );
 };
 
+const getTradingAvailability = (cafe, events, dayOfWeek) => {
+  const schedule = getCafeTradingHours(cafe).find((entry) => entry.dayOfWeek === dayOfWeek);
+  if (!schedule?.isOpen) {
+    return { status: 'closed', multiplier: 0, reason: 'Cafe is closed in its trading hours' };
+  }
+
+  const fullClosure = (events || []).find((event) => event.type === 'closure');
+  if (fullClosure) {
+    return { status: 'closed', multiplier: 0, reason: fullClosure.name || 'Cafe closure' };
+  }
+
+  const openMinutes = parseTime(schedule.openTime);
+  const closeMinutes = parseTime(schedule.closeTime);
+  const scheduledMinutes = closeMinutes != null && openMinutes != null ? closeMinutes - openMinutes : 0;
+  if (scheduledMinutes <= 0) {
+    return { status: 'closed', multiplier: 0, reason: 'Cafe has no valid trading window' };
+  }
+
+  const closureIntervals = (events || [])
+    .filter((entry) => entry.type === 'partial_closure')
+    .map((event) => {
+      const start = parseTime(event.closureWindow?.startTime);
+      const end = parseTime(event.closureWindow?.endTime);
+      if (start == null || end == null || end <= start) return null;
+      const clippedStart = Math.max(openMinutes, start);
+      const clippedEnd = Math.min(closeMinutes, end);
+      return clippedEnd > clippedStart ? [clippedStart, clippedEnd] : null;
+    })
+    .filter(Boolean)
+    .sort((left, right) => left[0] - right[0]);
+
+  let closedMinutes = 0;
+  let activeInterval = null;
+  for (const interval of closureIntervals) {
+    if (!activeInterval) {
+      activeInterval = interval;
+      continue;
+    }
+    if (interval[0] <= activeInterval[1]) {
+      activeInterval[1] = Math.max(activeInterval[1], interval[1]);
+      continue;
+    }
+    closedMinutes += activeInterval[1] - activeInterval[0];
+    activeInterval = interval;
+  }
+  if (activeInterval) closedMinutes += activeInterval[1] - activeInterval[0];
+
+  const multiplier = clamp(1 - Math.min(scheduledMinutes, closedMinutes) / scheduledMinutes, 0, 1);
+  if (multiplier < 1) {
+    return {
+      status: multiplier === 0 ? 'closed' : 'ready',
+      multiplier,
+      reason: multiplier === 0 ? 'Partial closures cover the full trading day' : 'Reduced trading hours',
+    };
+  }
+  return { status: 'ready', multiplier: 1, reason: '' };
+};
+
 /**
  * Generates a sales forecast for a cafe on a specific target date.
  *
@@ -371,7 +480,7 @@ const computeSuggestedStockMap = async (
  * @param {Date|string} targetDate
  * @returns {Promise<Forecast>}
  */
-const generateForecast = async (cafeId, targetDate) => {
+const generateForecast = async (cafeId, targetDate, options = {}) => {
   const cafe = await Cafe.findById(cafeId).lean();
   if (!cafe) {
     const error = new Error('Cafe not found');
@@ -403,11 +512,6 @@ const generateForecast = async (cafeId, targetDate) => {
     historyDates.length > 0 ? new Date(Math.min(...historyDates.map((date) => date.getTime()))) : undefined;
   const lastTransactionDate =
     historyDates.length > 0 ? new Date(Math.max(...historyDates.map((date) => date.getTime()))) : undefined;
-  const weeksWithSales = new Set(
-    historyDates.map((date) => Math.floor(
-      (zonedDayOrdinal(target, timezone) - zonedDayOrdinal(date, timezone)) / 7
-    ))
-  ).size;
   const staleDays =
     lastTransactionDate != null
       ? Math.max(0, zonedDayOrdinal(target, timezone) - zonedDayOrdinal(lastTransactionDate, timezone))
@@ -432,25 +536,46 @@ const generateForecast = async (cafeId, targetDate) => {
     Event.find({ cafeId, date: { $gte: target, $lt: nextTarget } }).lean(),
   ]);
   const weatherSignal = weather || unavailableWeatherSignal('Cafe coordinates are not configured');
+  const trading = getTradingAvailability(cafe, events, targetDayOfWeek);
 
   // Group transactions by week and item
-  const itemWeekMap = groupByWeekAndItem(transactions, target, timezone);
+  const { itemWeekMap, observedBuckets } = groupByWeekAndItem(
+    transactions,
+    target,
+    timezone,
+    settings.history.maxWeeks
+  );
+  const observedWeeks = observedBuckets.size;
+  const missingWeeks = Math.max(0, settings.history.maxWeeks - observedWeeks);
   const historicalPriceMap = buildHistoricalPriceMap(transactions);
 
-  // Get top 15 items by total historical frequency
+  // Forecast every observed item so revenue and accuracy include the long tail.
+  // The portal limits visual lists, but the model must not silently omit sales.
   const itemTotals = [];
   for (const [name, buckets] of itemWeekMap.entries()) {
     const total = Object.values(buckets).reduce((s, v) => s + v, 0);
     itemTotals.push({ name, total });
   }
   itemTotals.sort((a, b) => b.total - a.total);
-  const topItems = itemTotals.slice(0, 15).map((i) => i.name);
+  const forecastItemNames = itemTotals.map((i) => i.name);
 
   // Fetch item categories
-  const itemDocs = await Item.find({ cafeId, name: { $in: topItems } }).lean();
+  const itemDocs = await Item.find({ cafeId, name: { $in: forecastItemNames } }).lean();
   const categoryMap = new Map(itemDocs.map((i) => [i.name, i.category]));
+  const itemDocMap = new Map(itemDocs.map((item) => [item.name, item]));
 
   const forecastFactors = buildGlobalFactors({ signals, weather: weatherSignal, events, settings });
+  const tradingFactor = {
+    key: 'tradingHours',
+    label: 'Trading hours',
+    active: trading.multiplier !== 1,
+    adjustmentPct: Number(((trading.multiplier - 1) * 100).toFixed(2)),
+    multiplier: trading.multiplier,
+    effect: trading.multiplier === 1
+      ? 'no effect'
+      : `${Number(((trading.multiplier - 1) * 100).toFixed(1))}%`,
+    reason: trading.reason,
+  };
   const calibration = learningEnabled
     ? await computeForecastCalibration(cafeId, target, timezone)
     : {
@@ -469,13 +594,14 @@ const generateForecast = async (cafeId, targetDate) => {
       reason: 'Learning correction is available on the Pro plan',
     }
   );
-  const storedForecastFactors = [...forecastFactors, globalLearningFactor];
+  const storedForecastFactors = [...forecastFactors, tradingFactor, globalLearningFactor];
   const forecastItems = [];
   const predictedQtyByItem = new Map();
   let totalPredictedRevenue = 0;
+  let totalPredictedQty = 0;
 
-  for (const name of topItems) {
-    const buckets = itemWeekMap.get(name) || {};
+  for (const [itemIndex, name] of forecastItemNames.entries()) {
+    const buckets = itemWeekMap.get(name) || Array(settings.history.maxWeeks).fill(null);
     const baseQty = weightedAverage(buckets, settings.history);
     const category = categoryMap.get(name) || 'other';
     const factors = buildItemFactors({ category, signals, weather: weatherSignal, events, settings });
@@ -489,20 +615,26 @@ const generateForecast = async (cafeId, targetDate) => {
       }
     );
     const storedItemFactors = [...factors, learningFactor];
-    const finalQty = Math.round(baseQty * multiplyFactors(factors) * learningMultiplier);
+    const finalQty = Math.max(
+      0,
+      Math.round(baseQty * multiplyFactors(factors) * learningMultiplier * trading.multiplier)
+    );
 
     // Estimate revenue using item avgPrice if available
-    const itemDoc = itemDocs.find((d) => d.name === name);
+    const itemDoc = itemDocMap.get(name);
     const avgPrice = itemDoc?.avgPrice || historicalPriceMap.get(name) || 0;
     totalPredictedRevenue += finalQty * avgPrice;
+    totalPredictedQty += finalQty;
 
-    forecastItems.push({
-      itemName: name,
-      baseQty: parseFloat(baseQty.toFixed(2)),
-      predictedQty: finalQty,
-      factors: storedItemFactors,
-    });
-    predictedQtyByItem.set(name, finalQty);
+    if (itemIndex < MAX_STORED_FORECAST_ITEMS) {
+      forecastItems.push({
+        itemName: name,
+        baseQty: parseFloat(baseQty.toFixed(2)),
+        predictedQty: finalQty,
+        factors: storedItemFactors,
+      });
+      predictedQtyByItem.set(name, finalQty);
+    }
   }
 
   const suggestedStockByItem = await computeSuggestedStockMap(
@@ -521,13 +653,35 @@ const generateForecast = async (cafeId, targetDate) => {
     cafeId,
     date: { $gte: target, $lt: nextTarget },
   }).select('_id').lean();
+  const dateKey = zonedDateKey(target, timezone);
+  const origin = ['live', 'backfill', 'manual'].includes(options.origin)
+    ? options.origin
+    : 'live';
+  const availabilityStatus = trading.status === 'closed'
+    ? 'closed'
+    : observedWeeks < MIN_HISTORY_WEEKS
+      ? 'insufficient_data'
+      : 'ready';
+  const availabilityReason = availabilityStatus === 'closed'
+    ? trading.reason
+    : availabilityStatus === 'insufficient_data'
+      ? `At least ${MIN_HISTORY_WEEKS} observed matching trading days are required; ${observedWeeks} available`
+      : '';
   const forecast = await Forecast.findOneAndUpdate(
     existingForecast ? { _id: existingForecast._id } : { cafeId, date: target },
     {
       $set: {
         cafeId,
         date: target,
+        dateKey,
         generatedAt: new Date(),
+        origin,
+        modelVersion: FORECAST_MODEL_VERSION,
+        trainingCutoff: target,
+        availability: {
+          status: availabilityStatus,
+          reason: availabilityReason,
+        },
         items: forecastItems,
         signals: {
           weather: {
@@ -547,18 +701,33 @@ const generateForecast = async (cafeId, targetDate) => {
           isSchoolHoliday: signals.isSchoolHoliday,
           isPayday: signals.isPayday,
           dayOfWeek: targetDayOfWeek,
-          events: events.map((e) => ({ name: e.name, impact: e.impact, impactPct: e.impactPct })),
+          events: events.map((e) => ({
+            name: e.name,
+            type: e.type,
+            impact: e.impact,
+            impactPct: e.impactPct,
+            closureWindow: e.closureWindow,
+          })),
         },
         factors: storedForecastFactors,
         factorSettings: settings,
         factorEntitlements: entitlements,
         calibration,
         totalPredictedRevenue: parseFloat(totalPredictedRevenue.toFixed(2)),
+        forecastCoverage: {
+          itemCount: forecastItemNames.length,
+          storedItemCount: forecastItems.length,
+          totalPredictedQty,
+          includesAllRevenue: true,
+          accuracyMethod: 'aggregate_quantity',
+        },
         trainingData: {
           transactionCount: transactions.length,
           firstTransactionDate,
           lastTransactionDate,
-          weeksWithSales,
+          weeksWithSales: observedWeeks,
+          observedWeeks,
+          missingWeeks,
           staleDays,
         },
       },
@@ -597,7 +766,7 @@ const generateWeekForecast = async (cafeId) => {
 
   // Resilient: a transient failure on one day must not lose the whole week.
   const results = await Promise.allSettled(
-    targetDates.map((targetDate) => generateForecast(cafeId, targetDate))
+    targetDates.map((targetDate) => generateForecast(cafeId, targetDate, { origin: 'live' }))
   );
   return results
     .filter((result) => result.status === 'fulfilled')
@@ -606,7 +775,7 @@ const generateWeekForecast = async (cafeId) => {
 
 /**
  * Pulls actual transactions for a given date and updates forecast accuracy.
- * Accuracy = 1 - MAE/mean(actuals), expressed as a percentage.
+ * Accuracy is the bounded relative error between total predicted and sold units.
  *
  * @param {string|ObjectId} cafeId
  * @param {Date|string} date
@@ -663,17 +832,24 @@ const updateForecastActuals = async (cafeId, date, options = {}) => {
     }
   }
 
-  // Update actualQty on each forecast item
-  let totalAbsError = 0;
+  // Update actualQty on each displayed forecast item. Overall accuracy uses
+  // aggregate quantity across every predicted and sold item, including the
+  // long tail that is intentionally omitted from the bounded detail payload.
   let totalActual = 0;
 
   for (const fi of forecast.items) {
     fi.actualQty = actualMap.get(fi.itemName) || 0;
-    totalAbsError += Math.abs(fi.predictedQty - fi.actualQty);
-    totalActual += fi.actualQty;
   }
 
-  // MAPE-style accuracy: clamp between 0 and 100
+  for (const actualQty of actualMap.values()) totalActual += actualQty;
+  const hasCompleteCoverage = forecast.forecastCoverage?.includesAllRevenue === true &&
+    Number.isFinite(forecast.forecastCoverage?.totalPredictedQty);
+  const totalPredicted = hasCompleteCoverage
+    ? forecast.forecastCoverage.totalPredictedQty
+    : forecast.items.reduce((sum, item) => sum + (Number(item.predictedQty) || 0), 0);
+  const totalAbsError = Math.abs(totalPredicted - totalActual);
+
+  // Aggregate relative accuracy, clamped between 0 and 100.
   const accuracy =
     totalActual > 0
       ? Math.max(0, Math.min(100, (1 - totalAbsError / totalActual) * 100))
@@ -688,8 +864,66 @@ const updateForecastActuals = async (cafeId, date, options = {}) => {
   return forecast;
 };
 
+const refreshHistoricalActualsAfterMenuChange = async (cafeId, timezone) => {
+  const today = zonedDayStart(new Date(), timezone);
+  const historical = await Forecast.find({
+    cafeId,
+    date: { $lt: today },
+    actualsUpdatedAt: { $exists: true, $ne: null },
+  })
+    .select('date')
+    .sort({ date: -1 })
+    .limit(366)
+    .lean();
+  for (const forecast of historical) {
+    await updateForecastActuals(cafeId, forecast.date, { timezone });
+  }
+};
+
+const invalidateFutureForecastsAfterMenuChange = async (cafeId) => {
+  const cafe = await Cafe.findById(cafeId).select('timezone').lean();
+  if (!cafe) return null;
+  const timezone = safeTimezone(cafe.timezone);
+  const today = zonedDayStart(new Date(), timezone);
+  await Forecast.deleteMany({ cafeId, date: { $gte: today } });
+  return timezone;
+};
+
+const refreshForecastsAfterMenuChange = async (cafeId) => {
+  const timezone = await invalidateFutureForecastsAfterMenuChange(cafeId);
+  if (!timezone) return;
+  await refreshHistoricalActualsAfterMenuChange(cafeId, timezone);
+};
+
+const scheduleForecastRefreshAfterMenuChange = async (cafeId) => {
+  // Future plans are invalidated before the mutation response is returned.
+  // Historical actual recomputation is bounded and may finish asynchronously.
+  const timezone = await invalidateFutureForecastsAfterMenuChange(cafeId);
+  if (!timezone) return;
+  if (process.env.NODE_ENV === 'test') {
+    await refreshHistoricalActualsAfterMenuChange(cafeId, timezone);
+    return;
+  }
+  setImmediate(() => {
+    refreshHistoricalActualsAfterMenuChange(cafeId, timezone).catch((error) => {
+      console.error('[forecasts] menu-change refresh failed:', error.message);
+    });
+  });
+};
+
 module.exports = {
+  FORECAST_MODEL_VERSION,
+  MIN_HISTORY_WEEKS,
+  MAX_STORED_FORECAST_ITEMS,
   generateForecast,
   generateWeekForecast,
   updateForecastActuals,
+  refreshForecastsAfterMenuChange,
+  scheduleForecastRefreshAfterMenuChange,
+  _test: {
+    buildHistoryWeights,
+    groupByWeekAndItem,
+    weightedAverage,
+    getTradingAvailability,
+  },
 };

@@ -1,5 +1,6 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth.middleware');
+const { ownerOnly } = require('../middleware/rbac.middleware');
 const {
   list,
   getAuthUrl,
@@ -13,9 +14,9 @@ const router = express.Router();
 router.use(authMiddleware);
 
 router.get('/', list);
-router.get('/:provider/auth', getAuthUrl);
-router.post('/:provider/callback', callback);
-router.post('/:provider/sync', sync);
-router.post('/:provider/disconnect', disconnect);
+router.get('/:provider/auth', ownerOnly, getAuthUrl);
+router.post('/:provider/callback', ownerOnly, callback);
+router.post('/:provider/sync', ownerOnly, sync);
+router.post('/:provider/disconnect', ownerOnly, disconnect);
 
 module.exports = router;

@@ -4,7 +4,9 @@ const Forecast = require('../models/Forecast.model');
 const Cafe = require('../models/Cafe.model');
 const Organization = require('../models/Organization.model');
 const Transaction = require('../models/Transaction.model');
+const InsightChat = require('../models/InsightChat.model');
 const {
+  FORECAST_MODEL_VERSION,
   generateForecast,
   updateForecastActuals,
 } = require('../services/forecast.service');
@@ -32,7 +34,6 @@ const {
 
 const REQUIRED_PLANNING_FACTOR_KEYS = ['weather', 'loadShedding', 'holiday', 'payday', 'events'];
 const HISTORY_BACKFILL_BATCH_SIZE = 14;
-const historyBackfillJobs = new Set();
 
 const clampHistoryDays = (value) => {
   const parsed = Number.parseInt(value, 10);
@@ -73,16 +74,35 @@ const hasPlanningFactorPayload = (forecast) => {
   return (forecast.items || []).every((item) => Array.isArray(item.factors) && item.factors.length > 0);
 };
 
-const needsPlanningRefresh = (forecast) => {
+const needsPlanningRefresh = (forecast, timezone) => {
   if (!forecast) return true;
   if (hasMatchedActuals(forecast)) return true;
+  if (forecast.modelVersion !== FORECAST_MODEL_VERSION) return true;
+  const generatedDateKey = forecast.generatedAt
+    ? zonedDateKey(forecast.generatedAt, timezone)
+    : null;
+  if (generatedDateKey !== zonedDateKey(new Date(), timezone)) return true;
   return !hasPlanningFactorPayload(forecast);
 };
 
 const needsHistoryForecastRefresh = (forecast) => {
   if (!forecast) return true;
+  // Never rewrite an original live/manual historical snapshot. Backfills are
+  // explicitly marked and may be refreshed without corrupting live audit data.
+  if ((forecast.origin || 'live') !== 'backfill') return false;
   if (forecast.totalPredictedRevenue == null) return true;
   return !hasPlanningFactorPayload(forecast);
+};
+
+const forecastForApi = (forecast, timezone) => {
+  if (!forecast) return forecast;
+  const value = typeof forecast.toObject === 'function' ? forecast.toObject() : { ...forecast };
+  return {
+    ...value,
+    dateKey: value.dateKey || zonedDateKey(value.date, timezone),
+    origin: value.origin || 'live',
+    modelVersion: value.modelVersion || 'legacy',
+  };
 };
 
 const revenueAccuracy = (predicted, actual) => {
@@ -90,7 +110,28 @@ const revenueAccuracy = (predicted, actual) => {
   return parseFloat(Math.max(0, (1 - Math.abs(actual - predicted) / actual) * 100).toFixed(1));
 };
 
-const buildHistoryRow = (forecast, actual = {}) => {
+const summarizeHistoryAccuracy = (rows) => {
+  const accuracyRows = rows.filter((row) => row.revenueAccuracy != null);
+  const totalPredictedRevenue = rows.reduce((sum, row) => sum + row.predictedRevenue, 0);
+  const totalActualRevenue = rows.reduce((sum, row) => sum + row.actualRevenue, 0);
+  const variance = totalActualRevenue - totalPredictedRevenue;
+
+  return {
+    rowCount: rows.length,
+    overallRevenueAccuracy: revenueAccuracy(totalPredictedRevenue, totalActualRevenue),
+    avgDailyRevenueAccuracy: accuracyRows.length > 0
+      ? parseFloat((accuracyRows.reduce((sum, row) => sum + row.revenueAccuracy, 0) / accuracyRows.length).toFixed(1))
+      : null,
+    totalPredictedRevenue: parseFloat(totalPredictedRevenue.toFixed(2)),
+    totalActualRevenue: parseFloat(totalActualRevenue.toFixed(2)),
+    variance: parseFloat(variance.toFixed(2)),
+    variancePct: totalPredictedRevenue > 0
+      ? parseFloat(((variance / totalPredictedRevenue) * 100).toFixed(1))
+      : null,
+  };
+};
+
+const buildHistoryRow = (forecast, actual = {}, timezone) => {
   const predictedRevenue = Number(forecast.totalPredictedRevenue || 0);
   const actualRevenue = Number(actual.actualRevenue ?? forecast.actualRevenue ?? 0);
   const variance = parseFloat((actualRevenue - predictedRevenue).toFixed(2));
@@ -101,6 +142,10 @@ const buildHistoryRow = (forecast, actual = {}) => {
   return {
     forecastId: forecast._id,
     date: forecast.date,
+    dateKey: forecast.dateKey || zonedDateKey(forecast.date, timezone),
+    origin: forecast.origin || 'live',
+    modelVersion: forecast.modelVersion || 'legacy',
+    trainingCutoff: forecast.trainingCutoff || forecast.date,
     predictedRevenue,
     actualRevenue,
     variance,
@@ -137,37 +182,11 @@ const buildHistoryRow = (forecast, actual = {}) => {
 
 const ensureHistoryForecast = async (cafeId, date) => {
   let forecast = await Forecast.findOne({ cafeId, date });
-  if (needsHistoryForecastRefresh(forecast)) {
-    forecast = await generateForecast(cafeId, date);
+  if (!forecast || ((forecast.origin || 'live') === 'backfill' && needsHistoryForecastRefresh(forecast))) {
+    forecast = await generateForecast(cafeId, date, { origin: 'backfill' });
   }
   const updated = await updateForecastActuals(cafeId, date);
   return updated || forecast;
-};
-
-const scheduleHistoryBackfill = (cafeId, dateKeys, timezone) => {
-  if (dateKeys.length === 0 || process.env.NODE_ENV === 'test') return false;
-
-  const key = String(cafeId);
-  if (historyBackfillJobs.has(key)) return false;
-
-  const batch = dateKeys.slice(-HISTORY_BACKFILL_BATCH_SIZE).reverse();
-  historyBackfillJobs.add(key);
-
-  setImmediate(async () => {
-    try {
-      for (const dateKey of batch) {
-        try {
-          await ensureHistoryForecast(cafeId, zonedDayStart(dateKey, timezone));
-        } catch (error) {
-          console.error('[history] backfill failed for', dateKey, error.message);
-        }
-      }
-    } finally {
-      historyBackfillJobs.delete(key);
-    }
-  });
-
-  return true;
 };
 
 const getToday = async (req, res, next) => {
@@ -178,11 +197,11 @@ const getToday = async (req, res, next) => {
 
     let forecast = await Forecast.findOne({ cafeId, date: today });
 
-    if (needsPlanningRefresh(forecast)) {
-      forecast = await generateForecast(cafeId, today);
+    if (needsPlanningRefresh(forecast, timezone)) {
+      forecast = await generateForecast(cafeId, today, { origin: 'live' });
     }
 
-    return res.status(200).json({ success: true, forecast });
+    return res.status(200).json({ success: true, forecast: forecastForApi(forecast, timezone) });
   } catch (error) {
     next(error);
   }
@@ -211,21 +230,43 @@ const getWeek = async (req, res, next) => {
     const settled = await Promise.allSettled(
       targetDates.map(async (targetDate) => {
         const existingForecast = existingByDate.get(zonedDateKey(targetDate, timezone));
-        if (existingForecast && !needsPlanningRefresh(existingForecast)) {
+        if (existingForecast && !needsPlanningRefresh(existingForecast, timezone)) {
           return existingForecast;
         }
-        return generateForecast(cafeId, targetDate);
+        return generateForecast(cafeId, targetDate, { origin: 'live' });
       })
     );
     const forecasts = settled
       .filter((result) => result.status === 'fulfilled' && result.value)
-      .map((result) => result.value);
+      .map((result) => forecastForApi(result.value, timezone));
+    const failures = settled.flatMap((result, index) => (
+      result.status === 'rejected'
+        ? [{
+            dateKey: zonedDateKey(targetDates[index], timezone),
+            message: result.reason?.message || 'Forecast generation failed',
+          }]
+        : []
+    ));
+    const insufficientDays = forecasts
+      .filter((forecast) => forecast.availability?.status === 'insufficient_data')
+      .map((forecast) => forecast.dateKey);
 
     settled
       .filter((result) => result.status === 'rejected')
       .forEach((result) => console.error('[forecasts] week day generation failed:', result.reason?.message));
 
-    return res.status(200).json({ success: true, forecasts });
+    return res.status(200).json({
+      success: true,
+      forecasts,
+      meta: {
+        expectedDays: 7,
+        generatedDays: forecasts.length,
+        failedDays: failures,
+        isPartial: failures.length > 0 || forecasts.length !== 7,
+        insufficientData: insufficientDays.length > 0,
+        insufficientDays,
+      },
+    });
   } catch (error) {
     next(error);
   }
@@ -242,9 +283,12 @@ const generate = async (req, res, next) => {
 
     const timezone = await getCafeTimezone(cafeId);
     const targetDate = parseRequestedDay(date, timezone);
-    const forecast = await generateForecast(cafeId, targetDate);
+    const forecast = await generateForecast(cafeId, targetDate, { origin: 'manual' });
     clearApiCache();
-    return res.status(200).json({ success: true, forecast });
+    return res.status(200).json({
+      success: true,
+      forecast: forecastForApi(forecast, timezone),
+    });
   } catch (error) {
     next(error);
   }
@@ -307,9 +351,10 @@ const getAccuracy = async (req, res, next) => {
       date: { $gte: thirtyDaysAgo, $lt: today },
       accuracy: { $exists: true, $ne: null },
       actualsUpdatedAt: { $exists: true, $ne: null },
+      origin: { $ne: 'backfill' },
     })
       .sort({ date: -1 })
-      .select('date accuracy totalPredictedRevenue actualRevenue actualTransactionCount actualsUpdatedAt')
+      .select('date dateKey origin modelVersion accuracy totalPredictedRevenue actualRevenue actualTransactionCount actualsUpdatedAt')
       .lean();
 
     const avgAccuracy =
@@ -320,7 +365,7 @@ const getAccuracy = async (req, res, next) => {
     return res.status(200).json({
       success: true,
       avgAccuracy: avgAccuracy !== null ? parseFloat(avgAccuracy.toFixed(1)) : null,
-      forecasts,
+      forecasts: forecasts.map((forecast) => forecastForApi(forecast, timezone)),
     });
   } catch (error) {
     next(error);
@@ -417,33 +462,31 @@ const getHistory = async (req, res, next) => {
       missingDateKeys = dateKeys.filter((dateKey) => needsHistoryForecastRefresh(forecastByDate.get(dateKey)));
     }
 
-    const jobStarted =
-      req.query.backfill !== 'false' && req.query.backfill !== 'sync'
-        ? scheduleHistoryBackfill(cafeId, missingDateKeys, timezone)
-        : false;
-
     const rows = [];
     for (const dateKey of dateKeys) {
       const forecast = forecastByDate.get(dateKey);
       if (forecast && !needsHistoryForecastRefresh(forecast)) {
-        rows.push(buildHistoryRow(forecast, actualByDate.get(dateKey)));
+        rows.push(buildHistoryRow(forecast, actualByDate.get(dateKey), timezone));
       }
     }
 
     rows.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
-    const accuracyRows = rows.filter((row) => row.revenueAccuracy != null);
-    const totalPredictedRevenue = rows.reduce((sum, row) => sum + row.predictedRevenue, 0);
-    const totalActualRevenue = rows.reduce((sum, row) => sum + row.actualRevenue, 0);
-    const variance = totalActualRevenue - totalPredictedRevenue;
-    const overallRevenueAccuracy = revenueAccuracy(totalPredictedRevenue, totalActualRevenue);
-    const avgDailyRevenueAccuracy = accuracyRows.length > 0
-      ? parseFloat((accuracyRows.reduce((sum, row) => sum + row.revenueAccuracy, 0) / accuracyRows.length).toFixed(1))
-      : null;
+    const combinedAccuracy = summarizeHistoryAccuracy(rows);
+    const liveAccuracy = summarizeHistoryAccuracy(
+      rows.filter((row) => row.origin !== 'backfill')
+    );
+    const backtestAccuracy = summarizeHistoryAccuracy(
+      rows.filter((row) => row.origin === 'backfill')
+    );
     const totalRows = rows.length;
     const totalPages = Math.max(Math.ceil(totalRows / limit), 1);
     const currentPage = Math.min(page, totalPages);
     const pagedRows = rows.slice((currentPage - 1) * limit, currentPage * limit);
+
+    if (generated > 0) {
+      clearApiCache();
+    }
 
     return res.status(200).json({
       success: true,
@@ -459,19 +502,24 @@ const getHistory = async (req, res, next) => {
         pendingDays: missingDateKeys.length,
         isPartial: missingDateKeys.length > 0,
         backfill: {
-          status: missingDateKeys.length === 0 ? 'complete' : jobStarted ? 'started' : 'running',
+          status: missingDateKeys.length === 0 ? 'complete' : 'pending',
           pendingDays: missingDateKeys.length,
           batchSize: HISTORY_BACKFILL_BATCH_SIZE,
+          resumable: true,
+          nextRequest: missingDateKeys.length > 0 ? 'backfill=sync' : null,
         },
-        overallRevenueAccuracy,
-        avgDailyRevenueAccuracy,
-        avgRevenueAccuracy: avgDailyRevenueAccuracy,
-        totalPredictedRevenue: parseFloat(totalPredictedRevenue.toFixed(2)),
-        totalActualRevenue: parseFloat(totalActualRevenue.toFixed(2)),
-        variance: parseFloat(variance.toFixed(2)),
-        variancePct: totalPredictedRevenue > 0
-          ? parseFloat(((variance / totalPredictedRevenue) * 100).toFixed(1))
-          : null,
+        liveAccuracy,
+        backtestAccuracy,
+        combinedAccuracy,
+        // Preserve the original combined fields for older clients while making
+        // their mixed provenance explicit for new clients.
+        overallRevenueAccuracy: combinedAccuracy.overallRevenueAccuracy,
+        avgDailyRevenueAccuracy: combinedAccuracy.avgDailyRevenueAccuracy,
+        avgRevenueAccuracy: combinedAccuracy.avgDailyRevenueAccuracy,
+        totalPredictedRevenue: combinedAccuracy.totalPredictedRevenue,
+        totalActualRevenue: combinedAccuracy.totalActualRevenue,
+        variance: combinedAccuracy.variance,
+        variancePct: combinedAccuracy.variancePct,
       },
       pagination: {
         total: totalRows,
@@ -487,7 +535,7 @@ const getHistory = async (req, res, next) => {
 
 const getInsights = async (req, res, next) => {
   try {
-    const result = getCachedInsights(req.user.cafeId);
+    const result = await getCachedInsights(req.user.cafeId);
     return res.status(200).json({ success: true, ...result });
   } catch (error) {
     next(error);
@@ -521,17 +569,118 @@ const conversationSemanticHash = (conversation) =>
     ))
     .digest('hex');
 
-const refreshGeneratedInsights = async (req, res, next) => {
-  try {
-    const suppliedKey = String(req.get('Idempotency-Key') || '').trim();
-    if (suppliedKey.length > 160) {
-      return res.status(400).json({ success: false, message: 'Idempotency-Key is too long' });
+const persistChatExchange = async ({
+  chatId,
+  cafeId,
+  orgId,
+  userId,
+  idempotencyKey,
+  conversation,
+  result,
+}) => {
+  const userContent = Array.isArray(conversation)
+    ? [...conversation]
+      .reverse()
+      .find((message) => message?.role === 'user' && typeof message.content === 'string')
+      ?.content.trim().slice(0, 20000)
+    : '';
+  if (
+    !mongoose.Types.ObjectId.isValid(chatId) ||
+    !userContent ||
+    typeof result?.answer !== 'string' ||
+    !result.answer.trim()
+  ) {
+    return false;
+  }
+
+  const scope = {
+    _id: chatId,
+    cafeId,
+    orgId,
+    userId,
+  };
+  const assistantContent = result.answer.trim().slice(0, 20000);
+
+  // The client can save the user turn before or after the AI request. Read the
+  // current tail and use an updatedAt compare-and-swap so either ordering
+  // produces one complete user/assistant exchange without duplicate retries.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const existing = await InsightChat.findOne(scope)
+      .select('messages updatedAt +messages.requestKey')
+      .lean();
+    if (!existing) return false;
+    if (existing.messages?.some((message) => message.requestKey === idempotencyKey)) {
+      return true;
     }
+
+    const tail = existing.messages?.[existing.messages.length - 1];
+    const now = new Date();
+    const messages = [];
+    if (tail?.role !== 'user' || tail.content !== userContent) {
+      messages.push({
+        role: 'user',
+        content: userContent,
+        requestKey: idempotencyKey,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    messages.push({
+      role: 'assistant',
+      content: assistantContent,
+      requestKey: idempotencyKey,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const updated = await InsightChat.findOneAndUpdate(
+      {
+        ...scope,
+        updatedAt: existing.updatedAt,
+        messages: { $not: { $elemMatch: { requestKey: idempotencyKey } } },
+      },
+      {
+        $push: {
+          messages: {
+            $each: messages,
+            $slice: -80,
+          },
+        },
+        ...(result.contextStats && typeof result.contextStats === 'object'
+          ? { $set: { contextStats: result.contextStats } }
+          : {}),
+      },
+      { new: true, runValidators: true }
+    );
+    if (updated) return true;
+  }
+
+  // A highly contended chat can be retried by the client with the same
+  // idempotency key; the committed usage result ensures no second AI charge.
+  return false;
+};
+
+const persistChatExchangeWithoutBlockingDelivery = async (options) => {
+  try {
+    await persistChatExchange(options);
+  } catch (error) {
+    // The committed usage record contains the complete result for replay, so a
+    // transient chat-history write must not turn a delivered answer into a 500.
+    console.error('[ask-guava] chat exchange persistence failed:', error.code || error.name);
+  }
+};
+
+const refreshGeneratedInsights = async (req, res, next) => {
+  const requestAbort = abortWhenResponseCloses(res);
+  try {
+    const idempotencyKey = paidRequestIdempotencyKey(req, res);
+    if (!idempotencyKey) return;
     const { result, guavaCredits, replayed, coalesced } = await refreshInsights({
       cafeId: req.user.cafeId,
       orgId: req.user.orgId,
       userId: req.user.id,
-      idempotencyKey: suppliedKey || `insight-refresh:${req.user.id}:${req.id}`,
+      idempotencyKey,
+      signal: requestAbort.signal,
     });
     return res.status(200).json({
       success: true,
@@ -543,7 +692,10 @@ const refreshGeneratedInsights = async (req, res, next) => {
       meta: { replayed, coalesced },
     });
   } catch (error) {
+    if (requestAbort.signal.aborted || res.destroyed) return;
     next(error);
+  } finally {
+    requestAbort.dispose();
   }
 };
 
@@ -553,7 +705,7 @@ const chatInsights = async (req, res, next) => {
     const cafeId = req.user.cafeId;
     const orgId = req.user.orgId;
     const authorizedCafeIds = req.user.role === 'manager' ? req.user.cafeIds : undefined;
-    const { messages, question } = req.body;
+    const { chatId, messages, question } = req.body;
 
     const conversation = Array.isArray(messages)
       ? messages
@@ -575,11 +727,14 @@ const chatInsights = async (req, res, next) => {
     const idempotencyKey = paidRequestIdempotencyKey(req, res);
     if (!idempotencyKey) return;
 
-    const { result, guavaCredits } = await meterGuavaCredits({
+    const { result, guavaCredits, replayed } = await meterGuavaCredits({
       orgId,
       cafeId,
       userId: req.user.id,
       featureKey: 'ask_guava_chat',
+      relatedEntity: mongoose.Types.ObjectId.isValid(chatId)
+        ? { kind: 'insight_chat', id: String(chatId) }
+        : undefined,
       metadata: {
         messageCount: conversation.length,
         semanticHash: conversationSemanticHash(conversation),
@@ -594,7 +749,22 @@ const chatInsights = async (req, res, next) => {
         signal: requestAbort.signal,
       }),
     });
-    return res.status(200).json({ success: true, ...result, aiCredits: guavaCredits, guavaCredits });
+    await persistChatExchangeWithoutBlockingDelivery({
+      chatId,
+      cafeId,
+      orgId,
+      userId: req.user.id,
+      idempotencyKey,
+      conversation,
+      result,
+    });
+    return res.status(200).json({
+      success: true,
+      ...result,
+      aiCredits: guavaCredits,
+      guavaCredits,
+      meta: { replayed: Boolean(replayed) },
+    });
   } catch (error) {
     if (requestAbort.signal.aborted || res.destroyed) return;
     next(error);
@@ -606,6 +776,17 @@ const chatInsights = async (req, res, next) => {
 const writeStreamEvent = (res, event, data) => {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
+};
+
+const openSse = (res) => {
+  if (res.headersSent) return;
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders?.();
 };
 
 const abortWhenResponseCloses = (res) => {
@@ -629,7 +810,7 @@ const streamChatInsights = async (req, res, next) => {
     const cafeId = req.user.cafeId;
     const orgId = req.user.orgId;
     const authorizedCafeIds = req.user.role === 'manager' ? req.user.cafeIds : undefined;
-    const { messages, question } = req.body;
+    const { chatId, messages, question } = req.body;
 
     const conversation = Array.isArray(messages)
       ? messages
@@ -638,12 +819,7 @@ const streamChatInsights = async (req, res, next) => {
         : [];
 
     if (!process.env.ANTHROPIC_API_KEY) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache, no-transform',
-        Connection: 'keep-alive',
-        'X-Accel-Buffering': 'no',
-      });
+      openSse(res);
 
       const result = await streamBusinessChatResponse({
         cafeId,
@@ -667,11 +843,14 @@ const streamChatInsights = async (req, res, next) => {
     const idempotencyKey = paidRequestIdempotencyKey(req, res);
     if (!idempotencyKey) return;
 
-    const { result, guavaCredits } = await meterGuavaCredits({
+    const { result, guavaCredits, replayed } = await meterGuavaCredits({
       orgId,
       cafeId,
       userId: req.user.id,
       featureKey: 'ask_guava_chat',
+      relatedEntity: mongoose.Types.ObjectId.isValid(chatId)
+        ? { kind: 'insight_chat', id: String(chatId) }
+        : undefined,
       metadata: {
         messageCount: conversation.length,
         semanticHash: conversationSemanticHash(conversation),
@@ -680,12 +859,7 @@ const streamChatInsights = async (req, res, next) => {
       idempotencyKey,
       signal: requestAbort.signal,
       run: () => {
-        res.writeHead(200, {
-          'Content-Type': 'text/event-stream; charset=utf-8',
-          'Cache-Control': 'no-cache, no-transform',
-          Connection: 'keep-alive',
-          'X-Accel-Buffering': 'no',
-        });
+        openSse(res);
 
         return streamBusinessChatResponse({
           cafeId,
@@ -698,17 +872,34 @@ const streamChatInsights = async (req, res, next) => {
       },
     });
 
+    openSse(res);
+    if (replayed && result?.answer) {
+      writeStreamEvent(res, 'delta', { text: result.answer });
+    }
+    await persistChatExchangeWithoutBlockingDelivery({
+      chatId,
+      cafeId,
+      orgId,
+      userId: req.user.id,
+      idempotencyKey,
+      conversation,
+      result,
+    });
     writeStreamEvent(res, 'done', {
       generatedAt: result.generatedAt,
       contextStats: result.contextStats,
       aiCredits: guavaCredits,
       guavaCredits,
+      replayed: Boolean(replayed),
     });
     res.end();
   } catch (error) {
     if (requestAbort.signal.aborted || res.destroyed) return;
     if (res.headersSent) {
-      writeStreamEvent(res, 'error', { message: error.message || 'AI chat failed' });
+      writeStreamEvent(res, 'error', {
+        code: error.code || 'AI_CHAT_FAILED',
+        message: 'The AI analyst could not complete this request. Please retry.',
+      });
       return res.end();
     }
     return next(error);
@@ -725,11 +916,11 @@ const getTomorrow = async (req, res, next) => {
 
     let forecast = await Forecast.findOne({ cafeId, date: tomorrow });
 
-    if (needsPlanningRefresh(forecast)) {
-      forecast = await generateForecast(cafeId, tomorrow);
+    if (needsPlanningRefresh(forecast, timezone)) {
+      forecast = await generateForecast(cafeId, tomorrow, { origin: 'live' });
     }
 
-    return res.status(200).json({ success: true, forecast });
+    return res.status(200).json({ success: true, forecast: forecastForApi(forecast, timezone) });
   } catch (error) {
     next(error);
   }
@@ -754,7 +945,10 @@ const getRecent = async (req, res, next) => {
       .sort({ date: 1 })
       .lean();
 
-    return res.status(200).json({ success: true, forecasts });
+    return res.status(200).json({
+      success: true,
+      forecasts: forecasts.map((forecast) => forecastForApi(forecast, timezone)),
+    });
   } catch (error) {
     next(error);
   }

@@ -59,4 +59,28 @@ const writeLimiter = rateLimit({
   message: { success: false, message: 'You are doing that too quickly. Please slow down.' },
 });
 
-module.exports = { globalLimiter, authLimiter, refreshLimiter, inviteLimiter, writeLimiter };
+// Paid AI calls are expensive and can hold provider connections open. Bound them
+// per organization and user independently of the broad IP-based global limiter.
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  skip: isTest,
+  keyGenerator: (req) => `${req.user?.orgId || 'unknown'}:${req.user?.id || req.ip}`,
+  validate: { keyGeneratorIpFallback: false },
+  message: {
+    success: false,
+    code: 'AI_RATE_LIMITED',
+    message: 'Too many AI requests. Please wait a moment and try again.',
+  },
+});
+
+module.exports = {
+  aiLimiter,
+  globalLimiter,
+  authLimiter,
+  refreshLimiter,
+  inviteLimiter,
+  writeLimiter,
+};

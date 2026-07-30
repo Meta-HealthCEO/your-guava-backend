@@ -443,6 +443,54 @@ describe('parser.service', () => {
       ]);
     });
 
+    it('rejects conflicting receipt totals instead of guessing that they are line amounts', async () => {
+      const csv = [
+        'Receipt,Date,Time,Item,Qty,Total',
+        'R-conflict,2026-04-01,08:30,Flat White,1,35.00',
+        'R-conflict,2026-04-01,08:30,Muffin,1,25.00',
+      ].join('\n');
+      const result = await parseBuffer(Buffer.from(csv), {
+        columnMapping: {
+          receiptId: 'Receipt',
+          date: 'Date',
+          time: 'Time',
+          items: 'Item',
+          quantity: 'Qty',
+          total: 'Total',
+        },
+        itemsMode: 'line-per-row',
+      });
+
+      expect(result.rows).toHaveLength(0);
+      expect(result.rowErrors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ reason: expect.stringMatching(/conflicting receipt totals/i) }),
+      ]));
+    });
+
+    it('rejects rows that reuse a receipt ID with conflicting transaction metadata', async () => {
+      const csv = [
+        'Receipt,Date,Time,Item,Qty,Line Total',
+        'R-reused,2026-04-01,08:30,Flat White,1,35.00',
+        'R-reused,2026-04-02,08:30,Muffin,1,25.00',
+      ].join('\n');
+      const result = await parseBuffer(Buffer.from(csv), {
+        columnMapping: {
+          receiptId: 'Receipt',
+          date: 'Date',
+          time: 'Time',
+          items: 'Item',
+          quantity: 'Qty',
+          total: 'Line Total',
+        },
+        itemsMode: 'line-per-row',
+      });
+
+      expect(result.rows).toHaveLength(0);
+      expect(result.rowErrors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ reason: expect.stringMatching(/conflicting date/i) }),
+      ]));
+    });
+
     it('stops parsing when the configured row bound is exceeded', async () => {
       const previous = process.env.UPLOAD_MAX_ROWS;
       process.env.UPLOAD_MAX_ROWS = '1';

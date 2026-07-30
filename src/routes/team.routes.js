@@ -11,9 +11,11 @@ const {
   resendInvitation,
   revokeInvitation,
   listTeam,
+  listAccessAudit,
   removeMember,
   updateMemberCafes,
   updateMember,
+  transferOwnership,
   switchCafe,
   addCafe,
 } = require('../controllers/team.controller');
@@ -29,12 +31,14 @@ router.post('/switch-cafe', switchCafe);
 
 // Owner-only endpoints
 router.get('/', ownerOnly, listTeam);
+router.get('/audit-events', ownerOnly, listAccessAudit);
 router.post('/invite', ownerOnly, writeLimiter, inviteManager);
 router.post('/invitations/:invitationId/resend', ownerOnly, writeLimiter, resendInvitation);
 router.delete('/invitations/:invitationId', ownerOnly, writeLimiter, revokeInvitation);
 router.delete('/:userId', ownerOnly, removeMember);
 router.patch('/:userId', ownerOnly, updateMember);
 router.put('/:userId/cafes', ownerOnly, updateMemberCafes);
+router.post('/transfer-ownership', ownerOnly, writeLimiter, transferOwnership);
 router.post('/add-cafe', ownerOnly, addCafe);
 
 module.exports = router;

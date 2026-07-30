@@ -1,11 +1,13 @@
+const crypto = require('crypto');
 const Item = require('../models/Item.model');
 const { inferItemCategory } = require('../utils/itemCategory');
-const { meterGuavaCredits } = require('./usage.service');
+const { meterGuavaCredits, withUsageDiagnostics } = require('./usage.service');
 const { createAnthropicClient } = require('./anthropicClient.service');
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
 const MAX_AI_REVIEW_ITEMS = 10;
 const AI_REVIEW_CONCURRENCY = 2;
+const VALID_CATEGORIES = new Set(['coffee', 'food', 'cold_drink', 'water', 'retail', 'other']);
 
 const roundMoney = (value) => {
   const number = Number(value);
@@ -37,9 +39,19 @@ const cleanSuggestion = (suggestion, item, candidates = []) => {
     targetName: validTarget
       ? candidates.find((candidate) => String(candidate.item._id) === targetItemId)?.item.name
       : undefined,
-    category: suggestion?.category || item.category || inferItemCategory(item.name),
-    expectedPrice: roundMoney(suggestion?.expectedPrice) ?? fallbackPrice,
-    aliases: Array.isArray(suggestion?.aliases) ? suggestion.aliases.filter(Boolean).slice(0, 5) : [item.name].filter(Boolean),
+    category: VALID_CATEGORIES.has(suggestion?.category)
+      ? suggestion.category
+      : item.category || inferItemCategory(item.name),
+    expectedPrice: (() => {
+      const value = roundMoney(suggestion?.expectedPrice);
+      return value != null && value >= 0 && value <= 1_000_000 ? value : fallbackPrice;
+    })(),
+    aliases: Array.isArray(suggestion?.aliases)
+      ? suggestion.aliases
+        .filter((alias) => typeof alias === 'string' && alias.trim())
+        .map((alias) => alias.trim().slice(0, 200))
+        .slice(0, 5)
+      : [item.name].filter(Boolean),
     confidence,
     reason: String(suggestion?.reason || 'Suggested from menu item and POS sales patterns.').slice(0, 240),
     source: suggestion?.source || 'rules',
@@ -148,6 +160,7 @@ ${JSON.stringify(candidates.map((candidate) => ({
     score: candidate.score,
   })), null, 2)}`;
 
+  const startedAt = Date.now();
   const message = await client.messages.create({
     model: MODEL,
     max_tokens: 500,
@@ -155,7 +168,25 @@ ${JSON.stringify(candidates.map((candidate) => ({
     messages: [{ role: 'user', content: prompt }],
   });
 
-  return parseJsonObject(message.content?.[0]?.text || '');
+  const suggestion = parseJsonObject(message.content?.[0]?.text || '');
+  if (!suggestion || typeof suggestion !== 'object') {
+    const error = new Error('AI menu reviewer returned an invalid response');
+    error.statusCode = 502;
+    error.code = 'AI_INVALID_RESPONSE';
+    throw error;
+  }
+  return withUsageDiagnostics(
+    { suggestion },
+    {
+      operation: 'menu_item_ai_review',
+      model: message.model || MODEL,
+      providerRequestId: message.id,
+      inputTokens: Number(message.usage?.input_tokens) || 0,
+      outputTokens: Number(message.usage?.output_tokens) || 0,
+      stopReason: message.stop_reason,
+      latencyMs: Math.max(0, Date.now() - startedAt),
+    }
+  );
 };
 
 const suggestMenuItemReview = async (cafeId, item, candidates = [], usageContext = {}) => {
@@ -166,22 +197,42 @@ const suggestMenuItemReview = async (cafeId, item, candidates = [], usageContext
   }
 
   try {
-    const { result: ai } = await meterGuavaCredits({
+    const idempotencyKey = usageContext.idempotencyPrefix
+      ? `menu-review:${crypto
+        .createHash('sha256')
+        .update(`${usageContext.idempotencyPrefix}:${item._id}`)
+        .digest('hex')}`
+      : undefined;
+    const {
+      result: aiResult,
+      guavaCredits,
+      replayed,
+    } = await meterGuavaCredits({
       orgId: usageContext.orgId,
       cafeId,
       userId: usageContext.userId,
       featureKey: 'menu_item_ai_review',
       relatedEntity: { kind: 'item', id: String(item._id) },
       metadata: { itemName: item.name, candidateCount: candidates.length },
-      idempotencyKey: usageContext.idempotencyPrefix
-        ? `${usageContext.idempotencyPrefix}:${item._id}`
-        : undefined,
+      idempotencyKey,
       run: () => aiSuggestion(item, candidates),
     });
+    const ai = aiResult?.suggestion;
     if (!ai) return fallback;
-    return cleanSuggestion({ ...ai, source: 'ai' }, item, candidates);
-  } catch {
-    return fallback;
+    return {
+      ...cleanSuggestion({ ...ai, source: 'ai' }, item, candidates),
+      aiCreditsCharged: replayed ? 0 : 1,
+      guavaCredits,
+      replayed: Boolean(replayed),
+    };
+  } catch (error) {
+    return {
+      ...fallback,
+      aiUnavailableReason:
+        error.statusCode === 402 ? 'insufficient_credits' :
+          error.statusCode === 403 ? 'permission_required' :
+            'provider_unavailable',
+    };
   }
 };
 

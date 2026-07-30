@@ -1,5 +1,7 @@
 const supertest = require('supertest');
 const { setup, teardown, clearDB, createTestUser, createTestManager, app } = require('../setup');
+const Organization = require('../../src/models/Organization.model');
+const User = require('../../src/models/User.model');
 
 const request = supertest(app);
 
@@ -81,6 +83,70 @@ describe('Account API', () => {
     expect(res.body.account.user.name).toBe('Updated Owner');
     expect(res.body.account.organization.name).toBe('Updated Org');
     expect(res.body.account.organization.billingEmail).toBe('billing@yourguava.com');
+  });
+
+  it('redacts owner-only billing data from managers', async () => {
+    const manager = await createTestManager(ownerToken, [ownerUser.activeCafeId]);
+    const response = await request
+      .get('/api/account')
+      .set('Authorization', `Bearer ${manager.token}`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.account.user.permissions).toEqual({ canSpendCredits: false });
+    expect(response.body.account.usage.seats).toEqual(expect.objectContaining({
+      used: 2,
+      active: 2,
+      pending: 0,
+    }));
+    expect(response.body.account.organization.billingEmail).toBeUndefined();
+    expect(response.body.account.organization.paymentMethod).toBeUndefined();
+    expect(response.body.account.usage.creditLedger).toBeUndefined();
+    expect(response.body.account.plans).toEqual([]);
+
+    const paymentStatus = await request
+      .get('/api/account/payments/not-a-real-reference')
+      .set('Authorization', `Bearer ${manager.token}`);
+    expect(paymentStatus.status).toBe(403);
+  });
+
+  it('blocks a plan downgrade when current seats exceed the target allowance', async () => {
+    await Organization.updateOne(
+      { _id: ownerUser.orgId },
+      { $set: { plan: 'pro' } }
+    );
+    await User.create([
+      {
+        name: 'Manager One',
+        email: 'one@yourguava.com',
+        password: 'password123',
+        role: 'manager',
+        orgId: ownerUser.orgId,
+        cafeIds: [ownerUser.activeCafeId],
+        activeCafeId: ownerUser.activeCafeId,
+      },
+      {
+        name: 'Manager Two',
+        email: 'two@yourguava.com',
+        password: 'password123',
+        role: 'manager',
+        orgId: ownerUser.orgId,
+        cafeIds: [ownerUser.activeCafeId],
+        activeCafeId: ownerUser.activeCafeId,
+      },
+    ]);
+
+    const response = await request
+      .post('/api/account/checkout')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({ plan: 'starter', billingCycle: 'monthly' });
+    expect(response.status).toBe(409);
+    expect(response.body.code).toBe('PLAN_LIMIT_EXCEEDED');
+    expect(response.body.capacity.seats).toEqual(expect.objectContaining({
+      used: 3,
+      included: 2,
+      exceeded: true,
+    }));
+    expect((await Organization.findById(ownerUser.orgId)).plan).toBe('pro');
   });
 
   it('rejects invalid profile fields without partially updating the account', async () => {

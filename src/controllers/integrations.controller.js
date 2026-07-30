@@ -1,5 +1,9 @@
 const Cafe = require('../models/Cafe.model');
 const { encryptSecret, decryptSecret } = require('../services/secrets.service');
+const {
+  createIntegrationOAuthState,
+  consumeIntegrationOAuthState,
+} = require('../services/integrationOAuthState.service');
 
 const xeroService = require('../services/integrations/xero.service');
 const quickbooksService = require('../services/integrations/quickbooks.service');
@@ -66,10 +70,14 @@ const getAuthUrl = async (req, res, _next) => {
     const service = getService(provider);
     if (!service) return res.status(400).json({ success: false, message: 'Unknown provider' });
 
-    // Encode cafeId + provider in state so the callback can validate the origin
-    const state = Buffer.from(
-      JSON.stringify({ cafeId: req.user.cafeId, provider })
-    ).toString('base64url');
+    // Persist a short-lived, one-time, opaque state token. Binding the token to
+    // the live user, cafe and provider prevents tampering, replay and cross-cafe
+    // callback confusion.
+    const state = await createIntegrationOAuthState({
+      cafeId: req.user.cafeId,
+      userId: req.user.id,
+      provider,
+    });
 
     const url = service.buildAuthorizeUrl(state);
     return res.status(200).json({ success: true, url });
@@ -104,19 +112,24 @@ const callback = async (req, res, _next) => {
     if (!accountingIntegrationsEnabled()) return unavailable(res);
 
     const { provider } = req.params;
-    const { code, state, ...providerExtras } = req.body;
+    const { code, state, ...providerExtras } = req.body || {};
     const service = getService(provider);
     if (!service) return res.status(400).json({ success: false, message: 'Unknown provider' });
-
-    // Verify state contains this user's cafeId to prevent CSRF
-    let stateData;
-    try {
-      stateData = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
-    } catch {
-      return res.status(400).json({ success: false, message: 'Invalid state' });
+    if (typeof code !== 'string' || code.length < 1 || code.length > 4096) {
+      return res.status(400).json({ success: false, message: 'Invalid authorization code' });
     }
-    if (stateData.cafeId !== req.user.cafeId.toString()) {
-      return res.status(403).json({ success: false, message: 'State mismatch' });
+
+    const validState = await consumeIntegrationOAuthState({
+      state,
+      cafeId: req.user.cafeId,
+      userId: req.user.id,
+      provider,
+    });
+    if (!validState) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired authorization state',
+      });
     }
 
     const tokens = await service.exchangeCodeForTokens(code, providerExtras);
@@ -136,9 +149,14 @@ const callback = async (req, res, _next) => {
     await Cafe.findByIdAndUpdate(req.user.cafeId, { $set: update });
     return res.status(200).json({ success: true });
   } catch (error) {
-    return res
-      .status(500)
-      .json({ success: false, message: error.message || 'OAuth callback failed' });
+    console.error('[integrations] OAuth callback failed:', error?.message);
+    return res.status(isConfigError(error) ? 503 : 502).json({
+      success: false,
+      code: isConfigError(error) ? 'INTEGRATION_NOT_CONFIGURED' : 'OAUTH_CALLBACK_FAILED',
+      message: isConfigError(error)
+        ? error.message
+        : 'The accounting provider could not complete authorization',
+    });
   }
 };
 

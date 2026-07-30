@@ -25,6 +25,30 @@ const calibrationEntrySchema = new mongoose.Schema(
   { _id: false }
 );
 
+const forecastEventSchema = new mongoose.Schema(
+  {
+    name: { type: String },
+    type: {
+      type: String,
+      enum: ['event', 'closure', 'partial_closure'],
+      default: 'event',
+    },
+    impact: { type: String },
+    impactPct: { type: Number },
+    closureWindow: {
+      type: new mongoose.Schema(
+        {
+          startTime: { type: String },
+          endTime: { type: String },
+        },
+        { _id: false }
+      ),
+      default: undefined,
+    },
+  },
+  { _id: false }
+);
+
 const forecastSchema = new mongoose.Schema(
   {
     cafeId: {
@@ -36,9 +60,37 @@ const forecastSchema = new mongoose.Schema(
       type: Date,
       required: true,
     },
+    // Calendar date in the cafe's timezone. API consumers must use this field
+    // for labels and grouping rather than deriving a date from the UTC instant.
+    dateKey: {
+      type: String,
+      match: /^\d{4}-\d{2}-\d{2}$/,
+      index: true,
+    },
     generatedAt: {
       type: Date,
       default: Date.now,
+    },
+    origin: {
+      type: String,
+      enum: ['live', 'backfill', 'manual'],
+      default: 'live',
+      index: true,
+    },
+    modelVersion: {
+      type: String,
+      default: 'legacy',
+    },
+    trainingCutoff: {
+      type: Date,
+    },
+    availability: {
+      status: {
+        type: String,
+        enum: ['ready', 'insufficient_data', 'closed'],
+        default: 'ready',
+      },
+      reason: { type: String },
     },
     items: [
       {
@@ -68,7 +120,7 @@ const forecastSchema = new mongoose.Schema(
       isSchoolHoliday: { type: Boolean, default: false },
       isPayday: { type: Boolean, default: false },
       dayOfWeek: { type: Number },
-      events: [{ name: String, impact: String, impactPct: Number }],
+      events: [forecastEventSchema],
     },
     factors: [factorSchema],
     factorSettings: {
@@ -88,6 +140,13 @@ const forecastSchema = new mongoose.Schema(
     totalPredictedRevenue: {
       type: Number,
     },
+    forecastCoverage: {
+      itemCount: { type: Number, default: 0 },
+      storedItemCount: { type: Number, default: 0 },
+      totalPredictedQty: { type: Number, default: 0 },
+      includesAllRevenue: { type: Boolean, default: false },
+      accuracyMethod: { type: String },
+    },
     actualRevenue: {
       type: Number,
     },
@@ -105,6 +164,8 @@ const forecastSchema = new mongoose.Schema(
       firstTransactionDate: { type: Date },
       lastTransactionDate: { type: Date },
       weeksWithSales: { type: Number, default: 0 },
+      observedWeeks: { type: Number, default: 0 },
+      missingWeeks: { type: Number, default: 0 },
       staleDays: { type: Number },
     },
   },
@@ -112,6 +173,7 @@ const forecastSchema = new mongoose.Schema(
 );
 
 forecastSchema.index({ cafeId: 1, date: 1 }, { unique: true });
+forecastSchema.index({ cafeId: 1, dateKey: 1 });
 forecastSchema.index({ cafeId: 1, 'items.itemName': 1, date: -1 });
 
 module.exports = mongoose.model('Forecast', forecastSchema);

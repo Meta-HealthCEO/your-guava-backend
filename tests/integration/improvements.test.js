@@ -23,10 +23,12 @@ const validBody = (overrides = {}) => ({
 
 describe('Improvements API', () => {
   let ownerToken;
+  let ownerUser;
 
   beforeEach(async () => {
     const testUser = await createTestUser();
     ownerToken = testUser.token;
+    ownerUser = testUser.user;
   });
 
   describe('POST /api/improvements', () => {
@@ -119,6 +121,49 @@ describe('Improvements API', () => {
   });
 
   describe('GET /api/improvements', () => {
+    it('limits managers to tickets from their assigned cafes while owners see the organization', async () => {
+      const firstCafeTicket = await request
+        .post('/api/improvements')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send(validBody({ title: 'First cafe ticket' }));
+      const addedCafe = await request
+        .post('/api/team/add-cafe')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({ name: 'Second Cafe' });
+      const switched = await request
+        .post('/api/team/switch-cafe')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({ cafeId: addedCafe.body.cafe._id });
+      const secondCafeTicket = await request
+        .post('/api/improvements')
+        .set('Authorization', `Bearer ${switched.body.accessToken}`)
+        .send(validBody({ title: 'Second cafe ticket' }));
+      const manager = await createTestManager(ownerToken, [ownerUser.activeCafeId]);
+
+      const managerList = await request
+        .get('/api/improvements')
+        .set('Authorization', `Bearer ${manager.token}`);
+      expect(managerList.status).toBe(200);
+      expect(managerList.body.improvements.map((entry) => entry.title)).toEqual([
+        'First cafe ticket',
+      ]);
+      expect(managerList.body.counts.all).toBe(1);
+
+      const denied = await request
+        .get(`/api/improvements/${secondCafeTicket.body.improvement._id}`)
+        .set('Authorization', `Bearer ${manager.token}`);
+      expect(denied.status).toBe(404);
+      const allowed = await request
+        .get(`/api/improvements/${firstCafeTicket.body.improvement._id}`)
+        .set('Authorization', `Bearer ${manager.token}`);
+      expect(allowed.status).toBe(200);
+
+      const ownerList = await request
+        .get('/api/improvements')
+        .set('Authorization', `Bearer ${ownerToken}`);
+      expect(ownerList.body.improvements).toHaveLength(2);
+    });
+
     it('lists the org tickets with status counts, scoped to the org', async () => {
       await request
         .post('/api/improvements')

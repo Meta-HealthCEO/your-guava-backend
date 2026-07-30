@@ -85,7 +85,16 @@ describe('POS upload → forecast pipeline (end-to-end)', () => {
   beforeEach(async () => {
     const u = await createTestUser();
     token = u.token;
-    const cafe = await Cafe.findOne({}).select('timezone').lean();
+    // This synthetic fixture records sales on every weekday, including
+    // Sunday, so its configured operating schedule must match that premise.
+    const cafe = await Cafe.findOne({});
+    cafe.tradingHours = Array.from({ length: 7 }, (_, dayOfWeek) => ({
+      dayOfWeek,
+      isOpen: true,
+      openTime: '07:00',
+      closeTime: '17:00',
+    }));
+    await cafe.save();
     timezone = safeTimezone(cafe?.timezone);
   });
 

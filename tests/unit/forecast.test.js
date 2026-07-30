@@ -8,6 +8,7 @@ const {
   multiplyFactors,
   eventImpactPct,
 } = require('../../src/services/forecastFactors.service');
+const { _test: forecastMath } = require('../../src/services/forecast.service');
 
 describe('forecast factors', () => {
   const baseSignals = {
@@ -203,6 +204,20 @@ describe('forecast factors', () => {
     expect(eventImpactPct({ impact: 'low' }, settings.events)).toBe(DEFAULT_FORECAST_SETTINGS.events.lowPct);
   });
 
+  it('does not treat closure records as demand-uplift events', () => {
+    const settings = normalizeForecastSettings();
+    const factors = buildGlobalFactors({
+      signals: baseSignals,
+      weather: { temp: 22, condition: 'Clear', isRain: false },
+      events: [{ name: 'Maintenance', type: 'closure', impact: 'high' }],
+      settings,
+    });
+
+    expect(factors.find((factor) => factor.key === 'events')).toEqual(
+      expect.objectContaining({ active: false, multiplier: 1 })
+    );
+  });
+
   it('multiplies the active item factors into a final demand modifier', () => {
     const settings = normalizeForecastSettings({ payday: { pct: 10 } });
     const factors = buildItemFactors({
@@ -214,5 +229,86 @@ describe('forecast factors', () => {
     });
 
     expect(multiplyFactors(factors)).toBeCloseTo(1.15 * 1.10, 2);
+  });
+});
+
+describe('forecast history math', () => {
+  const history = {
+    maxWeeks: 3,
+    recentWeights: [0.35, 0.25, 0.20],
+    twoWeekWeights: [0.6, 0.4],
+  };
+
+  it('normalizes a three-week window instead of dropping twenty percent of demand', () => {
+    const weights = forecastMath.buildHistoryWeights(3, history);
+    expect(weights.reduce((sum, weight) => sum + weight, 0)).toBeCloseTo(1, 8);
+    expect(forecastMath.weightedAverage([10, 10, 10], history)).toBeCloseTo(10, 8);
+  });
+
+  it('keeps missing weeks missing while counting observed no-sale weeks as zero', () => {
+    const target = new Date('2026-07-29T22:00:00.000Z');
+    const transactions = [
+      {
+        date: new Date('2026-07-22T22:00:00.000Z'),
+        items: [{ name: 'Flat White', quantity: 2 }],
+      },
+      {
+        date: new Date('2026-07-15T22:00:00.000Z'),
+        items: [{ name: 'Muffin', quantity: 3 }],
+      },
+    ];
+    const { itemWeekMap, observedBuckets } = forecastMath.groupByWeekAndItem(
+      transactions,
+      target,
+      'Africa/Johannesburg',
+      3
+    );
+
+    expect([...observedBuckets]).toEqual([0, 1]);
+    expect(itemWeekMap.get('Flat White')).toEqual([2, 0, null]);
+    expect(itemWeekMap.get('Muffin')).toEqual([0, 3, null]);
+    expect(forecastMath.weightedAverage([10, null, 30], history)).toBeCloseTo(17.2727, 3);
+  });
+
+  it('forces full closures to zero and scales partial closures by open minutes', () => {
+    const cafe = {
+      tradingHours: Array.from({ length: 7 }, (_, dayOfWeek) => ({
+        dayOfWeek,
+        isOpen: true,
+        openTime: '08:00',
+        closeTime: '16:00',
+      })),
+    };
+    expect(forecastMath.getTradingAvailability(
+      cafe,
+      [{ name: 'Closed', type: 'closure' }],
+      4
+    )).toEqual(expect.objectContaining({ status: 'closed', multiplier: 0 }));
+    expect(forecastMath.getTradingAvailability(
+      cafe,
+      [{
+        name: 'Repairs',
+        type: 'partial_closure',
+        closureWindow: { startTime: '12:00', endTime: '16:00' },
+      }],
+      4
+    )).toEqual(expect.objectContaining({ status: 'ready', multiplier: 0.5 }));
+
+    expect(forecastMath.getTradingAvailability(
+      cafe,
+      [
+        {
+          name: 'Repairs phase one',
+          type: 'partial_closure',
+          closureWindow: { startTime: '10:00', endTime: '13:00' },
+        },
+        {
+          name: 'Repairs phase two',
+          type: 'partial_closure',
+          closureWindow: { startTime: '12:00', endTime: '14:00' },
+        },
+      ],
+      4
+    )).toEqual(expect.objectContaining({ status: 'ready', multiplier: 0.5 }));
   });
 });

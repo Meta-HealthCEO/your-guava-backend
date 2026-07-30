@@ -24,6 +24,6 @@ router.get('/', getAccount);
 router.patch('/profile', updateProfile);
 router.post('/checkout', ownerOnly, checkout);
 router.post('/ai-credits', ownerOnly, buyAiCredits);
-router.get('/payments/:reference', getPaymentStatus);
+router.get('/payments/:reference', ownerOnly, getPaymentStatus);
 
 module.exports = router;

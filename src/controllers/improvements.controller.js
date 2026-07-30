@@ -23,6 +23,21 @@ const parseEnum = (name, value, allowed) => {
   return { value };
 };
 
+const improvementAccessFilter = (req, orgId, { aggregate = false } = {}) => {
+  const normalizedOrgId = aggregate
+    ? new mongoose.Types.ObjectId(String(orgId))
+    : orgId;
+  if (req.user.role === 'owner') return { orgId: normalizedOrgId };
+
+  const cafeIds = (req.user.cafeIds || [])
+    .filter((id) => isValidId(id))
+    .map((id) => (aggregate ? new mongoose.Types.ObjectId(String(id)) : id));
+  return {
+    orgId: normalizedOrgId,
+    cafeId: { $in: cafeIds },
+  };
+};
+
 // POST /api/improvements — Log a new improvement or fix.
 const create = async (req, res, next) => {
   try {
@@ -112,7 +127,7 @@ const list = async (req, res, next) => {
     const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit, 10) || 50));
 
-    const filter = { orgId };
+    const filter = improvementAccessFilter(req, orgId);
     for (const [name, value, allowed] of [
       ['status', status, STATUSES],
       ['type', type, IMPROVEMENT_TYPES],
@@ -134,7 +149,7 @@ const list = async (req, res, next) => {
         .limit(limit)
         .lean(),
       Improvement.aggregate([
-        { $match: { orgId: new mongoose.Types.ObjectId(String(orgId)) } },
+        { $match: improvementAccessFilter(req, orgId, { aggregate: true }) },
         { $group: { _id: '$status', count: { $sum: 1 } } },
       ]),
     ]);
@@ -175,7 +190,7 @@ const getOne = async (req, res, next) => {
     }
     const improvement = await Improvement.findOne({
       _id: req.params.id,
-      orgId,
+      ...improvementAccessFilter(req, orgId),
     }).lean();
     if (!improvement) {
       return res.status(404).json({ success: false, message: 'Improvement not found' });
