@@ -1,5 +1,13 @@
 const supertest = require('supertest');
 const { setup, teardown, clearDB, createTestUser, app } = require('../setup');
+const {
+  addZonedDays,
+  getZonedDateParts,
+  safeTimezone,
+  zonedDateKey,
+  zonedDateTimeToUtc,
+  zonedDayOfWeek,
+} = require('../../src/services/parser.service');
 
 const request = supertest(app);
 
@@ -401,20 +409,22 @@ describe('Forecasts API', () => {
 
       await Organization.findByIdAndUpdate(user.orgId, { plan: 'growth' });
       const cafe = await Cafe.findOne({});
+      const timezone = safeTimezone(cafe.timezone);
 
-      const target = new Date();
-      target.setDate(target.getDate() - 1);
-      target.setHours(0, 0, 0, 0);
-      const dateKey = `${target.getFullYear()}-${String(target.getMonth() + 1).padStart(2, '0')}-${String(target.getDate()).padStart(2, '0')}`;
-      const oneWeekBefore = new Date(target);
-      oneWeekBefore.setDate(target.getDate() - 7);
-      oneWeekBefore.setHours(9, 0, 0, 0);
+      const target = addZonedDays(new Date(), -1, timezone);
+      const dateKey = zonedDateKey(target, timezone);
+      const oneWeekBeforeDay = addZonedDays(target, -7, timezone);
+      const oneWeekBefore = zonedDateTimeToUtc(
+        { ...getZonedDateParts(oneWeekBeforeDay, timezone), hour: 9, minute: 0, second: 0 },
+        timezone
+      );
+      const targetDayOfWeek = zonedDayOfWeek(target, timezone);
 
       await Transaction.create({
         cafeId: cafe._id,
         date: oneWeekBefore,
         hour: 9,
-        dayOfWeek: target.getDay(),
+        dayOfWeek: targetDayOfWeek,
         status: 'approved',
         items: [{ name: 'Flat White', quantity: 10, unitPrice: 32 }],
         total: 320,
@@ -424,7 +434,7 @@ describe('Forecasts API', () => {
         cafeId: cafe._id,
         date: target,
         hour: 10,
-        dayOfWeek: target.getDay(),
+        dayOfWeek: targetDayOfWeek,
         status: 'approved',
         items: [{ name: 'Flat White', quantity: 12, unitPrice: 32 }],
         total: 384,

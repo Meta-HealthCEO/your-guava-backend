@@ -6,6 +6,7 @@ const PaymentSession = require('../models/PaymentSession.model');
 const { addBillingCycle, getPlan, nextCreditResetDate } = require('./billingPlans.service');
 const oneGate = require('./onegate.service');
 const { bonusUsedForCredits } = require('./usage.service');
+const { safeTimezone, zonedDayStart } = require('./parser.service');
 
 const PROCESSING_LEASE_MS = 2 * 60 * 1000;
 const INITIALIZATION_LEASE_MS = 60 * 1000;
@@ -57,15 +58,16 @@ const generateReference = (kind = 'plan') => {
 };
 
 const invalidateFutureForecastsForOrg = async (orgId) => {
-  const cafes = await Cafe.find({ orgId }).select('_id').lean();
+  const cafes = await Cafe.find({ orgId }).select('_id timezone').lean();
   if (cafes.length === 0) return;
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  const now = new Date();
 
   await Forecast.deleteMany({
-    cafeId: { $in: cafes.map((cafe) => cafe._id) },
-    date: { $gte: today },
+    $or: cafes.map((cafe) => ({
+      cafeId: cafe._id,
+      date: { $gte: zonedDayStart(now, safeTimezone(cafe.timezone)) },
+    })),
   });
 };
 

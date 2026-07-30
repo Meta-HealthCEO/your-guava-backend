@@ -22,8 +22,16 @@ jest.mock('../../src/services/anthropic.service', () => ({
 
 const supertest = require('supertest');
 const { setup, teardown, clearDB, createTestUser, app } = require('../setup');
+const Cafe = require('../../src/models/Cafe.model');
 const Transaction = require('../../src/models/Transaction.model');
 const Item = require('../../src/models/Item.model');
+const {
+  addZonedDays,
+  safeTimezone,
+  zonedDateKey,
+  zonedDayOfWeek,
+  zonedDayStart,
+} = require('../../src/services/parser.service');
 
 const request = supertest(app);
 
@@ -37,26 +45,24 @@ const PRICES = { 'Flat White': 40, Cappuccino: 38, Croissant: 35 };
 // Flat Whites scale with the weekday, Cappuccinos and Croissants are flat.
 const flatWhiteQtyFor = (dayOfWeek) => 5 + dayOfWeek; // Sun=5 ... Sat=11
 
-const pad = (n) => String(n).padStart(2, '0');
-const yocoDate = (d) => `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())}`;
+const yocoDate = (date, timezone) => zonedDateKey(date, timezone).replaceAll('-', '/');
 
 /**
  * Builds a Yoco-format CSV covering the past `days` days (ending yesterday),
  * one receipt per item type per day.
  */
-const buildHistoryCsv = (days = 56) => {
+const buildHistoryCsv = (days = 56, timezone = 'Africa/Johannesburg') => {
   const header =
     'Receipt,Date,Time,Status,Payment Method,Order Number,Card Reader,Items,Note,Currency,Tip,Discount,VAT,Total (incl. tax),Fee Amount,Net Amount';
   const rows = [header];
   let receiptCounter = 1;
+  const today = zonedDayStart(new Date(), timezone);
 
   for (let daysAgo = days; daysAgo >= 1; daysAgo--) {
-    const date = new Date();
-    date.setHours(0, 0, 0, 0);
-    date.setDate(date.getDate() - daysAgo);
+    const date = addZonedDays(today, -daysAgo, timezone);
 
     const sales = [
-      ['Flat White', flatWhiteQtyFor(date.getDay())],
+      ['Flat White', flatWhiteQtyFor(zonedDayOfWeek(date, timezone))],
       ['Cappuccino', 4],
       ['Croissant', 3],
     ];
@@ -64,7 +70,7 @@ const buildHistoryCsv = (days = 56) => {
     for (const [item, qty] of sales) {
       const total = (qty * PRICES[item]).toFixed(2);
       rows.push(
-        `R-${String(receiptCounter++).padStart(6, '0')},${yocoDate(date)},09:30:00,Approved,Credit Card,#${receiptCounter},,${qty} x ${item},,ZAR,0.0,0.0,0.0,${total},0.0,${total}`
+        `R-${String(receiptCounter++).padStart(6, '0')},${yocoDate(date, timezone)},09:30:00,Approved,Credit Card,#${receiptCounter},,${qty} x ${item},,ZAR,0.0,0.0,0.0,${total},0.0,${total}`
       );
     }
   }
@@ -74,14 +80,17 @@ const buildHistoryCsv = (days = 56) => {
 
 describe('POS upload → forecast pipeline (end-to-end)', () => {
   let token;
+  let timezone;
 
   beforeEach(async () => {
     const u = await createTestUser();
     token = u.token;
+    const cafe = await Cafe.findOne({}).select('timezone').lean();
+    timezone = safeTimezone(cafe?.timezone);
   });
 
   it('ingests a Yoco export and produces working per-item predictions', async () => {
-    const csv = buildHistoryCsv(56);
+    const csv = buildHistoryCsv(56, timezone);
     const expectedRows = 56 * 3;
 
     // 1. Stage the upload — Yoco format must be auto-detected (no wizard needed)
@@ -135,7 +144,7 @@ describe('POS upload → forecast pipeline (end-to-end)', () => {
     // 6. Predictions track the historical weekday pattern.
     //    Factors (holidays etc.) can shift them, so allow a generous band.
     for (const forecast of week.body.forecasts) {
-      const forecastDay = new Date(forecast.date).getDay();
+      const forecastDay = zonedDayOfWeek(forecast.date, timezone);
       const flatWhite = forecast.items.find((i) => i.itemName === 'Flat White');
       const croissant = forecast.items.find((i) => i.itemName === 'Croissant');
 
@@ -169,7 +178,7 @@ describe('POS upload → forecast pipeline (end-to-end)', () => {
   }, 60000);
 
   it('backfills history and reports prediction-vs-actual accuracy', async () => {
-    const csv = buildHistoryCsv(56);
+    const csv = buildHistoryCsv(56, timezone);
 
     const stage = await request
       .post('/api/transactions/upload')
@@ -206,11 +215,10 @@ describe('POS upload → forecast pipeline (end-to-end)', () => {
     // Generic (non-Yoco) headers — requires the mapping wizard path
     const header = 'Sale Date,Products,Amount Due';
     const rows = [header];
+    const today = zonedDayStart(new Date(), timezone);
     for (let daysAgo = 28; daysAgo >= 1; daysAgo--) {
-      const date = new Date();
-      date.setHours(0, 0, 0, 0);
-      date.setDate(date.getDate() - daysAgo);
-      rows.push(`${yocoDate(date)},4 x Americano,140.00`);
+      const date = addZonedDays(today, -daysAgo, timezone);
+      rows.push(`${yocoDate(date, timezone)},4 x Americano,140.00`);
     }
     const csv = rows.join('\n');
 
