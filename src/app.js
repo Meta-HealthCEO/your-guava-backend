@@ -72,9 +72,14 @@ if (yocoIntegrationEnabled()) {
 app.use('/api/events', eventsRoutes);
 app.use('/api/team', teamRoutes);
 app.use('/api/analytics', analyticsRoutes);
-app.use('/api/staff', staffRoutes);
-app.use('/api/shifts', shiftsRoutes);
-app.use('/api/leave', leaveRoutes);
+const workforceEnabled =
+  process.env.NODE_ENV === 'test' ||
+  String(process.env.WORKFORCE_ENABLED || '').toLowerCase() === 'true';
+if (workforceEnabled) {
+  app.use('/api/staff', staffRoutes);
+  app.use('/api/shifts', shiftsRoutes);
+  app.use('/api/leave', leaveRoutes);
+}
 app.use('/api/uploads', uploadsRoutes);
 app.use('/api/insight-chats', insightChatsRoutes);
 app.use('/api/account', accountRoutes);

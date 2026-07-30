@@ -1,9 +1,13 @@
 const mockR2Files = new Map();
+let mockR2DeleteError = null;
 jest.mock('../../src/services/r2.service', () => ({
   uploadFile: async (buffer, key) => { mockR2Files.set(key, buffer); },
   downloadFile: async (key) => mockR2Files.get(key),
   getSignedDownloadUrl: async (key) => `https://test.r2.local/${key}`,
-  deleteFile: async (key) => { mockR2Files.delete(key); },
+  deleteFile: async (key) => {
+    if (mockR2DeleteError) throw mockR2DeleteError;
+    mockR2Files.delete(key);
+  },
   _resetClient: () => {},
 }));
 jest.mock('../../src/services/anthropic.service', () => ({
@@ -22,7 +26,11 @@ const request = supertest(app);
 
 beforeAll(setup);
 afterAll(teardown);
-afterEach(clearDB);
+afterEach(async () => {
+  mockR2DeleteError = null;
+  mockR2Files.clear();
+  await clearDB();
+});
 
 const yocoFixture = path.join(__dirname, '..', 'fixtures', 'test-transactions.csv');
 
@@ -462,6 +470,39 @@ describe('Uploads API', () => {
       expect(afterTxns).toHaveLength(4);
     });
 
+    it('rolls back the replacement when persistence fails after transactional deletion', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      const Item = require('../../src/models/Item.model');
+      const itemsBefore = await Item.find({}).sort({ _id: 1 }).lean();
+      const ingestionService = require('../../src/services/ingestion.service');
+      const persistSpy = jest.spyOn(ingestionService, 'persistParsedRows')
+        .mockRejectedValueOnce(new Error('injected persistence failure'));
+
+      const res = await request
+        .patch(`/api/uploads/${stage.body.uploadId}/mapping`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          columnMapping: { ...stage.body.columnMapping, items: 'Payment Method' },
+          itemsMode: stage.body.itemsMode,
+        });
+      persistSpy.mockRestore();
+
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(await Transaction.countDocuments({ uploadId: stage.body.uploadId })).toBe(4);
+      const upload = await Upload.findById(stage.body.uploadId).lean();
+      expect(upload.status).toBe('completed');
+      expect(upload.stats.imported).toBe(4);
+      expect(await Item.find({}).sort({ _id: 1 }).lean()).toEqual(itemsBefore);
+    });
+
     it('preserves transactions when re-map parses no valid rows', async () => {
       const stage = await request
         .post('/api/transactions/upload')
@@ -560,6 +601,51 @@ describe('Uploads API', () => {
         .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
       expect(res.status).toBe(409);
     });
+
+    it('recovers a stale parsing lease and allows retry', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      await Upload.collection.updateOne(
+        { _id: new (require('mongoose').Types.ObjectId)(stage.body.uploadId) },
+        {
+          $set: {
+            status: 'parsing',
+            updatedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+          },
+        }
+      );
+
+      const res = await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      expect(res.status).toBe(200);
+      expect(await Transaction.countDocuments({ uploadId: stage.body.uploadId })).toBe(4);
+    });
+  });
+
+  describe('abandoned pending upload cleanup', () => {
+    it('removes storage and soft-deletes expired unconfirmed uploads', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      const staged = await Upload.findById(stage.body.uploadId).lean();
+      await Upload.collection.updateOne(
+        { _id: staged._id },
+        { $set: { updatedAt: new Date(Date.now() - 2 * 60 * 60 * 1000) } }
+      );
+
+      const { cleanupAbandonedPendingUploads } = require('../../src/controllers/uploads.controller');
+      const summary = await cleanupAbandonedPendingUploads({ olderThanMs: 60 * 60 * 1000 });
+
+      expect(summary).toMatchObject({ scanned: 1, deleted: 1, failed: 0 });
+      expect(mockR2Files.has(staged.r2Key)).toBe(false);
+      expect((await Upload.findById(staged._id).lean()).status).toBe('deleted');
+    });
   });
 
   describe('DELETE /api/uploads/:id', () => {
@@ -591,6 +677,70 @@ describe('Uploads API', () => {
 
       const brownieAfter = await Item.findOne({ name: 'Brownie' }).lean();
       expect(brownieAfter.totalSold).toBe(0);
+    });
+
+    it('rolls back transaction deletion when the item rebuild fails', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+      const staged = await Upload.findById(stage.body.uploadId).lean();
+      const Item = require('../../src/models/Item.model');
+      const brownieBefore = await Item.findOne({ name: 'Brownie' }).lean();
+      expect(brownieBefore.totalSold).toBe(4);
+      const ingestionService = require('../../src/services/ingestion.service');
+      const rebuildItemsForCafe = ingestionService.rebuildItemsForCafe;
+      const rebuildSpy = jest.spyOn(ingestionService, 'rebuildItemsForCafe')
+        .mockImplementationOnce(async (...args) => {
+          await rebuildItemsForCafe(...args);
+          throw new Error('injected item rebuild failure');
+        });
+
+      const res = await request
+        .delete(`/api/uploads/${stage.body.uploadId}`)
+        .set('Authorization', `Bearer ${token}`);
+      rebuildSpy.mockRestore();
+
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(await Transaction.countDocuments({ uploadId: stage.body.uploadId })).toBe(4);
+      expect((await Upload.findById(stage.body.uploadId).lean()).status).toBe('completed');
+      expect(mockR2Files.has(staged.r2Key)).toBe(true);
+      expect((await Item.findOne({ name: 'Brownie' }).lean()).totalSold).toBe(4);
+    });
+
+    it('marks failed storage deletion for bounded background retry', async () => {
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+      const staged = await Upload.findById(stage.body.uploadId).lean();
+      mockR2DeleteError = new Error('temporary storage outage');
+
+      const res = await request
+        .delete(`/api/uploads/${stage.body.uploadId}`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      const pendingCleanup = await Upload.findById(stage.body.uploadId).lean();
+      expect(pendingCleanup.status).toBe('deleted');
+      expect(pendingCleanup.errorMessage).toMatch(/background cleanup/i);
+      expect(mockR2Files.has(staged.r2Key)).toBe(true);
+
+      mockR2DeleteError = null;
+      const { cleanupAbandonedPendingUploads } = require('../../src/controllers/uploads.controller');
+      const summary = await cleanupAbandonedPendingUploads({ limit: 10 });
+
+      expect(summary.storageRetried).toBe(1);
+      expect(mockR2Files.has(staged.r2Key)).toBe(false);
+      expect((await Upload.findById(stage.body.uploadId).lean()).errorMessage).toBeUndefined();
     });
   });
 

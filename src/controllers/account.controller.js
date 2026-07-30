@@ -1,6 +1,8 @@
+const mongoose = require('mongoose');
 const User = require('../models/User.model');
 const Cafe = require('../models/Cafe.model');
 const Organization = require('../models/Organization.model');
+const PaymentSession = require('../models/PaymentSession.model');
 const {
   getPlan,
   getPlans,
@@ -8,18 +10,27 @@ const {
   nextCreditResetDate,
 } = require('../services/billingPlans.service');
 const {
+  billingPeriodForPayment,
   createHostedPaymentSession,
   getCreditPack,
   invalidateFutureForecastsForOrg,
   reconcileOneGatePayment,
 } = require('../services/billingPayments.service');
 const {
+  billingAccessForOrganization,
+  billingRequiredError,
+  bonusUsedForCredits,
   creditSnapshot,
-  ensureFreshCreditWindow,
+  refreshCreditWindow,
   usageSummary,
 } = require('../services/usage.service');
 const oneGate = require('../services/onegate.service');
 const { clearApiCache } = require('../middleware/cache.middleware');
+
+const PROFILE_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
+const normalizedProfileText = (value) =>
+  typeof value === 'string' ? value.trim() : null;
 
 const mockBillingEnabled = () => process.env.NODE_ENV !== 'production';
 
@@ -30,6 +41,45 @@ const billingNotConfigured = (res) =>
     message: 'Card payments are not configured. Enable OneGate before accepting paid plan or credit purchases.',
   });
 
+const hostedPaymentResponse = ({ res, field, session, account, extra = {} }) => {
+  const initializationStatus = session.initializationStatus || 'ready';
+  const status = initializationStatus === 'initializing' ? 'initializing' : session.status;
+  const payment = {
+    provider: 'onegate',
+    reference: session.reference,
+    amount: session.amount,
+    currency: session.currency,
+    status,
+    ...extra,
+    ...(initializationStatus === 'ready' && session.providerPaymentKey
+      ? { paymentKey: session.providerPaymentKey }
+      : {}),
+    ...(initializationStatus === 'ready' && session.checkoutUrl
+      ? { redirectUrl: session.checkoutUrl }
+      : {}),
+  };
+
+  if (initializationStatus === 'initializing') {
+    return res.status(202).json({
+      success: true,
+      code: 'PAYMENT_SESSION_INITIALIZING',
+      [field]: payment,
+      account,
+    });
+  }
+  if (initializationStatus === 'failed') {
+    return res.status(409).json({
+      success: false,
+      code: 'PAYMENT_SESSION_INITIALIZATION_FAILED',
+      message: 'This payment session could not be initialized. Start again with a new Idempotency-Key.',
+      [field]: payment,
+      account,
+    });
+  }
+
+  return res.status(200).json({ success: true, [field]: payment, account });
+};
+
 const buildAccountPayload = async (userId) => {
   const user = await User.findById(userId).select('-password -refreshTokens').lean();
   if (!user) {
@@ -38,15 +88,12 @@ const buildAccountPayload = async (userId) => {
     throw err;
   }
 
-  const org = await Organization.findById(user.orgId);
+  const org = await refreshCreditWindow(user.orgId);
   if (!org) {
     const err = new Error('Organization not found');
     err.statusCode = 404;
     throw err;
   }
-
-  ensureFreshCreditWindow(org);
-  await org.save();
 
   const [seatCount, locationCount] = await Promise.all([
     User.countDocuments({ orgId: org._id }),
@@ -76,7 +123,12 @@ const buildAccountPayload = async (userId) => {
       billingCycle: org.billingCycle,
       billingEmail: org.billingEmail,
       paymentMethod: org.paymentMethod,
+      trialStartedAt: org.trialStartedAt,
+      trialEndsAt: org.trialEndsAt,
       subscriptionStartedAt: org.subscriptionStartedAt,
+      currentPeriodStart: org.currentPeriodStart,
+      currentPeriodEnd: org.currentPeriodEnd,
+      cancelAtPeriodEnd: org.cancelAtPeriodEnd,
       createdAt: org.createdAt,
     },
     usage: {
@@ -116,13 +168,10 @@ const getCreditBalance = async (req, res, next) => {
       orgId = user?.orgId;
     }
 
-    const org = await Organization.findById(orgId);
+    const org = await refreshCreditWindow(orgId);
     if (!org) {
       return res.status(404).json({ success: false, message: 'Organization not found' });
     }
-
-    ensureFreshCreditWindow(org);
-    await org.save();
 
     const plan = getPlan(org.plan);
     return res.status(200).json({
@@ -132,6 +181,8 @@ const getCreditBalance = async (req, res, next) => {
         plan: normalisePlanId(org.plan),
         billingStatus: org.billingStatus,
         billingCycle: org.billingCycle,
+        trialEndsAt: org.trialEndsAt,
+        currentPeriodEnd: org.currentPeriodEnd,
       },
       plan: {
         id: plan.id,
@@ -145,44 +196,89 @@ const getCreditBalance = async (req, res, next) => {
 };
 
 const updateProfile = async (req, res, next) => {
+  let session;
   try {
     const { name, organizationName, billingEmail } = req.body;
-
-    const user = await User.findById(req.user.id);
-    const org = await Organization.findById(user.orgId);
+    const changesName = hasOwn(req.body, 'name');
+    const changesOrganization = hasOwn(req.body, 'organizationName');
+    const changesBillingEmail = hasOwn(req.body, 'billingEmail');
+    if (!changesName && !changesOrganization && !changesBillingEmail) {
+      return res.status(400).json({ success: false, message: 'No supported profile fields were provided' });
+    }
 
     // Organization-level fields are owner-only; anyone can update their own name.
-    if ((organizationName || billingEmail) && user.role !== 'owner') {
+    if ((changesOrganization || changesBillingEmail) && req.user.role !== 'owner') {
       return res
         .status(403)
         .json({ success: false, message: 'Only the owner can change organization details' });
     }
 
-    if (name && name.trim().length >= 2) {
-      user.name = name.trim();
+    const cleanName = normalizedProfileText(name);
+    const cleanOrganizationName = normalizedProfileText(organizationName);
+    const cleanBillingEmail = normalizedProfileText(billingEmail)?.toLowerCase() || null;
+    if (changesName && (!cleanName || cleanName.length < 2 || cleanName.length > 120)) {
+      return res.status(400).json({ success: false, message: 'Name must be between 2 and 120 characters' });
     }
-    if (organizationName && organizationName.trim().length >= 2) {
-      org.name = organizationName.trim();
+    if (
+      changesOrganization &&
+      (!cleanOrganizationName || cleanOrganizationName.length < 2 || cleanOrganizationName.length > 120)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'Organization name must be between 2 and 120 characters',
+      });
     }
-    if (billingEmail) {
-      org.billingEmail = billingEmail.trim().toLowerCase();
+    if (
+      changesBillingEmail &&
+      (!cleanBillingEmail || cleanBillingEmail.length > 254 || !PROFILE_EMAIL_RE.test(cleanBillingEmail))
+    ) {
+      return res.status(400).json({ success: false, message: 'Enter a valid billing email address' });
     }
 
-    await Promise.all([user.save(), org.save()]);
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      const user = await User.findById(req.user.id).session(session);
+      if (!user) {
+        const error = new Error('User not found');
+        error.statusCode = 404;
+        throw error;
+      }
+      const org = await Organization.findById(user.orgId).session(session);
+      if (!org) {
+        const error = new Error('Organization not found');
+        error.statusCode = 404;
+        throw error;
+      }
+
+      if (changesName) user.name = cleanName;
+      if (changesOrganization) org.name = cleanOrganizationName;
+      if (changesBillingEmail) org.billingEmail = cleanBillingEmail;
+
+      await user.save({ session });
+      await org.save({ session });
+    });
     clearApiCache();
 
     const account = await buildAccountPayload(req.user.id);
     return res.status(200).json({ success: true, account });
   } catch (error) {
     next(error);
+  } finally {
+    if (session) await session.endSession();
   }
 };
 
 const mockCheckout = async ({ req, org, selectedPlan, billingCycle, paymentMethod }) => {
   const planChanged = org.plan !== selectedPlan.id;
+  const now = new Date();
+  const period = billingPeriodForPayment(org, billingCycle, now);
   org.plan = selectedPlan.id;
-  org.billingCycle = billingCycle === 'annual' ? 'annual' : 'monthly';
+  org.billingCycle = period.billingCycle;
   org.billingStatus = 'active';
+  org.subscriptionStartedAt = org.subscriptionStartedAt || now;
+  org.currentPeriodStart = period.currentPeriodStart;
+  org.currentPeriodEnd = period.currentPeriodEnd;
+  org.cancelAtPeriodEnd = false;
   org.mockCustomerId = org.mockCustomerId || `mock_cus_${org._id.toString().slice(-8)}`;
   org.paymentMethod = {
     brand: paymentMethod?.brand || 'visa',
@@ -190,11 +286,13 @@ const mockCheckout = async ({ req, org, selectedPlan, billingCycle, paymentMetho
     expiresAt: paymentMethod?.expiresAt || '12/30',
     provider: 'mock',
   };
+  const bonusUsed = bonusUsedForCredits(org);
   org.aiCredits = {
     included: selectedPlan.includedGuavaCredits ?? selectedPlan.includedAiCredits,
     bonus: org.aiCredits?.bonus || 0,
-    used: 0,
-    resetAt: nextCreditResetDate(),
+    bonusUsed,
+    used: bonusUsed,
+    resetAt: new Date(Math.min(nextCreditResetDate(now), period.currentPeriodEnd)),
   };
   await org.save();
 
@@ -219,6 +317,13 @@ const mockCheckout = async ({ req, org, selectedPlan, billingCycle, paymentMetho
 const checkout = async (req, res, next) => {
   try {
     const { plan, billingCycle = 'monthly', paymentMethod } = req.body;
+    const validPlanIds = new Set(getPlans().map((candidate) => candidate.id));
+    if (!validPlanIds.has(plan)) {
+      return res.status(400).json({ success: false, message: 'A valid billing plan is required' });
+    }
+    if (!['monthly', 'annual'].includes(billingCycle)) {
+      return res.status(400).json({ success: false, message: 'billingCycle must be monthly or annual' });
+    }
     const selectedPlan = getPlan(plan);
 
     const org = await Organization.findById(req.user.orgId);
@@ -236,20 +341,14 @@ const checkout = async (req, res, next) => {
         plan: selectedPlan.id,
         billingCycle: cycle,
         amount,
+        idempotencyKey: req.get('Idempotency-Key'),
       });
 
       const account = await buildAccountPayload(req.user.id);
-      return res.status(200).json({
-        success: true,
-        checkout: {
-          provider: 'onegate',
-          reference: session.reference,
-          paymentKey: session.providerPaymentKey,
-          redirectUrl: session.checkoutUrl,
-          amount: session.amount,
-          currency: session.currency,
-          status: session.status,
-        },
+      return hostedPaymentResponse({
+        res,
+        field: 'checkout',
+        session,
         account,
       });
     }
@@ -276,14 +375,21 @@ const checkout = async (req, res, next) => {
 
 const buyAiCredits = async (req, res, next) => {
   try {
-    const { credits = 250 } = req.body;
+    const { credits = 500 } = req.body;
 
     const org = await Organization.findById(req.user.orgId);
     if (!org) {
       return res.status(404).json({ success: false, message: 'Organization not found' });
     }
 
-    const pack = getCreditPack(org, credits);
+    const requestedCredits = Number(credits);
+    const availablePacks = getPlan(org.plan).creditPackOptions || [];
+    if (!availablePacks.some((option) => option.credits === requestedCredits)) {
+      return res.status(400).json({ success: false, message: 'Select a valid Guava Credit pack' });
+    }
+    const pack = getCreditPack(org, requestedCredits);
+    const billingAccess = billingAccessForOrganization(org);
+    if (!billingAccess.allowed) throw billingRequiredError(billingAccess);
 
     if (oneGate.isOneGateEnabled()) {
       const session = await createHostedPaymentSession({
@@ -292,30 +398,26 @@ const buyAiCredits = async (req, res, next) => {
         kind: 'credits',
         credits: pack.credits,
         amount: pack.price,
+        idempotencyKey: req.get('Idempotency-Key'),
       });
 
       const account = await buildAccountPayload(req.user.id);
-      return res.status(200).json({
-        success: true,
-        purchase: {
-          provider: 'onegate',
-          reference: session.reference,
-          paymentKey: session.providerPaymentKey,
-          redirectUrl: session.checkoutUrl,
-          credits: pack.credits,
-          amount: session.amount,
-          currency: session.currency,
-          status: session.status,
-        },
+      return hostedPaymentResponse({
+        res,
+        field: 'purchase',
+        session,
         account,
+        extra: { credits: pack.credits },
       });
     }
 
     if (!mockBillingEnabled()) return billingNotConfigured(res);
 
-    ensureFreshCreditWindow(org);
-    org.aiCredits.bonus = (org.aiCredits?.bonus || 0) + pack.credits;
-    await org.save();
+    await refreshCreditWindow(org._id);
+    await Organization.updateOne(
+      { _id: org._id },
+      { $inc: { 'aiCredits.bonus': pack.credits, __v: 1 } }
+    );
     clearApiCache();
 
     const account = await buildAccountPayload(req.user.id);
@@ -364,9 +466,10 @@ const handleOneGateReturn = async (req, res) => {
 
   if (reference) {
     try {
-      const session = await reconcileOneGatePayment(reference);
-      status = session.status === 'paid' ? 'paid' : session.status;
-      clearApiCache();
+      const session = await PaymentSession.findOne({ reference }).select('status').lean();
+      if (session?.status === 'paid') status = 'paid';
+      else if (['failed', 'cancelled'].includes(session?.status)) status = session.status;
+      else if (requestedResult === 'error') status = 'failed';
     } catch (_error) {
       status = requestedResult === 'error' ? 'failed' : status;
     }
@@ -378,11 +481,10 @@ const handleOneGateReturn = async (req, res) => {
 const getPaymentStatus = async (req, res, next) => {
   try {
     const { reference } = req.params;
-    const session = await reconcileOneGatePayment(reference).catch(async () => null);
-    if (!session || String(session.orgId) !== String(req.user.orgId)) {
+    const session = await PaymentSession.findOne({ reference, orgId: req.user.orgId });
+    if (!session) {
       return res.status(404).json({ success: false, message: 'Payment session not found' });
     }
-    clearApiCache();
 
     return res.status(200).json({
       success: true,
@@ -390,7 +492,8 @@ const getPaymentStatus = async (req, res, next) => {
         reference: session.reference,
         provider: session.provider,
         kind: session.kind,
-        status: session.status,
+          status: session.status,
+          initializationStatus: session.initializationStatus || 'ready',
         amount: session.amount,
         currency: session.currency,
       },

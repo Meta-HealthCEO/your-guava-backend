@@ -33,6 +33,17 @@ const refreshLimiter = rateLimit({
   message: { success: false, message: 'Too many refresh attempts, please try again later' },
 });
 
+// Public invitation tokens are high entropy, but preview/accept remain bounded
+// to prevent endpoint enumeration and password-hash resource abuse.
+const inviteLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  skip: isTest,
+  message: { success: false, message: 'Too many invitation attempts, please try again later' },
+});
+
 // Per-user limiter for authenticated write actions (e.g. logging tickets),
 // keyed by user id so one busy user can't exhaust a shared IP's budget.
 const writeLimiter = rateLimit({
@@ -48,4 +59,4 @@ const writeLimiter = rateLimit({
   message: { success: false, message: 'You are doing that too quickly. Please slow down.' },
 });
 
-module.exports = { globalLimiter, authLimiter, refreshLimiter, writeLimiter };
+module.exports = { globalLimiter, authLimiter, refreshLimiter, inviteLimiter, writeLimiter };

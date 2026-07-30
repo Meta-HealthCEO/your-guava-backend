@@ -28,6 +28,16 @@ const shiftSchema = new mongoose.Schema(
     hoursWorked: {
       type: Number,
     },
+    regularHours: {
+      type: Number,
+      min: 0,
+      default: 0,
+    },
+    overtimeHours: {
+      type: Number,
+      min: 0,
+      default: 0,
+    },
     type: {
       type: String,
       enum: ['regular', 'overtime'],

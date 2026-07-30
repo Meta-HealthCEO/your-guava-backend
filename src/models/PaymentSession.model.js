@@ -24,9 +24,31 @@ const paymentSessionSchema = new mongoose.Schema(
       enum: ['plan', 'credits'],
       required: true,
     },
+    idempotencyKey: {
+      type: String,
+      maxlength: 160,
+    },
+    requestFingerprint: {
+      type: String,
+      maxlength: 64,
+    },
+    initializationStatus: {
+      type: String,
+      enum: ['initializing', 'ready', 'failed'],
+      default: 'ready',
+      index: true,
+    },
+    initializationStartedAt: {
+      type: Date,
+    },
+    initializationAttempts: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     status: {
       type: String,
-      enum: ['pending', 'paid', 'failed', 'cancelled'],
+      enum: ['pending', 'processing', 'paid', 'failed', 'cancelled'],
       default: 'pending',
       index: true,
     },
@@ -85,8 +107,31 @@ const paymentSessionSchema = new mongoose.Schema(
     failedAt: {
       type: Date,
     },
+    processingStartedAt: {
+      type: Date,
+    },
+    fulfillmentAttempts: {
+      type: Number,
+      default: 0,
+    },
   },
   { timestamps: true }
 );
+
+paymentSessionSchema.index(
+  { provider: 1, providerTransactionId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { providerTransactionId: { $type: 'string' } },
+  }
+);
+paymentSessionSchema.index(
+  { orgId: 1, kind: 1, idempotencyKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { idempotencyKey: { $type: 'string' } },
+  }
+);
+paymentSessionSchema.index({ provider: 1, initializationStatus: 1, status: 1, updatedAt: 1 });
 
 module.exports = mongoose.model('PaymentSession', paymentSessionSchema);

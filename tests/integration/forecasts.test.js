@@ -452,7 +452,12 @@ describe('Forecasts API', () => {
       expect(row.variance).toBeCloseTo(row.actualRevenue - row.predictedRevenue, 2);
       expect(row.revenueAccuracy).toEqual(expect.any(Number));
       expect(row.transactionCount).toBe(1);
-      expect(row.weather).toEqual(expect.objectContaining({ temp: expect.any(Number), condition: expect.any(String) }));
+      expect(row.weather).toEqual(expect.objectContaining({ condition: expect.any(String) }));
+      if (row.weather.available === false) {
+        expect(row.weather.unavailableReason).toEqual(expect.any(String));
+      } else {
+        expect(row.weather.temp).toEqual(expect.any(Number));
+      }
       expect(row.signals.events).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'Local Market' })]));
       expect(row.activeFactors).toEqual(expect.arrayContaining([expect.objectContaining({ key: 'events' })]));
       expect(row.calibration).toEqual(

@@ -59,6 +59,26 @@ describe('Events API', () => {
       expect(res.body.success).toBe(false);
     });
 
+    it('rejects impossible calendar dates and reversed partial closures', async () => {
+      const badDate = await request
+        .post('/api/events')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ name: 'Impossible', date: '2026-02-30' });
+      expect(badDate.status).toBe(400);
+
+      const badClosure = await request
+        .post('/api/events')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          name: 'Bad closure',
+          date: '2026-04-15',
+          type: 'partial_closure',
+          closureWindow: { startTime: '15:00', endTime: '09:00' },
+        });
+      expect(badClosure.status).toBe(400);
+      expect(badClosure.body.message).toMatch(/after startTime/i);
+    });
+
     it('invalidates existing planning forecasts for the event date', async () => {
       const Forecast = require('../../src/models/Forecast.model');
       const target = new Date();

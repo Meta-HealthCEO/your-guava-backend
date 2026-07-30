@@ -3,8 +3,10 @@ const router = express.Router();
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const authMiddleware = require('../middleware/auth.middleware');
 const { apiCache } = require('../middleware/cache.middleware');
+const r2 = require('../services/r2.service');
 const {
   upload,
   getTransactions,
@@ -12,7 +14,9 @@ const {
   getDataStatus,
 } = require('../controllers/transactions.controller');
 
-const uploadMaxBytes = () => parseInt(process.env.UPLOAD_MAX_BYTES || '10485760', 10);
+const uploadMaxBytes = () => (
+  typeof r2.maxObjectBytes === 'function' ? r2.maxObjectBytes() : 10 * 1024 * 1024
+);
 
 // Ensure uploads directory exists
 const uploadsDir = path.join(process.cwd(), 'uploads');
@@ -26,7 +30,7 @@ const storage = multer.diskStorage({
     cb(null, uploadsDir);
   },
   filename: (_req, file, cb) => {
-    const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+    const uniqueSuffix = `${Date.now()}-${crypto.randomBytes(16).toString('hex')}`;
     const safeName = path.basename(file.originalname).replace(/[^a-zA-Z0-9._-]/g, '_');
     cb(null, `${uniqueSuffix}-${safeName}`);
   },

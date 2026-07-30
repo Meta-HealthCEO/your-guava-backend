@@ -1,5 +1,6 @@
 const supertest = require('supertest');
 const { setup, teardown, clearDB, createTestUser, createTestManager, app } = require('../setup');
+const LeaveBalance = require('../../src/models/LeaveBalance.model');
 
 const request = supertest(app);
 
@@ -69,6 +70,21 @@ describe('Leave API', () => {
         });
 
       expect(res.status).toBe(400);
+    });
+
+    it('returns 400 for an unsupported leave type', async () => {
+      const res = await request
+        .post('/api/leave')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({
+          staffId,
+          type: 'vacation',
+          startDate: '2026-04-06',
+          endDate: '2026-04-07',
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/type must be/i);
     });
   });
 
@@ -140,6 +156,28 @@ describe('Leave API', () => {
         .set('Authorization', `Bearer ${manager.token}`);
 
       expect(res.status).toBe(403);
+    });
+
+    it('allows only one concurrent approval and deducts the balance once', async () => {
+      const createRes = await request
+        .post('/api/leave')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({
+          staffId,
+          type: 'annual',
+          startDate: '2026-04-06',
+          endDate: '2026-04-10',
+        });
+      const leaveId = createRes.body.leaveRequest._id;
+
+      const responses = await Promise.all([
+        request.put(`/api/leave/${leaveId}/approve`).set('Authorization', `Bearer ${ownerToken}`),
+        request.put(`/api/leave/${leaveId}/approve`).set('Authorization', `Bearer ${ownerToken}`),
+      ]);
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
+
+      const balance = await LeaveBalance.findOne({ staffId }).lean();
+      expect(balance.annual.used).toBe(5);
     });
   });
 

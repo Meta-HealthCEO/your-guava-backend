@@ -11,6 +11,9 @@ const eventSchema = new mongoose.Schema(
     name: {
       type: String,
       required: true,
+      trim: true,
+      minlength: 2,
+      maxlength: 160,
     },
     date: {
       type: Date,
@@ -45,6 +48,7 @@ const eventSchema = new mongoose.Schema(
     },
     notes: {
       type: String,
+      maxlength: 2000,
     },
     recurring: {
       type: Boolean,

@@ -1,8 +1,66 @@
 const fs = require('fs');
 const path = require('path');
-const { parseBuffer } = require('../../src/services/parser.service');
+const zlib = require('zlib');
+const {
+  parseBuffer,
+  zonedDayStart,
+  assertSupportedFileBuffer,
+} = require('../../src/services/parser.service');
 
 const fixture = (name) => fs.readFileSync(path.join(__dirname, '..', 'fixtures', name));
+
+const buildStoredZip = (entries) => {
+  const localChunks = [];
+  const centralChunks = [];
+  let localOffset = 0;
+
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name || '[Content_Types].xml');
+    const data = Buffer.from(entry.data || 'x');
+    const flags = entry.flags || 0;
+    const compressionMethod = entry.compressionMethod || 0;
+    const compressedSize = entry.compressedSize ?? data.length;
+    const uncompressedSize = entry.uncompressedSize ?? data.length;
+    const crcData = Buffer.from(entry.crcData ?? data);
+    const crc = zlib.crc32(crcData) >>> 0;
+    const local = Buffer.alloc(30 + name.length + data.length);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(entry.versionNeeded || 20, 4);
+    local.writeUInt16LE(flags, 6);
+    local.writeUInt16LE(compressionMethod, 8);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(compressedSize, 18);
+    local.writeUInt32LE(uncompressedSize, 22);
+    local.writeUInt16LE(name.length, 26);
+    name.copy(local, 30);
+    data.copy(local, 30 + name.length);
+    localChunks.push(local);
+
+    const central = Buffer.alloc(46 + name.length);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(entry.versionNeeded || 20, 6);
+    central.writeUInt16LE(flags, 8);
+    central.writeUInt16LE(compressionMethod, 10);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(compressedSize, 20);
+    central.writeUInt32LE(uncompressedSize, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt32LE(localOffset, 42);
+    name.copy(central, 46);
+    centralChunks.push(central);
+    localOffset += local.length;
+  }
+
+  const centralDirectory = Buffer.concat(centralChunks);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralDirectory.length, 12);
+  end.writeUInt32LE(localOffset, 16);
+  return Buffer.concat([...localChunks, centralDirectory, end]);
+};
 
 describe('parser.service', () => {
   describe('packed itemsMode', () => {
@@ -46,6 +104,19 @@ describe('parser.service', () => {
       expect(result.rows[0].date.getMonth()).toBe(0);
       expect(result.rows[0].date.getDate()).toBe(31);
       expect(result.rows[0].hour).toBe(10);
+    });
+
+    it('interprets wall-clock timestamps in the cafe timezone', async () => {
+      const csv = 'Txn Number,Sale Date,Sale Time,Description,Amount\nA009,2026-04-01,23:30,Flat White,35.00';
+      const result = await parseBuffer(Buffer.from(csv), {
+        columnMapping: mapping,
+        itemsMode: 'packed',
+        timezone: 'Africa/Johannesburg',
+      });
+
+      expect(result.rows[0].date.toISOString()).toBe('2026-04-01T21:30:00.000Z');
+      expect(result.rows[0].hour).toBe(23);
+      expect(result.rows[0].dayOfWeek).toBe(3);
     });
 
     it('normalises BOM/whitespace headers and comma-decimal currency values', async () => {
@@ -310,6 +381,187 @@ describe('parser.service', () => {
         }),
       ]);
       expect(result.rows).toHaveLength(0);
+    });
+
+    it.each([
+      {
+        label: 'oversized quantities',
+        csv: 'Date,Items,Total\n2026-04-01,10001 x Foo,10',
+        reason: /quantity exceeds/i,
+      },
+      {
+        label: 'oversized monetary values',
+        csv: 'Date,Items,Total\n2026-04-01,1 x Foo,10000001',
+        reason: /amount exceeds/i,
+      },
+      {
+        label: 'missing monetary values',
+        csv: 'Date,Items,Total\n2026-04-01,1 x Foo,',
+        reason: /invalid transaction total/i,
+      },
+      {
+        label: 'scientific-notation monetary values',
+        csv: 'Date,Items,Total\n2026-04-01,1 x Foo,1e999',
+        reason: /invalid transaction total/i,
+      },
+      {
+        label: 'oversized canonical item names',
+        csv: `Date,Items,Total\n2026-04-01,1 x ${'x'.repeat(201)},10`,
+        reason: /item name exceeds/i,
+      },
+    ])('rejects $label before they can poison analytics', async ({ csv, reason }) => {
+      const result = await parseBuffer(Buffer.from(csv), {
+        columnMapping: { date: 'Date', items: 'Items', total: 'Total' },
+        itemsMode: 'packed',
+      });
+
+      expect(result.rows).toHaveLength(0);
+      expect(result.errors).toBe(1);
+      expect(result.rowErrors[0].reason).toMatch(reason);
+    });
+
+    it('rejects a grouped receipt whose line totals exceed the transaction amount bound', async () => {
+      const csv = [
+        'Receipt,Date,Item,Qty,Line Total',
+        'R-LARGE,2026-04-01,Foo,1,6000000',
+        'R-LARGE,2026-04-01,Bar,1,6000000',
+      ].join('\n');
+      const result = await parseBuffer(Buffer.from(csv), {
+        columnMapping: {
+          receiptId: 'Receipt',
+          date: 'Date',
+          items: 'Item',
+          quantity: 'Qty',
+          total: 'Line Total',
+        },
+        itemsMode: 'line-per-row',
+      });
+
+      expect(result.rows).toHaveLength(0);
+      expect(result.rowErrors).toEqual([
+        expect.objectContaining({ reason: expect.stringMatching(/transaction total exceeds/i) }),
+      ]);
+    });
+
+    it('stops parsing when the configured row bound is exceeded', async () => {
+      const previous = process.env.UPLOAD_MAX_ROWS;
+      process.env.UPLOAD_MAX_ROWS = '1';
+      const csv = 'Date,Items,Total\n2026-04-01,1 x Foo,10\n2026-04-02,1 x Bar,12';
+      try {
+        await expect(parseBuffer(Buffer.from(csv), {
+          columnMapping: { date: 'Date', items: 'Items', total: 'Total' },
+          itemsMode: 'packed',
+        })).rejects.toThrow(/row limit/i);
+      } finally {
+        if (previous == null) delete process.env.UPLOAD_MAX_ROWS;
+        else process.env.UPLOAD_MAX_ROWS = previous;
+      }
+    });
+
+    it('rejects uploads whose calendar span exceeds the configured bound', async () => {
+      const previous = process.env.UPLOAD_MAX_DATE_RANGE_DAYS;
+      process.env.UPLOAD_MAX_DATE_RANGE_DAYS = '1';
+      const csv = 'Date,Items,Total\n2026-04-01,1 x Foo,10\n2026-04-02,1 x Bar,12';
+      try {
+        await expect(parseBuffer(Buffer.from(csv), {
+          columnMapping: { date: 'Date', items: 'Items', total: 'Total' },
+          itemsMode: 'packed',
+        })).rejects.toThrow(/date range/i);
+      } finally {
+        if (previous == null) delete process.env.UPLOAD_MAX_DATE_RANGE_DAYS;
+        else process.env.UPLOAD_MAX_DATE_RANGE_DAYS = previous;
+      }
+    });
+
+    it('rejects binary content presented as CSV', async () => {
+      await expect(parseBuffer(Buffer.from([0x50, 0x4b, 0x00, 0x01]), {
+        columnMapping: { date: 'Date', items: 'Items', total: 'Total' },
+        itemsMode: 'packed',
+      })).rejects.toThrow(/binary data/i);
+    });
+
+    it('does not normalize impossible date-only boundaries', () => {
+      expect(zonedDayStart('2026-02-30', 'Africa/Johannesburg')).toBeNull();
+    });
+  });
+
+  describe('XLSX archive preflight', () => {
+    it('accepts a small, well-formed ZIP archive', () => {
+      const archive = buildStoredZip([{ name: '[Content_Types].xml', data: '<Types />' }]);
+
+      expect(() => assertSupportedFileBuffer(archive, 'xlsx')).not.toThrow();
+    });
+
+    it('rejects suspicious compression ratios before decompression', () => {
+      const archive = buildStoredZip([{
+        name: 'xl/worksheets/sheet1.xml',
+        data: 'x',
+        compressedSize: 1,
+        uncompressedSize: 500000,
+      }]);
+
+      expect(() => assertSupportedFileBuffer(archive, 'xlsx')).toThrow(/compression-ratio/i);
+    });
+
+    it('rejects deflate streams that lie about their expanded size', () => {
+      const compressed = zlib.deflateRawSync(Buffer.from('x'.repeat(5000)));
+      const archive = buildStoredZip([{
+        name: 'xl/worksheets/sheet1.xml',
+        data: compressed,
+        compressionMethod: 8,
+        uncompressedSize: 1,
+        crcData: Buffer.from('x'.repeat(5000)),
+      }]);
+
+      expect(() => assertSupportedFileBuffer(archive, 'xlsx')).toThrow(/safely decompressed/i);
+    });
+
+    it('rejects entries whose content does not match the declared CRC', () => {
+      const archive = buildStoredZip([{
+        name: 'xl/workbook.xml',
+        data: 'actual',
+        crcData: Buffer.from('different'),
+      }]);
+
+      expect(() => assertSupportedFileBuffer(archive, 'xlsx')).toThrow(/CRC checksum/i);
+    });
+
+    it('rejects encrypted archive entries', () => {
+      const archive = buildStoredZip([{
+        name: 'xl/workbook.xml',
+        data: 'x',
+        flags: 0x0001,
+      }]);
+
+      expect(() => assertSupportedFileBuffer(archive, 'xlsx')).toThrow(/unsafe ZIP features/i);
+    });
+
+    it('rejects ZIP64 end records', () => {
+      const archive = buildStoredZip([{ name: 'xl/workbook.xml', data: 'x' }]);
+      archive.writeUInt16LE(0xffff, archive.length - 12);
+
+      expect(() => assertSupportedFileBuffer(archive, 'xlsx')).toThrow(/ZIP64/i);
+    });
+
+    it('enforces the configured archive entry bound', () => {
+      const previous = process.env.XLSX_MAX_ENTRIES;
+      process.env.XLSX_MAX_ENTRIES = '1';
+      const archive = buildStoredZip([
+        { name: '[Content_Types].xml', data: 'x' },
+        { name: 'xl/workbook.xml', data: 'x' },
+      ]);
+      try {
+        expect(() => assertSupportedFileBuffer(archive, 'xlsx')).toThrow(/entry limit/i);
+      } finally {
+        if (previous == null) delete process.env.XLSX_MAX_ENTRIES;
+        else process.env.XLSX_MAX_ENTRIES = previous;
+      }
+    });
+
+    it('rejects traversal entry names even in otherwise valid archives', () => {
+      const archive = buildStoredZip([{ name: '../outside.xml', data: 'x' }]);
+
+      expect(() => assertSupportedFileBuffer(archive, 'xlsx')).toThrow(/unsafe entry name/i);
     });
   });
 });

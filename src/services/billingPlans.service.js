@@ -82,12 +82,33 @@ const getPlan = (plan) => PLAN_CONFIG[normalisePlanId(plan)];
 
 const getPlans = () => Object.values(PLAN_CONFIG);
 
-const nextCreditResetDate = () => {
-  const resetAt = new Date();
-  resetAt.setMonth(resetAt.getMonth() + 1);
-  resetAt.setDate(1);
-  resetAt.setHours(0, 0, 0, 0);
-  return resetAt;
+const startOfNextUtcMonth = (from = new Date()) => {
+  const value = new Date(from);
+  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth() + 1, 1));
 };
 
-module.exports = { PLAN_CONFIG, getPlan, getPlans, normalisePlanId, nextCreditResetDate };
+const addUtcMonthsClamped = (from, months) => {
+  const value = new Date(from);
+  const day = value.getUTCDate();
+  value.setUTCDate(1);
+  value.setUTCMonth(value.getUTCMonth() + months);
+  const lastDay = new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth() + 1, 0)).getUTCDate();
+  value.setUTCDate(Math.min(day, lastDay));
+  return value;
+};
+
+const addBillingCycle = (from, billingCycle = 'monthly') =>
+  addUtcMonthsClamped(from, billingCycle === 'annual' ? 12 : 1);
+
+const nextCreditResetDate = (from = new Date()) => startOfNextUtcMonth(from);
+
+module.exports = {
+  PLAN_CONFIG,
+  addBillingCycle,
+  addUtcMonthsClamped,
+  getPlan,
+  getPlans,
+  normalisePlanId,
+  nextCreditResetDate,
+  startOfNextUtcMonth,
+};

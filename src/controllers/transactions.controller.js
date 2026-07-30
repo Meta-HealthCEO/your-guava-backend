@@ -7,19 +7,27 @@ const Cafe = require('../models/Cafe.model');
 const Upload = require('../models/Upload.model');
 const r2 = require('../services/r2.service');
 const ingestion = require('../services/ingestion.service');
+const parser = require('../services/parser.service');
 const { proposeColumnMapping } = require('../services/anthropic.service');
 
 const REQUIRED_UPLOAD_MAPPING = ['date', 'items', 'total'];
 const MIN_HEADER_COUNT = 2;
+const MAX_TRANSACTION_QUERY_RANGE_DAYS = 5 * 366;
+const MAX_TRANSACTION_PAGE = 10000;
+
+const getCafeTimezone = async (cafeId) => {
+  const cafe = await Cafe.findById(cafeId).select('timezone').lean();
+  return parser.safeTimezone(cafe?.timezone);
+};
 
 const requiredUploadMappingForMode = (itemsMode = 'packed') =>
   itemsMode === 'line-per-row'
     ? [...REQUIRED_UPLOAD_MAPPING, 'receiptId']
     : REQUIRED_UPLOAD_MAPPING;
 
-const cleanupLocalFile = (filePath) => {
+const cleanupLocalFile = async (filePath) => {
   if (!filePath) return;
-  try { fs.unlinkSync(filePath); } catch {}
+  try { await fs.promises.rm(filePath, { force: true }); } catch {}
 };
 
 const cleanColumnMapping = (mapping = {}, headers = []) => {
@@ -53,13 +61,21 @@ const upload = async (req, res, next) => {
     const fileName = path.basename(req.file.originalname);
     const safeStorageName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_') || 'upload';
     const ext = path.extname(fileName).toLowerCase().slice(1);
-    const buffer = fs.readFileSync(filePath);
+    const buffer = await fs.promises.readFile(filePath);
 
     // Validate size
-    const maxBytes = parseInt(process.env.UPLOAD_MAX_BYTES || '10485760', 10);
+    const maxBytes = typeof r2.maxObjectBytes === 'function'
+      ? r2.maxObjectBytes()
+      : 10 * 1024 * 1024;
     if (buffer.length > maxBytes) {
-      cleanupLocalFile(filePath);
+      await cleanupLocalFile(filePath);
       return res.status(400).json({ success: false, message: `File exceeds ${maxBytes} bytes` });
+    }
+    try {
+      parser.assertSupportedFileBuffer(buffer, ext);
+    } catch (err) {
+      await cleanupLocalFile(filePath);
+      return res.status(400).json({ success: false, message: err.message });
     }
 
     // Preview headers + sample rows
@@ -67,16 +83,18 @@ const upload = async (req, res, next) => {
     try {
       preview = await ingestion.previewBuffer(buffer, ext);
     } catch (err) {
-      cleanupLocalFile(filePath);
+      await cleanupLocalFile(filePath);
       return res.status(400).json({
         success: false,
-        message: 'Could not read this file. Please upload a valid CSV or XLSX export.',
+        message: err.statusCode === 400
+          ? err.message
+          : 'Could not read this file. Please upload a valid CSV or XLSX export.',
       });
     }
 
     const { headers, sampleRows } = preview;
     if (!headers || headers.length < MIN_HEADER_COUNT) {
-      cleanupLocalFile(filePath);
+      await cleanupLocalFile(filePath);
       return res.status(400).json({ success: false, message: 'Could not parse file headers' });
     }
 
@@ -86,14 +104,15 @@ const upload = async (req, res, next) => {
       await r2.uploadFile(buffer, r2Key, req.file.mimetype || 'text/csv');
       stagedR2Key = r2Key;
     } catch (err) {
-      cleanupLocalFile(filePath);
+      await cleanupLocalFile(filePath);
       return res.status(503).json({ success: false, message: 'File storage unavailable, please retry' });
     }
-    cleanupLocalFile(filePath);
+    await cleanupLocalFile(filePath);
 
     // Detect format
     let posType, columnMapping, itemsMode;
     let usedSavedMapping = false;
+    const cafe = await Cafe.findById(cafeId).lean();
     const yoco = ingestion.yocoMapping();
     if (ingestion.isYocoFormat(headers) && hasRequiredHeaderMapping(yoco.mapping, headers, yoco.itemsMode)) {
       posType = 'yoco';
@@ -102,7 +121,6 @@ const upload = async (req, res, next) => {
     } else {
       posType = 'wizard';
       // Try cafe-saved mapping first
-      const cafe = await Cafe.findById(cafeId).lean();
       if (cafe?.savedColumnMapping) {
         const saved = cafe.savedColumnMapping;
         columnMapping = cleanColumnMapping(saved, headers);
@@ -147,7 +165,7 @@ const upload = async (req, res, next) => {
       needsConfirmation: posType !== 'yoco' && !(usedSavedMapping && hasRequiredMapping),
     });
   } catch (error) {
-    cleanupLocalFile(filePath);
+    await cleanupLocalFile(filePath);
     if (stagedR2Key && !uploadDocCreated) {
       try { await r2.deleteFile(stagedR2Key); } catch {}
     }
@@ -159,17 +177,37 @@ const getTransactions = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
     const { startDate, endDate, limit = 100, page = 1 } = req.query;
+    const timezone = await getCafeTimezone(cafeId);
 
     const query = { cafeId };
 
     if (startDate || endDate) {
+      if (!startDate || !endDate) {
+        return res.status(400).json({
+          success: false,
+          message: 'startDate and endDate must be provided together',
+        });
+      }
       query.date = {};
-      if (startDate) query.date.$gte = new Date(startDate);
-      if (endDate) query.date.$lte = new Date(endDate);
+      if (startDate) query.date.$gte = parser.zonedDayStart(startDate, timezone);
+      if (endDate) query.date.$lte = parser.zonedDayEnd(endDate, timezone);
+      if ((startDate && !query.date.$gte) || (endDate && !query.date.$lte)) {
+        return res.status(400).json({ success: false, message: 'Invalid transaction date range' });
+      }
+      if (query.date.$gte && query.date.$lte) {
+        const rangeDays = parser.zonedDayOrdinal(query.date.$lte, timezone) -
+          parser.zonedDayOrdinal(query.date.$gte, timezone) + 1;
+        if (rangeDays <= 0 || rangeDays > MAX_TRANSACTION_QUERY_RANGE_DAYS) {
+          return res.status(400).json({
+            success: false,
+            message: `Transaction date range must be between 1 and ${MAX_TRANSACTION_QUERY_RANGE_DAYS} days`,
+          });
+        }
+      }
     }
 
-    const limitNum = Math.min(parseInt(limit, 10) || 100, 500);
-    const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+    const limitNum = Math.max(1, Math.min(parseInt(limit, 10) || 100, 500));
+    const pageNum = Math.max(1, Math.min(parseInt(page, 10) || 1, MAX_TRANSACTION_PAGE));
     const skip = (pageNum - 1) * limitNum;
 
     const [transactions, total] = await Promise.all([
@@ -200,6 +238,7 @@ const getStats = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
     const cafeObjectId = new mongoose.Types.ObjectId(String(cafeId));
+    const timezone = await getCafeTimezone(cafeId);
 
     const [result] = await Transaction.aggregate([
       {
@@ -262,11 +301,10 @@ const getStats = async (req, res, next) => {
     const totalRevenue = Number(totals.totalRevenue || 0);
     const firstDate = totals.firstDate;
     const lastDate = totals.lastDate;
-    const firstDay = new Date(firstDate);
-    firstDay.setHours(0, 0, 0, 0);
-    const lastDay = new Date(lastDate);
-    lastDay.setHours(0, 0, 0, 0);
-    const dayCount = Math.max(Math.floor((lastDay - firstDay) / (1000 * 60 * 60 * 24)) + 1, 1);
+    const dayCount = Math.max(
+      parser.zonedDayOrdinal(lastDate, timezone) - parser.zonedDayOrdinal(firstDate, timezone) + 1,
+      1
+    );
     const avgDailyRevenue = totalRevenue / dayCount;
 
     return res.status(200).json({
@@ -288,6 +326,7 @@ const getStats = async (req, res, next) => {
 const getDataStatus = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
+    const timezone = await getCafeTimezone(cafeId);
 
     // Find the latest transaction date (most recent data the user has)
     const latest = await Transaction.findOne({ cafeId }).sort({ date: -1 }).select('date').lean();
@@ -295,16 +334,14 @@ const getDataStatus = async (req, res, next) => {
     const totalCount = await Transaction.countDocuments({ cafeId });
 
     // Coverage: count distinct dates with transactions in the last 30 days.
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setHours(0, 0, 0, 0);
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const thirtyDaysAgo = parser.addZonedDays(new Date(), -29, timezone);
 
     const coverage = await Transaction.aggregate([
       { $match: { cafeId: new mongoose.Types.ObjectId(String(cafeId)), date: { $gte: thirtyDaysAgo } } },
       {
         $group: {
           _id: {
-            $dateToString: { format: '%Y-%m-%d', date: '$date' },
+            $dateToString: { format: '%Y-%m-%d', date: '$date', timezone },
           },
           count: { $sum: 1 },
         },
@@ -315,11 +352,11 @@ const getDataStatus = async (req, res, next) => {
     // Number of days since latest data
     let daysSinceLatest = null;
     if (latest) {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const latestDay = new Date(latest.date);
-      latestDay.setHours(0, 0, 0, 0);
-      daysSinceLatest = Math.max(0, Math.floor((today - latestDay) / 86400000));
+      daysSinceLatest = Math.max(
+        0,
+        parser.zonedDayOrdinal(new Date(), timezone) -
+          parser.zonedDayOrdinal(latest.date, timezone)
+      );
     }
 
     return res.status(200).json({

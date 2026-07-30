@@ -120,39 +120,44 @@ const sendWelcomeEmail = async ({ user, org, cafe }) => {
   });
 };
 
-const sendTeamInviteEmail = async ({ manager, owner, cafes = [], temporaryPassword }) => {
-  const loginUrl = `${appUrl()}/login`;
+const sendTeamInviteEmail = async ({ invitation, owner, cafes = [], invitationToken }) => {
+  if (!invitationToken) throw new Error('Invitation token is required');
+  const invitationUrl = `${appUrl()}/accept-invite#token=${encodeURIComponent(invitationToken)}`;
   const cafeNames = cafes.map((cafe) => cafe.name).filter(Boolean);
   const cafeList = cafeNames.length > 0 ? cafeNames.join(', ') : 'assigned cafe locations';
+  const expiresAt = new Date(invitation.expiresAt).toLocaleString('en-ZA', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  });
 
   const html = baseHtml({
-    title: 'You have been added to Your Guava',
-    intro: `${owner.name} added you as a manager.`,
-    ctaLabel: 'Sign in',
-    ctaUrl: loginUrl,
+    title: 'You have been invited to Your Guava',
+    intro: `${owner.name} invited you to join as a manager.`,
+    ctaLabel: 'Accept invitation',
+    ctaUrl: invitationUrl,
     children: `
       <p style="margin:0 0 14px;">You can now access <strong>${escapeHtml(cafeList)}</strong> in Your Guava.</p>
       <table role="presentation" cellspacing="0" cellpadding="0" style="margin:18px 0;width:100%;background:#111111;border:1px solid #2a2a2a;border-radius:8px;">
-        <tr><td style="padding:14px;color:#888888;font-size:12px;">Email</td><td style="padding:14px;color:#f0f0f0;font-size:14px;">${escapeHtml(manager.email)}</td></tr>
-        <tr><td style="padding:14px;color:#888888;font-size:12px;border-top:1px solid #2a2a2a;">Temporary password</td><td style="padding:14px;color:#f0f0f0;font-size:14px;border-top:1px solid #2a2a2a;"><strong>${escapeHtml(temporaryPassword)}</strong></td></tr>
+        <tr><td style="padding:14px;color:#888888;font-size:12px;">Email</td><td style="padding:14px;color:#f0f0f0;font-size:14px;">${escapeHtml(invitation.email)}</td></tr>
+        <tr><td style="padding:14px;color:#888888;font-size:12px;border-top:1px solid #2a2a2a;">Expires</td><td style="padding:14px;color:#f0f0f0;font-size:14px;border-top:1px solid #2a2a2a;">${escapeHtml(expiresAt)}</td></tr>
       </table>
-      <p style="margin:0;color:#b8b8b8;">After signing in, change this temporary password from Account settings.</p>
+      <p style="margin:0;color:#b8b8b8;">Use the button above to choose your password. The link works once and expires automatically.</p>
     `,
   });
 
   const text = plainLines([
-    `Hi ${manager.name},`,
-    `${owner.name} added you as a manager in Your Guava.`,
+    `Hi ${invitation.name},`,
+    `${owner.name} invited you to join Your Guava as a manager.`,
     `Cafe access: ${cafeList}`,
-    `Email: ${manager.email}`,
-    `Temporary password: ${temporaryPassword}`,
-    `Sign in: ${loginUrl}`,
-    'After signing in, change this temporary password from Account settings.',
+    `Email: ${invitation.email}`,
+    `Invitation expires: ${expiresAt}`,
+    `Accept invitation: ${invitationUrl}`,
+    'Choose your password when you accept. The link works once.',
   ]);
 
   return sendEmail({
-    to: manager.email,
-    subject: 'You have been added to Your Guava',
+    to: invitation.email,
+    subject: 'You have been invited to Your Guava',
     html,
     text,
     tags: [{ name: 'email_type', value: 'team_invite' }],

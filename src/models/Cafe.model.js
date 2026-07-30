@@ -5,6 +5,9 @@ const cafeSchema = new mongoose.Schema(
     name: {
       type: String,
       required: true,
+      trim: true,
+      minlength: 2,
+      maxlength: 120,
     },
     orgId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -12,23 +15,23 @@ const cafeSchema = new mongoose.Schema(
       required: true,
     },
     location: {
-      address: { type: String },
-      addressLine2: { type: String },
-      suburb: { type: String },
-      city: { type: String, default: 'Cape Town' },
-      postalCode: { type: String },
-      province: { type: String },
-      country: { type: String, default: 'South Africa' },
-      lat: { type: Number },
-      lng: { type: Number },
+      address: { type: String, maxlength: 240 },
+      addressLine2: { type: String, maxlength: 240 },
+      suburb: { type: String, maxlength: 120 },
+      city: { type: String, maxlength: 120 },
+      postalCode: { type: String, maxlength: 24 },
+      province: { type: String, maxlength: 120 },
+      country: { type: String, default: 'South Africa', maxlength: 120 },
+      lat: { type: Number, min: -90, max: 90 },
+      lng: { type: Number, min: -180, max: 180 },
     },
     yocoConnected: {
       type: Boolean,
       default: false,
     },
     yocoTokens: {
-      accessToken: String,
-      refreshToken: String,
+      accessToken: { type: String, select: false },
+      refreshToken: { type: String, select: false },
       expiresAt: Date,
     },
     yocoBusinessId: String,
@@ -84,8 +87,8 @@ const cafeSchema = new mongoose.Schema(
     accountingIntegrations: {
       xero: {
         connected: { type: Boolean, default: false },
-        accessToken: { type: String },
-        refreshToken: { type: String },
+        accessToken: { type: String, select: false },
+        refreshToken: { type: String, select: false },
         tenantId: { type: String },
         expiresAt: { type: Date },
         connectedAt: { type: Date },
@@ -95,8 +98,8 @@ const cafeSchema = new mongoose.Schema(
       },
       quickbooks: {
         connected: { type: Boolean, default: false },
-        accessToken: { type: String },
-        refreshToken: { type: String },
+        accessToken: { type: String, select: false },
+        refreshToken: { type: String, select: false },
         realmId: { type: String },
         expiresAt: { type: Date },
         connectedAt: { type: Date },
@@ -106,8 +109,8 @@ const cafeSchema = new mongoose.Schema(
       },
       sage: {
         connected: { type: Boolean, default: false },
-        accessToken: { type: String },
-        refreshToken: { type: String },
+        accessToken: { type: String, select: false },
+        refreshToken: { type: String, select: false },
         businessId: { type: String },
         expiresAt: { type: Date },
         connectedAt: { type: Date },
@@ -119,5 +122,7 @@ const cafeSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+cafeSchema.index({ orgId: 1, createdAt: 1 });
 
 module.exports = mongoose.model('Cafe', cafeSchema);

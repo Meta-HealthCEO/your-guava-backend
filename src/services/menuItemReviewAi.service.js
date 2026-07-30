@@ -1,9 +1,11 @@
-const Anthropic = require('@anthropic-ai/sdk');
 const Item = require('../models/Item.model');
 const { inferItemCategory } = require('../utils/itemCategory');
 const { meterGuavaCredits } = require('./usage.service');
+const { createAnthropicClient } = require('./anthropicClient.service');
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
+const MAX_AI_REVIEW_ITEMS = 10;
+const AI_REVIEW_CONCURRENCY = 2;
 
 const roundMoney = (value) => {
   const number = Number(value);
@@ -103,7 +105,7 @@ const parseJsonObject = (text = '') => {
 const aiSuggestion = async (item, candidates = []) => {
   if (!process.env.ANTHROPIC_API_KEY || process.env.NODE_ENV === 'test') return null;
 
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const client = createAnthropicClient();
   const prompt = `You validate imported POS item names for a coffee shop.
 Choose exactly one action:
 - map_to: POS item is the same as an existing menu item
@@ -159,7 +161,9 @@ ${JSON.stringify(candidates.map((candidate) => ({
 const suggestMenuItemReview = async (cafeId, item, candidates = [], usageContext = {}) => {
   const fallback = fallbackSuggestion(item, candidates);
 
-  if (!process.env.ANTHROPIC_API_KEY || process.env.NODE_ENV === 'test') return fallback;
+  if (!usageContext.useAi || !process.env.ANTHROPIC_API_KEY || process.env.NODE_ENV === 'test') {
+    return fallback;
+  }
 
   try {
     const { result: ai } = await meterGuavaCredits({
@@ -169,6 +173,9 @@ const suggestMenuItemReview = async (cafeId, item, candidates = [], usageContext
       featureKey: 'menu_item_ai_review',
       relatedEntity: { kind: 'item', id: String(item._id) },
       metadata: { itemName: item.name, candidateCount: candidates.length },
+      idempotencyKey: usageContext.idempotencyPrefix
+        ? `${usageContext.idempotencyPrefix}:${item._id}`
+        : undefined,
       run: () => aiSuggestion(item, candidates),
     });
     if (!ai) return fallback;
@@ -178,7 +185,28 @@ const suggestMenuItemReview = async (cafeId, item, candidates = [], usageContext
   }
 };
 
+const mapWithConcurrency = async (values, concurrency, worker) => {
+  const results = new Array(values.length);
+  let nextIndex = 0;
+
+  const runWorker = async () => {
+    while (nextIndex < values.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(values[index], index);
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, values.length) }, () => runWorker())
+  );
+  return results;
+};
+
 const suggestMenuItemReviews = async (cafeId, itemsWithCandidates = [], usageContext = {}) => {
+  const boundedItems = usageContext.useAi
+    ? itemsWithCandidates.slice(0, MAX_AI_REVIEW_ITEMS)
+    : itemsWithCandidates;
   const matchedItems = await Item.find({
     cafeId,
     isActive: { $ne: false },
@@ -188,15 +216,16 @@ const suggestMenuItemReviews = async (cafeId, itemsWithCandidates = [], usageCon
     .limit(80)
     .lean();
 
-  return Promise.all(itemsWithCandidates.map(async ({ item, candidates }) => {
+  return mapWithConcurrency(boundedItems, AI_REVIEW_CONCURRENCY, async ({ item, candidates }) => {
     const candidateList = candidates?.length > 0
       ? candidates
       : matchedItems.slice(0, 10).map((candidate) => ({ item: candidate, score: 0 }));
     return suggestMenuItemReview(cafeId, item, candidateList, usageContext);
-  }));
+  });
 };
 
 module.exports = {
+  MAX_AI_REVIEW_ITEMS,
   fallbackSuggestion,
   suggestMenuItemReview,
   suggestMenuItemReviews,

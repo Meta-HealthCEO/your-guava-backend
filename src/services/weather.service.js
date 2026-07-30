@@ -5,13 +5,16 @@ const weatherCache = new Map();
 const pendingWeatherRequests = new Map();
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
-const DEFAULT_WEATHER = {
-  temp: 22,
-  condition: 'Clear',
-  humidity: 60,
-  isRain: false,
-  precipMm: 0,
-  chanceOfRain: 0,
+const unavailableWeatherSignal = (unavailableReason = 'Weather data is unavailable') => ({
+  available: false,
+  condition: 'Unavailable',
+  unavailableReason,
+});
+
+const finiteMetric = (value) => {
+  if (value === undefined || value === null || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 };
 
 const toDateKey = (date) => {
@@ -41,20 +44,42 @@ const normaliseDay = (dayData) => {
   if (!dayData?.day) return null;
 
   const day = dayData.day;
-  const conditionText = day.condition?.text || 'Clear';
+  const temp = finiteMetric(day.avgtemp_c);
+  const humidity = finiteMetric(day.avghumidity);
+  const conditionText = typeof day.condition?.text === 'string'
+    ? day.condition.text.trim()
+    : '';
+  if (
+    temp === null ||
+    temp < -90 ||
+    temp > 70 ||
+    humidity === null ||
+    humidity < 0 ||
+    humidity > 100 ||
+    !conditionText ||
+    conditionText.length > 200
+  ) return null;
+
+  const rawPrecipMm = finiteMetric(day.totalprecip_mm);
+  const precipMm = rawPrecipMm !== null && rawPrecipMm >= 0 ? rawPrecipMm : null;
+  const rawChanceOfRain = finiteMetric(day.daily_chance_of_rain);
+  const chanceOfRain = rawChanceOfRain !== null && rawChanceOfRain >= 0 && rawChanceOfRain <= 100
+    ? rawChanceOfRain
+    : null;
   const isRain = conditionText.toLowerCase().includes('rain') ||
     conditionText.toLowerCase().includes('drizzle') ||
     conditionText.toLowerCase().includes('shower') ||
-    Number(day.totalprecip_mm || 0) > 0 ||
-    Number(day.daily_chance_of_rain || 0) >= 50;
+    (precipMm !== null && precipMm > 0) ||
+    (chanceOfRain !== null && chanceOfRain >= 50);
 
   return {
-    temp: day.avgtemp_c ?? DEFAULT_WEATHER.temp,
+    available: true,
+    temp,
     condition: conditionText,
-    humidity: day.avghumidity ?? DEFAULT_WEATHER.humidity,
+    humidity,
     isRain,
-    precipMm: Number(day.totalprecip_mm ?? DEFAULT_WEATHER.precipMm),
-    chanceOfRain: Number(day.daily_chance_of_rain ?? DEFAULT_WEATHER.chanceOfRain),
+    ...(precipMm !== null ? { precipMm } : {}),
+    ...(chanceOfRain !== null ? { chanceOfRain } : {}),
   };
 };
 
@@ -79,12 +104,13 @@ const runDedupe = async (pendingKey, fn) => {
 /**
  * Fetches the weather forecast/history for a given lat/lng and date.
  * Uses WeatherAPI.com /history.json for past dates and /forecast.json otherwise.
- * Falls back to defaults on any error.
+ * Returns an explicit unavailable signal when configuration or provider data
+ * is unavailable. It never invents weather observations.
  *
  * @param {number} lat
  * @param {number} lng
  * @param {Date|string} date
- * @returns {Promise<{ temp: number, condition: string, humidity: number, isRain: boolean, precipMm: number, chanceOfRain: number }>}
+ * @returns {Promise<object>}
  */
 const getWeatherForecast = async (lat, lng, date) => {
   const apiKey = process.env.WEATHER_API_KEY;
@@ -92,12 +118,15 @@ const getWeatherForecast = async (lat, lng, date) => {
 
   if (!apiKey || !baseUrl) {
     if (process.env.NODE_ENV !== 'test') {
-      console.warn('[weather] WEATHER_API_KEY or WEATHER_API_URL not set, using defaults');
+      console.warn('[weather] WEATHER_API_KEY or WEATHER_API_URL not set');
     }
-    return { ...DEFAULT_WEATHER };
+    return unavailableWeatherSignal('Weather service is not configured');
   }
 
   const targetDate = new Date(date);
+  if (Number.isNaN(targetDate.getTime())) {
+    return unavailableWeatherSignal('Weather date is invalid');
+  }
   const dateStr = toDateKey(targetDate);
   const cacheKey = cacheKeyFor(lat, lng, dateStr);
 
@@ -133,12 +162,12 @@ const getWeatherForecast = async (lat, lng, date) => {
 
     const result = readCache(cacheKey);
     if (!result) {
-      return { ...DEFAULT_WEATHER };
+      return unavailableWeatherSignal('Weather provider returned no data for this date');
     }
     return result;
   } catch (error) {
     console.error('[weather] API error:', error.message);
-    return { ...DEFAULT_WEATHER };
+    return unavailableWeatherSignal('Weather data is temporarily unavailable');
   }
 };
 
@@ -147,4 +176,4 @@ const clearWeatherCache = () => {
   pendingWeatherRequests.clear();
 };
 
-module.exports = { getWeatherForecast, clearWeatherCache };
+module.exports = { getWeatherForecast, unavailableWeatherSignal, clearWeatherCache };

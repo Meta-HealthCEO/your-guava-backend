@@ -137,8 +137,15 @@ describe('Integrations API', () => {
       },
     });
 
-    // Verify it was set
-    const before = await Cafe.findById(cafeId).lean();
+    // Provider secrets stay excluded from ordinary cafe reads.
+    const defaultView = await Cafe.findById(cafeId).lean();
+    expect(defaultView.accountingIntegrations?.xero?.accessToken).toBeUndefined();
+    expect(defaultView.accountingIntegrations?.xero?.refreshToken).toBeUndefined();
+
+    // Secret-consuming paths must opt in explicitly.
+    const before = await Cafe.findById(cafeId)
+      .select('+accountingIntegrations.xero.accessToken +accountingIntegrations.xero.refreshToken')
+      .lean();
     expect(before.accountingIntegrations?.xero?.connected).toBe(true);
 
     // Disconnect
@@ -150,7 +157,9 @@ describe('Integrations API', () => {
     expect(res.body.success).toBe(true);
 
     // Verify tokens cleared
-    const after = await Cafe.findById(cafeId).lean();
+    const after = await Cafe.findById(cafeId)
+      .select('+accountingIntegrations.xero.accessToken +accountingIntegrations.xero.refreshToken')
+      .lean();
     expect(after.accountingIntegrations?.xero?.connected).toBe(false);
     expect(after.accountingIntegrations?.xero?.accessToken).toBeFalsy();
   });

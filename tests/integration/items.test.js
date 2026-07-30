@@ -168,4 +168,26 @@ describe('Menu items API', () => {
       .set('Authorization', `Bearer ${token}`);
     expect(afterResolve.body.meta.priceMismatches).toBe(0);
   });
+
+  it('rejects oversized or invalid menu-item mutations', async () => {
+    const invalidPayloads = [
+      { name: 'x'.repeat(201) },
+      { name: 'Flat White', expectedPrice: -1 },
+      { name: 'Flat White', expectedPrice: 1000001 },
+      { name: 'Flat White', priceTolerancePct: 101 },
+      { name: 'Flat White', aliases: Array.from({ length: 51 }, (_, index) => `Alias ${index}`) },
+      { name: 'Flat White', notes: 'x'.repeat(2001) },
+      { name: 'Flat White', category: 'not-a-category' },
+      { name: 'Flat White', isActive: 'false' },
+    ];
+
+    for (const payload of invalidPayloads) {
+      const response = await request
+        .post('/api/items')
+        .set('Authorization', `Bearer ${token}`)
+        .send(payload);
+      expect(response.status).toBe(400);
+    }
+    expect(await Item.countDocuments({ cafeId: user.activeCafeId })).toBe(0);
+  });
 });

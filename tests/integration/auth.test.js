@@ -113,6 +113,35 @@ describe('Auth API', () => {
       expect(res.body.success).toBe(false);
       expect(res.body.message).toMatch(/at least 8/i);
     });
+
+    it('trims account names and rejects oversized tenant names', async () => {
+      const welcomeSpy = jest
+        .spyOn(emailService, 'sendWelcomeEmail')
+        .mockResolvedValue({ sent: true });
+      const trimmed = await request.post('/api/auth/register').send({
+        name: '  Trimmed Owner  ',
+        email: 'trimmed@yourguava.com',
+        password: 'password123',
+        cafeName: '  Trimmed Cafe  ',
+        orgName: '  Trimmed Org  ',
+      });
+
+      expect(trimmed.status).toBe(201);
+      expect(welcomeSpy).toHaveBeenCalledWith({
+        user: expect.objectContaining({ name: 'Trimmed Owner' }),
+        org: expect.objectContaining({ name: 'Trimmed Org' }),
+        cafe: expect.objectContaining({ name: 'Trimmed Cafe' }),
+      });
+
+      const oversized = await request.post('/api/auth/register').send({
+        name: 'Another Owner',
+        email: 'oversized@yourguava.com',
+        password: 'password123',
+        cafeName: 'x'.repeat(121),
+      });
+      expect(oversized.status).toBe(400);
+      expect(oversized.body.message).toMatch(/cafe name/i);
+    });
   });
 
   describe('POST /api/auth/login', () => {

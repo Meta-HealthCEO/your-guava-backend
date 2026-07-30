@@ -283,14 +283,26 @@ const factor = ({ key, label, adjustmentPct = 0, active = false, reason, minimum
   reason: reason || '',
 });
 
+const isWeatherAvailable = (weather) =>
+  Boolean(
+    weather &&
+    weather.available !== false &&
+    Number.isFinite(weather.temp) &&
+    typeof weather.condition === 'string' &&
+    weather.condition.trim()
+  );
+
 const isRainy = (weather) =>
   Boolean(
-    weather?.isRain ||
-    String(weather?.condition || '').toLowerCase().match(/rain|drizzle|shower|storm/)
+    isWeatherAvailable(weather) &&
+    (
+      weather?.isRain ||
+      String(weather?.condition || '').toLowerCase().match(/rain|drizzle|shower|storm/)
+    )
   );
 
 const weatherAdjustmentPct = (category, weather, settings) => {
-  if (!settings.enabled || !weather) return 0;
+  if (!settings.enabled || !isWeatherAvailable(weather)) return 0;
 
   let pct = 0;
   if (weather.temp > settings.hotTemp) {
@@ -307,8 +319,15 @@ const weatherAdjustmentPct = (category, weather, settings) => {
 };
 
 const weatherSummaryFactor = (weather, settings) => {
-  if (!settings.enabled || !weather) {
+  if (!settings.enabled) {
     return factor({ key: 'weather', label: 'Weather', reason: 'Weather factor disabled' });
+  }
+  if (!isWeatherAvailable(weather)) {
+    return factor({
+      key: 'weather',
+      label: 'Weather',
+      reason: weather?.unavailableReason || 'Weather data unavailable',
+    });
   }
 
   const reasons = [];
@@ -342,13 +361,16 @@ const weatherItemFactor = (category, weather, settings) => {
     active: adjustmentPct !== 0,
     adjustmentPct,
     minimumMultiplier: settings.minimumMultiplier,
-    reason: weather?.condition || '',
+    reason: isWeatherAvailable(weather)
+      ? weather.condition
+      : weather?.unavailableReason || 'Weather data unavailable',
   });
 };
 
-const loadSheddingFactor = (stage, settings) => {
+const loadSheddingFactor = (stage, settings, availability = {}) => {
+  const stageAvailable = availability.available !== false && Number.isFinite(stage);
   let adjustmentPct = 0;
-  if (settings.enabled && stage > 0) {
+  if (settings.enabled && stageAvailable && stage > 0) {
     if (stage <= 2) adjustmentPct = settings.stage1To2Pct;
     else if (stage <= 4) adjustmentPct = settings.stage3To4Pct;
     else adjustmentPct = settings.stage5PlusPct;
@@ -358,7 +380,13 @@ const loadSheddingFactor = (stage, settings) => {
     label: 'Load shedding',
     active: adjustmentPct !== 0,
     adjustmentPct,
-    reason: stage > 0 ? `stage ${stage}` : '',
+    reason: !settings.enabled
+      ? 'Load-shedding factor disabled'
+      : !stageAvailable
+        ? availability.unavailableReason || 'Load-shedding data unavailable'
+        : stage > 0
+          ? `stage ${stage}`
+          : '',
   });
 };
 
@@ -423,7 +451,10 @@ const eventsFactor = (events, settings) => {
 
 const buildGlobalFactors = ({ signals, weather, events, settings }) => [
   weatherSummaryFactor(weather, settings.weather),
-  loadSheddingFactor(signals.loadSheddingStage, settings.loadShedding),
+  loadSheddingFactor(signals.loadSheddingStage, settings.loadShedding, {
+    available: signals.loadSheddingAvailable,
+    unavailableReason: signals.loadSheddingUnavailableReason,
+  }),
   holidayFactor(signals.isPublicHoliday, signals.isSchoolHoliday, settings.holiday),
   paydayFactor(signals.isPayday, settings.payday),
   eventsFactor(events, settings.events),
@@ -431,7 +462,10 @@ const buildGlobalFactors = ({ signals, weather, events, settings }) => [
 
 const buildItemFactors = ({ category, signals, weather, events, settings }) => [
   weatherItemFactor(category, weather, settings.weather),
-  loadSheddingFactor(signals.loadSheddingStage, settings.loadShedding),
+  loadSheddingFactor(signals.loadSheddingStage, settings.loadShedding, {
+    available: signals.loadSheddingAvailable,
+    unavailableReason: signals.loadSheddingUnavailableReason,
+  }),
   holidayFactor(signals.isPublicHoliday, signals.isSchoolHoliday, settings.holiday),
   paydayFactor(signals.isPayday, settings.payday),
   eventsFactor(events, settings.events),

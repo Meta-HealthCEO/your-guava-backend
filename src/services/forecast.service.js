@@ -5,7 +5,15 @@ const Event = require('../models/Event.model');
 const Cafe = require('../models/Cafe.model');
 const Organization = require('../models/Organization.model');
 const { getSignalsForDate } = require('../utils/signals');
-const { getWeatherForecast } = require('./weather.service');
+const { getWeatherForecast, unavailableWeatherSignal } = require('./weather.service');
+const {
+  safeTimezone,
+  zonedDayStart,
+  addZonedDays,
+  zonedDayOrdinal,
+  zonedDayOfWeek,
+  processLocalCalendarDate,
+} = require('./parser.service');
 const {
   getForecastSettings,
   getFactorEntitlements,
@@ -15,7 +23,6 @@ const {
   multiplyFactors,
 } = require('./forecastFactors.service');
 
-const MS_PER_DAY = 1000 * 60 * 60 * 24;
 const CALIBRATION_LOOKBACK_DAYS = 60;
 const MIN_OVERALL_CALIBRATION_SAMPLES = 3;
 const MIN_FACTOR_CALIBRATION_SAMPLES = 3;
@@ -51,10 +58,8 @@ const buildLearningFactor = (multiplier, sampleSize, options = {}) => {
   };
 };
 
-const computeForecastCalibration = async (cafeId, targetDate) => {
-  const lookbackStart = new Date(targetDate);
-  lookbackStart.setDate(lookbackStart.getDate() - CALIBRATION_LOOKBACK_DAYS);
-  lookbackStart.setHours(0, 0, 0, 0);
+const computeForecastCalibration = async (cafeId, targetDate, timezone) => {
+  const lookbackStart = addZonedDays(targetDate, -CALIBRATION_LOOKBACK_DAYS, timezone);
 
   const pastForecasts = await Forecast.find({
     cafeId,
@@ -165,13 +170,12 @@ const calibrationMultiplierForItem = (calibration, itemName, factors) => {
  * Groups transactions by week bucket (most recent = bucket 0) and by item name.
  * Returns: Map<itemName, number[]> where each number is the quantity sold that week.
  */
-const groupByWeekAndItem = (transactions, targetDate) => {
-  const target = new Date(targetDate);
+const groupByWeekAndItem = (transactions, targetDate, timezone) => {
+  const targetOrdinal = zonedDayOrdinal(targetDate, timezone);
 
   // Bucket index: 0 = this week, 1 = last week, etc.
   const getBucket = (txDate) => {
-    const diffMs = target - new Date(txDate);
-    const diffDays = diffMs / (1000 * 60 * 60 * 24);
+    const diffDays = targetOrdinal - zonedDayOrdinal(txDate, timezone);
     return Math.floor(diffDays / 7);
   };
 
@@ -265,12 +269,16 @@ const buildHistoricalPriceMap = (transactions) => {
  * @param {number} predictedQty
  * @returns {Promise<number>}
  */
-const computeSuggestedStock = async (cafeId, itemName, predictedQty, settings, targetDate = new Date()) => {
-  const target = new Date(targetDate);
-  target.setHours(0, 0, 0, 0);
-  const thirtyDaysAgo = new Date(target);
-  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-  thirtyDaysAgo.setHours(0, 0, 0, 0);
+const computeSuggestedStock = async (
+  cafeId,
+  itemName,
+  predictedQty,
+  settings,
+  targetDate = new Date(),
+  timezone = 'Africa/Johannesburg'
+) => {
+  const target = zonedDayStart(targetDate, timezone);
+  const thirtyDaysAgo = addZonedDays(target, -30, timezone);
 
   const pastForecasts = await Forecast.find({
     cafeId,
@@ -312,15 +320,18 @@ const computeSuggestedStockFromPairs = (predictedQty, pairs, settings) => {
   return Math.round(predictedQty * safetyMargin);
 };
 
-const computeSuggestedStockMap = async (cafeId, predictedQtyByItem, settings, targetDate = new Date()) => {
+const computeSuggestedStockMap = async (
+  cafeId,
+  predictedQtyByItem,
+  settings,
+  targetDate = new Date(),
+  timezone = 'Africa/Johannesburg'
+) => {
   const itemNames = [...predictedQtyByItem.keys()];
   if (itemNames.length === 0) return new Map();
 
-  const target = new Date(targetDate);
-  target.setHours(0, 0, 0, 0);
-  const thirtyDaysAgo = new Date(target);
-  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-  thirtyDaysAgo.setHours(0, 0, 0, 0);
+  const target = zonedDayStart(targetDate, timezone);
+  const thirtyDaysAgo = addZonedDays(target, -30, timezone);
 
   const pastForecasts = await Forecast.find({
     cafeId,
@@ -361,15 +372,24 @@ const computeSuggestedStockMap = async (cafeId, predictedQtyByItem, settings, ta
  * @returns {Promise<Forecast>}
  */
 const generateForecast = async (cafeId, targetDate) => {
-  const target = new Date(targetDate);
-  target.setHours(0, 0, 0, 0);
-  const nextTarget = new Date(target);
-  nextTarget.setDate(nextTarget.getDate() + 1);
-  const targetDayOfWeek = target.getDay();
+  const cafe = await Cafe.findById(cafeId).lean();
+  if (!cafe) {
+    const error = new Error('Cafe not found');
+    error.statusCode = 404;
+    throw error;
+  }
+  const timezone = safeTimezone(cafe.timezone);
+  const target = zonedDayStart(targetDate, timezone);
+  if (!target) {
+    const error = new Error('Invalid forecast date');
+    error.statusCode = 400;
+    throw error;
+  }
+  const nextTarget = addZonedDays(target, 1, timezone);
+  const targetDayOfWeek = zonedDayOfWeek(target, timezone);
 
   // Fetch last 8 weeks of same-day-of-week transactions
-  const eightWeeksAgo = new Date(target);
-  eightWeeksAgo.setDate(eightWeeksAgo.getDate() - 56);
+  const eightWeeksAgo = addZonedDays(target, -56, timezone);
 
   const transactions = await Transaction.find({
     cafeId,
@@ -384,30 +404,37 @@ const generateForecast = async (cafeId, targetDate) => {
   const lastTransactionDate =
     historyDates.length > 0 ? new Date(Math.max(...historyDates.map((date) => date.getTime()))) : undefined;
   const weeksWithSales = new Set(
-    historyDates.map((date) => Math.floor((target - date) / MS_PER_DAY / 7))
+    historyDates.map((date) => Math.floor(
+      (zonedDayOrdinal(target, timezone) - zonedDayOrdinal(date, timezone)) / 7
+    ))
   ).size;
   const staleDays =
-    lastTransactionDate != null ? Math.max(0, Math.floor((target - lastTransactionDate) / MS_PER_DAY)) : undefined;
+    lastTransactionDate != null
+      ? Math.max(0, zonedDayOrdinal(target, timezone) - zonedDayOrdinal(lastTransactionDate, timezone))
+      : undefined;
 
   // Get cafe location for weather
-  const cafe = await Cafe.findById(cafeId).lean();
   const org = cafe?.orgId ? await Organization.findById(cafe.orgId).lean() : null;
   const plan = org?.plan || 'starter';
   const settings = getForecastSettings(cafe, plan);
   const entitlements = getFactorEntitlements(plan);
   const learningEnabled = factorUnlocked(plan, 'learning') && settings.learning.enabled;
-  const lat = cafe?.location?.lat || -33.9249; // Cape Town default
-  const lng = cafe?.location?.lng || 18.4241;
+  const lat = cafe.location?.lat;
+  const lng = cafe.location?.lng;
+  const hasCoordinates = Number.isFinite(lat) && Number.isFinite(lng) &&
+    lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+  const localCalendarDate = processLocalCalendarDate(target, timezone);
 
   // Fetch signals, weather, and events in parallel
   const [signals, weather, events] = await Promise.all([
-    getSignalsForDate(target, { lat, lng, city: cafe?.location?.city }),
-    getWeatherForecast(lat, lng, target),
+    getSignalsForDate(localCalendarDate, { city: cafe.location?.city }),
+    hasCoordinates ? getWeatherForecast(lat, lng, localCalendarDate) : Promise.resolve(null),
     Event.find({ cafeId, date: { $gte: target, $lt: nextTarget } }).lean(),
   ]);
+  const weatherSignal = weather || unavailableWeatherSignal('Cafe coordinates are not configured');
 
   // Group transactions by week and item
-  const itemWeekMap = groupByWeekAndItem(transactions, target);
+  const itemWeekMap = groupByWeekAndItem(transactions, target, timezone);
   const historicalPriceMap = buildHistoricalPriceMap(transactions);
 
   // Get top 15 items by total historical frequency
@@ -423,9 +450,9 @@ const generateForecast = async (cafeId, targetDate) => {
   const itemDocs = await Item.find({ cafeId, name: { $in: topItems } }).lean();
   const categoryMap = new Map(itemDocs.map((i) => [i.name, i.category]));
 
-  const forecastFactors = buildGlobalFactors({ signals, weather, events, settings });
+  const forecastFactors = buildGlobalFactors({ signals, weather: weatherSignal, events, settings });
   const calibration = learningEnabled
-    ? await computeForecastCalibration(cafeId, target)
+    ? await computeForecastCalibration(cafeId, target, timezone)
     : {
         lookbackDays: CALIBRATION_LOOKBACK_DAYS,
         sampleSize: 0,
@@ -451,7 +478,7 @@ const generateForecast = async (cafeId, targetDate) => {
     const buckets = itemWeekMap.get(name) || {};
     const baseQty = weightedAverage(buckets, settings.history);
     const category = categoryMap.get(name) || 'other';
-    const factors = buildItemFactors({ category, signals, weather, events, settings });
+    const factors = buildItemFactors({ category, signals, weather: weatherSignal, events, settings });
     const learningMultiplier = learningEnabled ? calibrationMultiplierForItem(calibration, name, factors) : 1;
     const learningFactor = buildLearningFactor(
       learningMultiplier,
@@ -478,28 +505,44 @@ const generateForecast = async (cafeId, targetDate) => {
     predictedQtyByItem.set(name, finalQty);
   }
 
-  const suggestedStockByItem = await computeSuggestedStockMap(cafeId, predictedQtyByItem, settings, target);
+  const suggestedStockByItem = await computeSuggestedStockMap(
+    cafeId,
+    predictedQtyByItem,
+    settings,
+    target,
+    timezone
+  );
   for (const item of forecastItems) {
     item.suggestedStock = suggestedStockByItem.get(item.itemName) ?? item.predictedQty;
   }
 
   // Upsert forecast document
+  const existingForecast = await Forecast.findOne({
+    cafeId,
+    date: { $gte: target, $lt: nextTarget },
+  }).select('_id').lean();
   const forecast = await Forecast.findOneAndUpdate(
-    { cafeId, date: target },
+    existingForecast ? { _id: existingForecast._id } : { cafeId, date: target },
     {
       $set: {
+        cafeId,
+        date: target,
         generatedAt: new Date(),
         items: forecastItems,
         signals: {
           weather: {
-            temp: weather.temp,
-            condition: weather.condition,
-            humidity: weather.humidity,
-            isRain: weather.isRain,
-            precipMm: weather.precipMm,
-            chanceOfRain: weather.chanceOfRain,
+            available: weatherSignal.available,
+            temp: weatherSignal.temp,
+            condition: weatherSignal.condition,
+            humidity: weatherSignal.humidity,
+            isRain: weatherSignal.isRain,
+            precipMm: weatherSignal.precipMm,
+            chanceOfRain: weatherSignal.chanceOfRain,
+            unavailableReason: weatherSignal.unavailableReason,
           },
           loadSheddingStage: signals.loadSheddingStage,
+          loadSheddingAvailable: signals.loadSheddingAvailable,
+          loadSheddingUnavailableReason: signals.loadSheddingUnavailableReason,
           isPublicHoliday: signals.isPublicHoliday,
           isSchoolHoliday: signals.isSchoolHoliday,
           isPayday: signals.isPayday,
@@ -538,14 +581,19 @@ const generateForecast = async (cafeId, targetDate) => {
  * @returns {Promise<Forecast[]>}
  */
 const generateWeekForecast = async (cafeId) => {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  const cafe = await Cafe.findById(cafeId).select('timezone').lean();
+  if (!cafe) {
+    const error = new Error('Cafe not found');
+    error.statusCode = 404;
+    throw error;
+  }
+  const timezone = safeTimezone(cafe.timezone);
+  const today = zonedDayStart(new Date(), timezone);
 
-  const targetDates = Array.from({ length: 7 }, (_, i) => {
-    const targetDate = new Date(today);
-    targetDate.setDate(today.getDate() + i);
-    return targetDate;
-  });
+  const targetDates = Array.from(
+    { length: 7 },
+    (_, index) => addZonedDays(today, index, timezone)
+  );
 
   // Resilient: a transient failure on one day must not lose the whole week.
   const results = await Promise.allSettled(
@@ -564,13 +612,25 @@ const generateWeekForecast = async (cafeId) => {
  * @param {Date|string} date
  * @returns {Promise<Forecast|null>}
  */
-const updateForecastActuals = async (cafeId, date) => {
-  const target = new Date(date);
-  target.setHours(0, 0, 0, 0);
-  const nextDay = new Date(target);
-  nextDay.setDate(nextDay.getDate() + 1);
+const updateForecastActuals = async (cafeId, date, options = {}) => {
+  let timezone = options.timezone;
+  if (!timezone) {
+    const cafe = await Cafe.findById(cafeId).select('timezone').lean();
+    timezone = cafe?.timezone;
+  }
+  timezone = safeTimezone(timezone);
+  const target = zonedDayStart(date, timezone);
+  if (!target) {
+    const error = new Error('Invalid forecast date');
+    error.statusCode = 400;
+    throw error;
+  }
+  const nextDay = addZonedDays(target, 1, timezone);
 
-  const forecast = await Forecast.findOne({ cafeId, date: target });
+  const forecast = await Forecast.findOne({
+    cafeId,
+    date: { $gte: target, $lt: nextDay },
+  }).sort({ date: 1 });
   if (!forecast) return null;
 
   // Fetch actual transactions for that date

@@ -1,15 +1,46 @@
-const Anthropic = require('@anthropic-ai/sdk');
 const Transaction = require('../models/Transaction.model');
 const Forecast = require('../models/Forecast.model');
 const Cafe = require('../models/Cafe.model');
 const Event = require('../models/Event.model');
 const Item = require('../models/Item.model');
 const Organization = require('../models/Organization.model');
-const { meterGuavaCredits } = require('./usage.service');
+const { creditSnapshot, meterGuavaCredits } = require('./usage.service');
+const { createAnthropicClient } = require('./anthropicClient.service');
 
 // In-memory cache: cafeId -> { insights, generatedAt }
 const insightsCache = new Map();
+const insightsInFlight = new Map();
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const REFRESH_DEDUPE_MS = 30 * 1000;
+
+const missingInsightsKeyResponse = () => ({
+  insights: ['AI insights require an Anthropic API key. Add ANTHROPIC_API_KEY to your environment variables.'],
+  generatedAt: new Date(),
+  requiresRefresh: false,
+  cacheStatus: 'unconfigured',
+});
+
+const cachedInsightEntry = (cafeId) => insightsCache.get(String(cafeId)) || null;
+
+const getCachedInsights = (cafeId) => {
+  const cached = cachedInsightEntry(cafeId);
+  if (cached) {
+    const fresh = Date.now() - cached.generatedAt.getTime() < CACHE_TTL_MS;
+    return {
+      insights: cached.insights,
+      generatedAt: cached.generatedAt,
+      requiresRefresh: !fresh,
+      cacheStatus: fresh ? 'fresh' : 'stale',
+    };
+  }
+  if (!process.env.ANTHROPIC_API_KEY) return missingInsightsKeyResponse();
+  return {
+    insights: [],
+    generatedAt: null,
+    requiresRefresh: true,
+    cacheStatus: 'empty',
+  };
+};
 
 /**
  * Generates Claude-powered sales insights for a cafe.
@@ -17,24 +48,21 @@ const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
  * @param {string|ObjectId} cafeId
  * @returns {Promise<{ insights: string[], generatedAt: Date }>}
  */
-const generateInsights = async (cafeId) => {
+const generateInsights = async (cafeId, { force = false } = {}) => {
   const cafeKey = cafeId.toString();
 
   // Guard: no API key
   if (!process.env.ANTHROPIC_API_KEY) {
-    return {
-      insights: ['AI insights require an Anthropic API key. Add ANTHROPIC_API_KEY to your environment variables.'],
-      generatedAt: new Date(),
-    };
+    return missingInsightsKeyResponse();
   }
 
   // Check cache
   const cached = insightsCache.get(cafeKey);
-  if (cached && Date.now() - cached.generatedAt.getTime() < CACHE_TTL_MS) {
+  if (!force && cached && Date.now() - cached.generatedAt.getTime() < CACHE_TTL_MS) {
     return { insights: cached.insights, generatedAt: cached.generatedAt };
   }
 
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const client = createAnthropicClient();
 
   // Fetch last 14 days of transactions
   const fourteenDaysAgo = new Date();
@@ -58,9 +86,9 @@ const generateInsights = async (cafeId) => {
 
   const tomorrowForecast = await Forecast.findOne({ cafeId, date: tomorrow }).lean();
 
-  const prompt = `You are a data analyst for a Cape Town coffee shop. Analyse this sales data and provide 4-5 actionable insights.
+  const prompt = `You are a data analyst for a coffee shop. Analyse this sales data and provide 4-5 actionable insights.
 Focus on: patterns, anomalies, opportunities, and staffing recommendations.
-Be specific with numbers. Use South African context (weather, load shedding, holidays, etc.)
+Be specific with numbers. Use local context only when it is supported by the supplied data; do not assume a city, country, weather event, holiday, or power event.
 
 Sales summary (last 14 days):
 ${JSON.stringify(summary, null, 2)}
@@ -72,7 +100,7 @@ Return ONLY a JSON array of insight strings. No markdown, no preamble, no explan
 Example: ["Insight 1 here.", "Insight 2 here."]`;
 
   const message = await client.messages.create({
-    model: 'claude-haiku-4-5-20251001',
+    model: process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001',
     max_tokens: 1024,
     messages: [{ role: 'user', content: prompt }],
   });
@@ -95,6 +123,73 @@ Example: ["Insight 1 here.", "Insight 2 here."]`;
   insightsCache.set(cafeKey, { insights, generatedAt });
 
   return { insights, generatedAt };
+};
+
+const currentCreditSnapshot = async (orgId) => {
+  if (!orgId) return null;
+  const org = await Organization.findById(orgId);
+  return org ? creditSnapshot(org) : null;
+};
+
+const performInsightsRefresh = async ({ cafeId, orgId, userId, idempotencyKey }) => {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return {
+      result: missingInsightsKeyResponse(),
+      guavaCredits: null,
+      replayed: false,
+    };
+  }
+
+  const recent = cachedInsightEntry(cafeId);
+  if (recent && Date.now() - recent.generatedAt.getTime() < REFRESH_DEDUPE_MS) {
+    return {
+      result: { insights: recent.insights, generatedAt: recent.generatedAt },
+      guavaCredits: await currentCreditSnapshot(orgId),
+      replayed: true,
+    };
+  }
+
+  try {
+    const metered = await meterGuavaCredits({
+      orgId,
+      cafeId,
+      userId,
+      featureKey: 'insight_refresh',
+      idempotencyKey,
+      metadata: { source: 'explicit_refresh' },
+      run: () => generateInsights(cafeId, { force: true }),
+    });
+    return { ...metered, replayed: false };
+  } catch (error) {
+    const cached = cachedInsightEntry(cafeId);
+    if (error.statusCode === 409 && cached) {
+      return {
+        result: { insights: cached.insights, generatedAt: cached.generatedAt },
+        guavaCredits: await currentCreditSnapshot(orgId),
+        usage: null,
+        replayed: true,
+      };
+    }
+    throw error;
+  }
+};
+
+const refreshInsights = async (options) => {
+  const cafeKey = String(options.cafeId);
+  const existing = insightsInFlight.get(cafeKey);
+  if (existing) {
+    const result = await existing;
+    return { ...result, coalesced: true };
+  }
+
+  const task = performInsightsRefresh(options);
+  insightsInFlight.set(cafeKey, task);
+  try {
+    const result = await task;
+    return { ...result, coalesced: false };
+  } finally {
+    if (insightsInFlight.get(cafeKey) === task) insightsInFlight.delete(cafeKey);
+  }
 };
 
 /**
@@ -159,14 +254,32 @@ const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Frida
 
 const roundMoney = (value) => parseFloat((value || 0).toFixed(2));
 
-const buildBusinessContext = async ({ cafeId, orgId }) => {
+const buildBusinessContext = async ({ cafeId, orgId, authorizedCafeIds }) => {
+  const scopedCafeIds = Array.isArray(authorizedCafeIds)
+    ? [...new Set(authorizedCafeIds.map(String))]
+    : null;
+  if (scopedCafeIds && !scopedCafeIds.includes(String(cafeId))) {
+    const err = new Error('Cafe access is no longer available');
+    err.statusCode = 403;
+    throw err;
+  }
+
   const [activeCafe, organization] = await Promise.all([
-    Cafe.findById(cafeId).lean(),
+    Cafe.findOne({ _id: cafeId, ...(orgId ? { orgId } : {}) }).lean(),
     orgId ? Organization.findById(orgId).lean() : null,
   ]);
 
+  if (!activeCafe) {
+    const err = new Error('Cafe access is no longer available');
+    err.statusCode = 403;
+    throw err;
+  }
+
   const cafes = orgId
-    ? await Cafe.find({ orgId }).select('name location dataUploaded lastSyncAt yocoConnected createdAt').lean()
+    ? await Cafe.find({
+        orgId,
+        ...(scopedCafeIds ? { _id: { $in: scopedCafeIds } } : {}),
+      }).select('name location dataUploaded lastSyncAt yocoConnected createdAt').lean()
     : activeCafe ? [activeCafe] : [];
 
   const cafeIds = cafes.map((cafe) => cafe._id);
@@ -473,7 +586,7 @@ const buildContextStats = (context) => ({
   contextWindow: context.dataset.contextWindow,
 });
 
-const buildBusinessChatRequest = async ({ cafeId, orgId, messages }) => {
+const buildBusinessChatRequest = async ({ cafeId, orgId, authorizedCafeIds, messages }) => {
   const cleanedMessages = sanitizeMessages(messages);
   if (cleanedMessages.length === 0 || cleanedMessages[cleanedMessages.length - 1].role !== 'user') {
     const err = new Error('At least one user message is required');
@@ -481,7 +594,7 @@ const buildBusinessChatRequest = async ({ cafeId, orgId, messages }) => {
     throw err;
   }
 
-  const context = await buildBusinessContext({ cafeId, orgId });
+  const context = await buildBusinessContext({ cafeId, orgId, authorizedCafeIds });
   const model = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
 
   const system = `You are Your Guava's embedded AI business analyst for coffee shops.
@@ -508,15 +621,26 @@ ${JSON.stringify(context, null, 2)}`;
   };
 };
 
-const generateBusinessChatResponse = async ({ cafeId, orgId, messages }) => {
+const generateBusinessChatResponse = async ({
+  cafeId,
+  orgId,
+  authorizedCafeIds,
+  messages,
+  signal,
+}) => {
   if (!process.env.ANTHROPIC_API_KEY) {
     return missingChatKeyResponse();
   }
 
-  const { request, contextStats } = await buildBusinessChatRequest({ cafeId, orgId, messages });
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const { request, contextStats } = await buildBusinessChatRequest({
+    cafeId,
+    orgId,
+    authorizedCafeIds,
+    messages,
+  });
+  const client = createAnthropicClient();
 
-  const response = await client.messages.create(request);
+  const response = await client.messages.create(request, { signal });
 
   const answer = response.content
     .map((part) => (part.type === 'text' ? part.text : ''))
@@ -530,7 +654,14 @@ const generateBusinessChatResponse = async ({ cafeId, orgId, messages }) => {
   };
 };
 
-const streamBusinessChatResponse = async ({ cafeId, orgId, messages, onDelta }) => {
+const streamBusinessChatResponse = async ({
+  cafeId,
+  orgId,
+  authorizedCafeIds,
+  messages,
+  onDelta,
+  signal,
+}) => {
   if (!process.env.ANTHROPIC_API_KEY) {
     const fallback = missingChatKeyResponse();
     onDelta(fallback.answer);
@@ -539,9 +670,14 @@ const streamBusinessChatResponse = async ({ cafeId, orgId, messages, onDelta }) 
     };
   }
 
-  const { request, contextStats } = await buildBusinessChatRequest({ cafeId, orgId, messages });
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  const stream = await client.messages.create({ ...request, stream: true });
+  const { request, contextStats } = await buildBusinessChatRequest({
+    cafeId,
+    orgId,
+    authorizedCafeIds,
+    messages,
+  });
+  const client = createAnthropicClient();
+  const stream = await client.messages.create({ ...request, stream: true }, { signal });
   let answer = '';
 
   for await (const event of stream) {
@@ -571,7 +707,7 @@ const mappingCache = new Map(); // sha1(headers) -> mapping
  * @returns {Promise<{mapping: object, itemsMode: 'packed'|'line-per-row'}>}
  */
 const proposeColumnMappingWithClaude = async (headers, sampleRows) => {
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const client = createAnthropicClient();
 
   const prompt = `You are mapping CSV columns from a coffee-shop POS export to a canonical schema.
 
@@ -662,11 +798,19 @@ const proposeColumnMapping = async (headers, sampleRows, usageContext = {}) => {
 };
 
 const _resetMappingCache = () => mappingCache.clear();
+const _resetInsightsCache = () => {
+  insightsCache.clear();
+  insightsInFlight.clear();
+};
 
 module.exports = {
+  _resetInsightsCache,
+  _resetMappingCache,
+  buildBusinessContext,
+  getCachedInsights,
   generateInsights,
   generateBusinessChatResponse,
-  streamBusinessChatResponse,
   proposeColumnMapping,
-  _resetMappingCache,
+  refreshInsights,
+  streamBusinessChatResponse,
 };

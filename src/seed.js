@@ -6,6 +6,7 @@ const User = require('./models/User.model');
 const Cafe = require('./models/Cafe.model');
 const Organization = require('./models/Organization.model');
 const { ingestFile } = require('./services/ingestion.service');
+const { isSafeSeedMongoUri } = require('./utils/seedMongoSafety');
 
 const MONGO_URI = process.env.MONGODB_URI;
 const IMPORT_FILE = process.env.SEED_IMPORT_FILE || process.argv[2];
@@ -16,8 +17,6 @@ const SEED_ORG_NAME = process.env.SEED_ORG_NAME || 'Demo Coffee Group';
 const SEED_CAFE_NAME = process.env.SEED_CAFE_NAME || 'Demo Cafe';
 const SEED_CAFE_CITY = process.env.SEED_CAFE_CITY || 'Cape Town';
 const SEED_CAFE_ADDRESS = process.env.SEED_CAFE_ADDRESS || 'Demo address';
-
-const isLocalUri = (uri = '') => /localhost|127\.0\.0\.1/.test(uri);
 
 const resolveImportFile = () => {
   if (!IMPORT_FILE) {
@@ -40,10 +39,10 @@ async function seed() {
     process.exit(1);
   }
 
-  // Destructive: wipes users/cafes/orgs. Refuse to run against anything
-  // that isn't a local database unless explicitly forced.
-  if (process.env.NODE_ENV === 'production' || (!isLocalUri(MONGO_URI) && process.env.SEED_FORCE !== 'true')) {
-    console.error('[seed] Refusing to run: non-local MONGODB_URI or production environment. Set SEED_FORCE=true to override.');
+  // Destructive: wipes users/cafes/orgs. Only a single, parsed loopback
+  // MongoDB target is permitted, and production is always refused.
+  if (!isSafeSeedMongoUri(MONGO_URI, process.env.NODE_ENV)) {
+    console.error('[seed] Refusing to run: MONGODB_URI must target one loopback host outside production.');
     process.exit(1);
   }
 

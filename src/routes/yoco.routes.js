@@ -72,7 +72,9 @@ router.get('/status', authMiddleware, async (req, res, next) => {
 // POST /api/yoco/sync — Manual full sync (pull all historical orders)
 router.post('/sync', authMiddleware, async (req, res, next) => {
   try {
-    const cafe = await Cafe.findById(req.user.cafeId);
+    const cafe = await Cafe.findById(req.user.cafeId).select(
+      '+yocoTokens.accessToken +yocoTokens.refreshToken'
+    );
     if (!cafe?.yocoConnected) {
       return res.status(400).json({ success: false, message: 'Yoco not connected' });
     }

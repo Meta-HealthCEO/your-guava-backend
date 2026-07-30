@@ -35,11 +35,13 @@ const errorMiddleware = (err, req, res, next) => {
     message = 'Internal Server Error';
   }
 
+  const exposeDetails = err.details && !(statusCode >= 500 && process.env.NODE_ENV === 'production');
+
   res.status(statusCode).json({
     success: false,
     message,
     ...(requestId ? { requestId } : {}),
-    ...(err.details ? { details: err.details } : {}),
+    ...(exposeDetails ? { details: err.details } : {}),
   });
 };
 

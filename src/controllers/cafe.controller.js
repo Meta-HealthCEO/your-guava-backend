@@ -2,6 +2,47 @@ const Cafe = require('../models/Cafe.model');
 const User = require('../models/User.model');
 const { normalizeTradingHours, defaultTradingHours } = require('../utils/tradingHours');
 
+const LOCATION_TEXT_FIELDS = [
+  'address',
+  'addressLine2',
+  'suburb',
+  'city',
+  'postalCode',
+  'province',
+  'country',
+];
+
+const parseCoordinate = (value, min, max, label) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
+    const error = new Error(`${label} must be between ${min} and ${max}`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return parsed;
+};
+
+const withoutTokens = (integration = {}) => {
+  const { accessToken: _accessToken, refreshToken: _refreshToken, ...safe } = integration || {};
+  return safe;
+};
+
+const cafeDto = (value) => {
+  const cafe = value?.toObject ? value.toObject() : { ...(value || {}) };
+
+  if (cafe.yocoTokens) cafe.yocoTokens = withoutTokens(cafe.yocoTokens);
+  if (cafe.accountingIntegrations) {
+    cafe.accountingIntegrations = Object.fromEntries(
+      Object.entries(cafe.accountingIntegrations).map(([provider, integration]) => [
+        provider,
+        withoutTokens(integration),
+      ])
+    );
+  }
+
+  return cafe;
+};
+
 // GET /api/cafe/list — all cafes the user can access
 const listCafes = async (req, res, next) => {
   try {
@@ -16,7 +57,10 @@ const listCafes = async (req, res, next) => {
       cafes = await Cafe.find({ orgId: user.orgId }).select('name location').lean();
     } else {
       // Managers only see assigned cafes
-      cafes = await Cafe.find({ _id: { $in: user.cafeIds } }).select('name location').lean();
+      cafes = await Cafe.find({
+        _id: { $in: user.cafeIds },
+        orgId: user.orgId,
+      }).select('name location').lean();
     }
 
     return res.status(200).json({ success: true, cafes });
@@ -27,14 +71,17 @@ const listCafes = async (req, res, next) => {
 
 const getMe = async (req, res, next) => {
   try {
-    const cafe = await Cafe.findById(req.user.cafeId).lean();
+    const cafe = await Cafe.findOne({
+      _id: req.user.cafeId,
+      orgId: req.user.orgId,
+    }).lean();
     if (!cafe) {
       return res.status(404).json({ success: false, message: 'Cafe not found' });
     }
     if (!Array.isArray(cafe.tradingHours) || cafe.tradingHours.length !== 7) {
       cafe.tradingHours = defaultTradingHours();
     }
-    return res.status(200).json({ success: true, cafe });
+    return res.status(200).json({ success: true, cafe: cafeDto(cafe) });
   } catch (error) {
     next(error);
   }
@@ -44,16 +91,56 @@ const updateMe = async (req, res, next) => {
   try {
     const { name, location, tradingHours } = req.body;
 
-    const updates = {};
-    if (name) updates.name = name;
-    if (location) updates.location = location;
+    const setUpdates = {};
+    const unsetUpdates = {};
+    if (name !== undefined) setUpdates.name = String(name).trim();
+    if (location !== undefined) {
+      if (!location || typeof location !== 'object' || Array.isArray(location)) {
+        return res.status(400).json({ success: false, message: 'location must be an object' });
+      }
+
+      for (const field of LOCATION_TEXT_FIELDS) {
+        if (!Object.prototype.hasOwnProperty.call(location, field)) continue;
+        const value = String(location[field] ?? '').trim();
+        if (value) setUpdates[`location.${field}`] = value;
+        else unsetUpdates[`location.${field}`] = 1;
+      }
+
+      const hasLat = Object.prototype.hasOwnProperty.call(location, 'lat');
+      const hasLng = Object.prototype.hasOwnProperty.call(location, 'lng');
+      if (hasLat !== hasLng) {
+        return res.status(400).json({
+          success: false,
+          message: 'Latitude and longitude must be provided together',
+        });
+      }
+      if (hasLat && hasLng) {
+        const clearCoordinates =
+          (location.lat === '' || location.lat == null) &&
+          (location.lng === '' || location.lng == null);
+        if (clearCoordinates) {
+          unsetUpdates['location.lat'] = 1;
+          unsetUpdates['location.lng'] = 1;
+        } else {
+          setUpdates['location.lat'] = parseCoordinate(location.lat, -90, 90, 'Latitude');
+          setUpdates['location.lng'] = parseCoordinate(location.lng, -180, 180, 'Longitude');
+        }
+      }
+    }
     if (tradingHours !== undefined) {
-      updates.tradingHours = normalizeTradingHours(tradingHours);
+      setUpdates.tradingHours = normalizeTradingHours(tradingHours);
     }
 
-    const cafe = await Cafe.findByIdAndUpdate(
-      req.user.cafeId,
-      { $set: updates },
+    const update = {};
+    if (Object.keys(setUpdates).length > 0) update.$set = setUpdates;
+    if (Object.keys(unsetUpdates).length > 0) update.$unset = unsetUpdates;
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ success: false, message: 'No supported cafe fields were provided' });
+    }
+
+    const cafe = await Cafe.findOneAndUpdate(
+      { _id: req.user.cafeId, orgId: req.user.orgId },
+      update,
       { new: true, runValidators: true }
     );
 
@@ -61,10 +148,10 @@ const updateMe = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Cafe not found' });
     }
 
-    return res.status(200).json({ success: true, cafe });
+    return res.status(200).json({ success: true, cafe: cafeDto(cafe) });
   } catch (error) {
     next(error);
   }
 };
 
-module.exports = { listCafes, getMe, updateMe };
+module.exports = { cafeDto, listCafes, getMe, updateMe };

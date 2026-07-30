@@ -10,6 +10,8 @@ const {
   normaliseRow,
   detectCsvSeparator,
   readWorkbookRows,
+  assertSupportedFileBuffer,
+  parserLimits,
 } = require('./parser.service');
 const { computeDedupKey } = require('../utils/dedupKey');
 const {
@@ -54,12 +56,14 @@ const yocoMapping = () => ({
  * @returns {Promise<string[]>}
  */
 const previewWorkbook = async (buffer) => {
+  assertSupportedFileBuffer(buffer, 'xlsx');
   const rows = await readWorkbookRows(buffer);
   const headers = rows[0] ? Object.keys(rows[0]) : [];
   return { headers, sampleRows: rows.slice(0, 5) };
 };
 
 const extractHeaders = async (buffer, fileExt = 'csv') => {
+  assertSupportedFileBuffer(buffer, fileExt);
   if (fileExt === 'xlsx') {
     return (await previewWorkbook(buffer)).headers;
   }
@@ -89,6 +93,7 @@ const extractHeaders = async (buffer, fileExt = 'csv') => {
  * Returns headers + first 5 rows for AI/preset analysis.
  */
 const previewBuffer = async (buffer, fileExt = 'csv') => {
+  assertSupportedFileBuffer(buffer, fileExt);
   if (fileExt === 'xlsx') {
     return previewWorkbook(buffer);
   }
@@ -96,20 +101,45 @@ const previewBuffer = async (buffer, fileExt = 'csv') => {
     throw new Error('Legacy XLS files are not supported. Please export as CSV or XLSX.');
   }
   return new Promise((resolve, reject) => {
+    const limits = parserLimits();
     const rows = [];
     let headers = [];
-    Readable.from(buffer)
-      .pipe(csv({
+    let settled = false;
+    const input = Readable.from(buffer);
+    const parserStream = csv({
         separator: detectCsvSeparator(buffer),
         mapHeaders: ({ header, index }) => normaliseHeader(header, index),
         mapValues: ({ value }) => normaliseCell(value),
-      }))
-      .on('headers', (h) => { headers = h; })
-      .on('data', (row) => {
-        if (rows.length < 5) rows.push(normaliseRow(row));
+      });
+    input
+      .pipe(parserStream)
+      .on('headers', (h) => {
+        if (h.length > limits.maxColumns) {
+          parserStream.destroy(new Error(`File exceeds the ${limits.maxColumns} column limit`));
+          return;
+        }
+        headers = h;
       })
-      .on('error', reject)
-      .on('end', () => resolve({ headers, sampleRows: rows }));
+      .on('data', (row) => {
+        if (settled) return;
+        if (rows.length < 5) rows.push(normaliseRow(row));
+        if (rows.length === 5) {
+          settled = true;
+          resolve({ headers, sampleRows: rows });
+          parserStream.destroy();
+        }
+      })
+      .on('error', (error) => {
+        if (settled) return;
+        settled = true;
+        if (!error.statusCode) error.statusCode = 400;
+        reject(error);
+      })
+      .on('end', () => {
+        if (settled) return;
+        settled = true;
+        resolve({ headers, sampleRows: rows });
+      });
   });
 };
 
@@ -125,6 +155,155 @@ const addPersistenceRowError = (rowErrors, row, reason) => {
   });
 };
 
+const transactionIdentity = (row) => {
+  if (row.receiptId) return { type: 'receiptId', value: row.receiptId };
+  return {
+    type: 'dedupKey',
+    value: computeDedupKey({
+      date: row.date.toISOString().slice(0, 10),
+      time: row.date.toISOString().slice(11, 16),
+      total: row.total,
+      items: row.items,
+    }),
+  };
+};
+
+const transactionDocument = (row, { cafeId, uploadId, identity }) => ({
+  cafeId,
+  uploadId,
+  receiptId: identity.type === 'receiptId' ? identity.value : undefined,
+  dedupKey: identity.type === 'dedupKey' ? identity.value : undefined,
+  date: row.date,
+  hour: row.hour,
+  dayOfWeek: row.dayOfWeek,
+  status: 'approved',
+  paymentMethod: row.paymentMethod,
+  items: row.items,
+  total: row.total,
+  tip: row.tip,
+  discount: row.discount,
+  source: 'csv',
+});
+
+const chunksOf = (values, size = 500) => {
+  const chunks = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+};
+
+const findExistingIdentities = async (cafeId, candidates, session) => {
+  const existing = new Set();
+  const receiptIds = [...new Set(
+    candidates.filter((candidate) => candidate.identity.type === 'receiptId')
+      .map((candidate) => candidate.identity.value)
+  )];
+  const dedupKeys = [...new Set(
+    candidates.filter((candidate) => candidate.identity.type === 'dedupKey')
+      .map((candidate) => candidate.identity.value)
+  )];
+
+  const queries = [
+    ...chunksOf(receiptIds).map((chunk) => ({ receiptId: { $in: chunk } })),
+    ...chunksOf(dedupKeys).map((chunk) => ({ dedupKey: { $in: chunk } })),
+  ];
+  for (const identityQuery of queries) {
+    let query = Transaction.find({ cafeId, ...identityQuery }).select('receiptId dedupKey');
+    if (session) query = query.session(session);
+    const rows = await query.lean();
+    for (const row of rows) {
+      if (row.receiptId) existing.add(`receiptId:${row.receiptId}`);
+      if (row.dedupKey) existing.add(`dedupKey:${row.dedupKey}`);
+    }
+  }
+  return existing;
+};
+
+const reconcileParsedRows = async (parsed, { cafeId, session }) => {
+  const reconciledCache = new Map();
+  for (const row of parsed.rows) {
+    if ((row.status || 'approved').toLowerCase() !== 'approved') continue;
+    const cacheKey = JSON.stringify(row.items || []);
+    let reconciled = reconciledCache.get(cacheKey);
+    if (!reconciled) {
+      reconciled = await reconcileTransactionItems(cafeId, row.items, { session });
+      reconciledCache.set(cacheKey, reconciled);
+    }
+    row.items = reconciled.map((item) => ({ ...item }));
+  }
+  return parsed;
+};
+
+const persistParsedRowsBulk = async (
+  parsed,
+  { cafeId, uploadId, session, itemsAlreadyReconciled = false }
+) => {
+  let skipped = 0;
+  let errors = parsed.errors;
+  const rowErrors = cloneRowErrors(parsed.rowErrors);
+  let approvedRows = 0;
+  let declinedRows = 0;
+  let duplicateRows = 0;
+  const candidates = [];
+  const seen = new Set();
+
+  for (const row of parsed.rows) {
+    const status = (row.status || 'approved').toLowerCase();
+    if (status !== 'approved') {
+      skipped++;
+      declinedRows++;
+      continue;
+    }
+    approvedRows++;
+    try {
+      if (!itemsAlreadyReconciled) {
+        row.items = await reconcileTransactionItems(cafeId, row.items, { session });
+      }
+      const identity = transactionIdentity(row);
+      const identityKey = `${identity.type}:${identity.value}`;
+      if (seen.has(identityKey)) {
+        skipped++;
+        duplicateRows++;
+        continue;
+      }
+      seen.add(identityKey);
+      candidates.push({ row, identity, identityKey });
+    } catch (error) {
+      errors++;
+      addPersistenceRowError(rowErrors, row, 'Could not reconcile row items');
+      throw error;
+    }
+  }
+
+  const existing = await findExistingIdentities(cafeId, candidates, session);
+  const importable = candidates.filter((candidate) => {
+    if (!existing.has(candidate.identityKey)) return true;
+    skipped++;
+    duplicateRows++;
+    return false;
+  });
+
+  const documents = importable.map(({ row, identity }) =>
+    transactionDocument(row, { cafeId, uploadId, identity })
+  );
+  if (documents.length > 0) {
+    await Transaction.insertMany(documents, { ordered: true, ...(session ? { session } : {}) });
+  }
+
+  return {
+    imported: documents.length,
+    skipped,
+    errors,
+    rowErrors,
+    totalRows: parsed.totalRows,
+    approvedRows,
+    declinedRows,
+    duplicateRows,
+    dateRange: parsed.dateRange,
+  };
+};
+
 /**
  * Persistence-only half of ingestion: takes an already-parsed result object and
  * writes transactions + item upserts to the database. Does NOT touch R2 or the
@@ -136,7 +315,29 @@ const addPersistenceRowError = (rowErrors, row, reason) => {
  * @param {string} opts.uploadId
  * @returns {Promise<{imported: number, skipped: number, errors: number, rowErrors: object[], totalRows: number, dateRange: object}>}
  */
-const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
+const persistParsedRows = async (
+  parsed,
+  {
+    cafeId,
+    uploadId,
+    session,
+    bulk = false,
+    itemsAlreadyReconciled = false,
+    rebuildItems = true,
+    failOnPersistenceError = false,
+  }
+) => {
+  if (bulk) {
+    const result = await persistParsedRowsBulk(parsed, {
+      cafeId,
+      uploadId,
+      session,
+      itemsAlreadyReconciled,
+    });
+    if (rebuildItems) await rebuildItemsForCafe(cafeId, { session });
+    return result;
+  }
+
   let imported = 0;
   let skipped = 0;
   let errors = parsed.errors;
@@ -166,16 +367,20 @@ const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
         ? { cafeId, receiptId: row.receiptId }
         : { cafeId, dedupKey };
 
-      const existing = await Transaction.findOne(filter).lean();
+      let existingQuery = Transaction.findOne(filter);
+      if (session) existingQuery = existingQuery.session(session);
+      const existing = await existingQuery.lean();
       if (existing) {
         skipped++;
         duplicateRows++;
         continue;
       }
 
-      const reconciledItems = await reconcileTransactionItems(cafeId, row.items);
+      const reconciledItems = itemsAlreadyReconciled
+        ? row.items
+        : await reconcileTransactionItems(cafeId, row.items, { session });
 
-      await Transaction.create({
+      const document = {
         cafeId,
         uploadId,
         receiptId: row.receiptId,
@@ -190,13 +395,16 @@ const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
         tip: row.tip,
         discount: row.discount,
         source: 'csv',
-      });
+      };
+      if (session) await Transaction.create([document], { session });
+      else await Transaction.create(document);
       imported++;
     } catch (err) {
       if (err.code === 11000) {
         skipped++;
         duplicateRows++;
       } else {
+        if (failOnPersistenceError) throw err;
         console.error('[ingestion] row error:', err.message);
         errors++;
         addPersistenceRowError(rowErrors, row, 'Could not save row');
@@ -204,7 +412,7 @@ const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
     }
   }
 
-  await rebuildItemsForCafe(cafeId);
+  if (rebuildItems) await rebuildItemsForCafe(cafeId, { session });
 
   return {
     imported,
@@ -231,8 +439,11 @@ const persistParsedRows = async (parsed, { cafeId, uploadId }) => {
  * @param {string} [opts.fileExt='csv']
  * @returns {Promise<{imported: number, skipped: number, errors: number, totalRows: number, dateRange: object}>}
  */
-const ingestParsedRows = async (buffer, { cafeId, uploadId, columnMapping, itemsMode, fileExt = 'csv' }) => {
-  const parsed = await parseBuffer(buffer, { columnMapping, itemsMode, fileExt });
+const ingestParsedRows = async (
+  buffer,
+  { cafeId, uploadId, columnMapping, itemsMode, fileExt = 'csv', timezone }
+) => {
+  const parsed = await parseBuffer(buffer, { columnMapping, itemsMode, fileExt, timezone });
   return persistParsedRows(parsed, { cafeId, uploadId });
 };
 
@@ -255,6 +466,7 @@ module.exports = {
   ingestFile,
   ingestParsedRows,
   persistParsedRows,
+  reconcileParsedRows,
   isYocoFormat,
   yocoMapping,
   extractHeaders,

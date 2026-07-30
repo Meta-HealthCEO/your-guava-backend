@@ -1,7 +1,6 @@
 const express = require('express');
 const authMiddleware = require('../middleware/auth.middleware');
 const { ownerOnly } = require('../middleware/rbac.middleware');
-const { apiCache } = require('../middleware/cache.middleware');
 const {
   checkout,
   getAccount,
@@ -20,7 +19,7 @@ router.get('/payments/onegate/return', handleOneGateReturn);
 
 router.use(authMiddleware);
 
-router.get('/credits', apiCache({ ttlMs: 30000, keyPrefix: 'account-credits' }), getCreditBalance);
+router.get('/credits', getCreditBalance);
 router.get('/', getAccount);
 router.patch('/profile', updateProfile);
 router.post('/checkout', ownerOnly, checkout);

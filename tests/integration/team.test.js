@@ -1,6 +1,7 @@
 const supertest = require('supertest');
 const { setup, teardown, clearDB, createTestUser, createTestManager, app } = require('../setup');
 const User = require('../../src/models/User.model');
+const TeamInvitation = require('../../src/models/TeamInvitation.model');
 const emailService = require('../../src/services/email.service');
 
 const request = supertest(app);
@@ -23,7 +24,7 @@ describe('Team API', () => {
   });
 
   describe('POST /api/team/invite', () => {
-    it('owner invites a manager successfully', async () => {
+    it('stores only a hashed pending token, then accepts it exactly once', async () => {
       const cafeId = ownerUser.activeCafeId;
       const inviteSpy = jest
         .spyOn(emailService, 'sendTeamInviteEmail')
@@ -40,63 +41,64 @@ describe('Team API', () => {
 
       expect(res.status).toBe(201);
       expect(res.body.success).toBe(true);
-      expect(res.body.manager).toBeDefined();
-      expect(res.body.manager.email).toBe('manager@yourguava.com');
-      expect(res.body.manager.role).toBe('manager');
-      // Email was "sent" (mock), so the password must not leak into the response
+      expect(res.body.invitation.email).toBe('manager@yourguava.com');
       expect(res.body.emailSent).toBe(true);
-      expect(res.body.temporaryPassword).toBeUndefined();
+      expect(res.body.token).toBeUndefined();
       expect(inviteSpy).toHaveBeenCalledTimes(1);
       expect(inviteSpy).toHaveBeenCalledWith({
-        manager: expect.objectContaining({
+        invitation: expect.objectContaining({
           email: 'manager@yourguava.com',
           name: 'New Manager',
         }),
         owner: expect.objectContaining({ email: 'test@yourguava.com' }),
         cafes: expect.arrayContaining([expect.objectContaining({ name: 'Test Cafe' })]),
-        temporaryPassword: expect.stringMatching(/^Guava-/),
+        invitationToken: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
       });
 
-      const persisted = await User.findOne({ email: 'manager@yourguava.com' });
+      expect(await User.findOne({ email: 'manager@yourguava.com' })).toBeNull();
+      const invitationToken = inviteSpy.mock.calls[0][0].invitationToken;
+      const persistedInvite = await TeamInvitation.findById(res.body.invitation.id).select('+tokenHash');
+      expect(persistedInvite.status).toBe('pending');
+      expect(persistedInvite.tokenHash).toMatch(/^[a-f0-9]{64}$/);
+      expect(persistedInvite.tokenHash).not.toBe(invitationToken);
+      expect(JSON.stringify(res.body)).not.toContain(invitationToken);
+
+      const preview = await request
+        .post('/api/team/invitations/preview')
+        .send({ token: invitationToken });
+      expect(preview.status).toBe(200);
+      expect(preview.headers['cache-control']).toBe('no-store');
+      expect(preview.body.invitation).toEqual(expect.objectContaining({
+        email: 'manager@yourguava.com',
+        organizationName: 'Test Org',
+        cafeNames: ['Test Cafe'],
+      }));
+      expect(JSON.stringify(preview.body)).not.toContain(invitationToken);
+
+      const accepted = await request
+        .post('/api/team/invitations/accept')
+        .send({ token: invitationToken, password: 'chosen-password-123' });
+      expect(accepted.status).toBe(201);
+      expect(accepted.headers['cache-control']).toBe('no-store');
+      expect(accepted.body.user).toEqual({ email: 'manager@yourguava.com' });
+
+      const persisted = await User.findOne({ email: 'manager@yourguava.com' }).select('+password');
       expect(persisted).toBeTruthy();
       expect(persisted.role).toBe('manager');
       expect(persisted.orgId.toString()).toBe(ownerUser.orgId.toString());
       expect(persisted.activeCafeId.toString()).toBe(cafeId.toString());
-      expect(persisted.cafeIds.map((id) => id.toString())).toEqual([cafeId.toString()]);
+      await expect(persisted.comparePassword('chosen-password-123')).resolves.toBe(true);
 
-      const sentPassword = inviteSpy.mock.calls[0][0].temporaryPassword;
-      expect(persisted.password).not.toBe(sentPassword);
-      await expect(persisted.comparePassword(sentPassword)).resolves.toBe(true);
+      const replay = await request
+        .post('/api/team/invitations/accept')
+        .send({ token: invitationToken, password: 'another-password-123' });
+      expect(replay.status).toBe(404);
+      expect(replay.headers['cache-control']).toBe('no-store');
+      expect(replay.body.message).toMatch(/invalid or has expired/i);
+      expect(await User.countDocuments({ email: 'manager@yourguava.com' })).toBe(1);
     });
 
-    it('ignores a client-supplied password and generates its own', async () => {
-      const cafeId = ownerUser.activeCafeId;
-      const inviteSpy = jest
-        .spyOn(emailService, 'sendTeamInviteEmail')
-        .mockResolvedValue({ sent: true });
-
-      const res = await request
-        .post('/api/team/invite')
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .send({
-          name: 'New Manager',
-          email: 'manager2@yourguava.com',
-          password: 'attacker-chosen-password',
-          cafeIds: [cafeId],
-        });
-
-      expect(res.status).toBe(201);
-      // Passwords are delivered only through the invite email, never the API.
-      expect(res.body.emailSent).toBe(true);
-      expect(res.body.temporaryPassword).toBeUndefined();
-
-      const persisted = await User.findOne({ email: 'manager2@yourguava.com' });
-      const sentPassword = inviteSpy.mock.calls[0][0].temporaryPassword;
-      await expect(persisted.comparePassword('attacker-chosen-password')).resolves.toBe(false);
-      await expect(persisted.comparePassword(sentPassword)).resolves.toBe(true);
-    });
-
-    it('rolls back the manager and never returns a password when invite email is skipped', async () => {
+    it('revokes the pending token and creates no account when invite email is skipped', async () => {
       const cafeId = ownerUser.activeCafeId;
       jest
         .spyOn(emailService, 'sendTeamInviteEmail')
@@ -116,11 +118,12 @@ describe('Team API', () => {
       expect(res.body.success).toBe(false);
       expect(res.body.emailSent).toBe(false);
       expect(res.body.message).toMatch(/email is not configured/i);
-      expect(res.body.temporaryPassword).toBeUndefined();
-      expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/blocked because email is not configured/i));
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/invitation .* blocked because email is not configured/i));
 
       const persisted = await User.findOne({ email: 'no-email@yourguava.com' });
       expect(persisted).toBeNull();
+      const invitation = await TeamInvitation.findOne({ email: 'no-email@yourguava.com' });
+      expect(invitation.status).toBe('revoked');
       expect(res.body.seats.used).toBe(1);
     });
 
@@ -162,16 +165,126 @@ describe('Team API', () => {
       expect(res.status).toBe(402);
       expect(res.body.message).toMatch(/seat limit/i);
     });
-  });
 
-  describe('GET /api/team', () => {
-    it('lists team members', async () => {
+    it('serializes concurrent invites so the seat limit cannot be exceeded', async () => {
       const cafeId = ownerUser.activeCafeId;
       jest
         .spyOn(emailService, 'sendTeamInviteEmail')
         .mockResolvedValue({ sent: true });
 
-      // Invite a manager
+      const responses = await Promise.all([
+        request
+          .post('/api/team/invite')
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .send({ name: 'Manager A', email: 'manager-a@yourguava.com', cafeIds: [cafeId] }),
+        request
+          .post('/api/team/invite')
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .send({ name: 'Manager B', email: 'manager-b@yourguava.com', cafeIds: [cafeId] }),
+      ]);
+
+      expect(responses.map((response) => response.status).sort()).toEqual([201, 402]);
+      expect(await User.countDocuments({ orgId: ownerUser.orgId })).toBe(1);
+      expect(await TeamInvitation.countDocuments({ orgId: ownerUser.orgId, status: 'pending' })).toBe(1);
+    });
+
+    it('serializes concurrent acceptance and creates one manager account', async () => {
+      const inviteSpy = jest
+        .spyOn(emailService, 'sendTeamInviteEmail')
+        .mockResolvedValue({ sent: true });
+      await request
+        .post('/api/team/invite')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({
+          name: 'Concurrent Manager',
+          email: 'concurrent@yourguava.com',
+          cafeIds: [ownerUser.activeCafeId],
+        });
+      const token = inviteSpy.mock.calls[0][0].invitationToken;
+
+      const responses = await Promise.all([
+        request.post('/api/team/invitations/accept').send({ token, password: 'chosen-password-123' }),
+        request.post('/api/team/invitations/accept').send({ token, password: 'chosen-password-123' }),
+      ]);
+
+      expect(responses.map((response) => response.status).sort()).toEqual([201, 404]);
+      expect(await User.countDocuments({ email: 'concurrent@yourguava.com' })).toBe(1);
+    });
+
+    it('revalidates the seat limit at acceptance time', async () => {
+      const inviteSpy = jest
+        .spyOn(emailService, 'sendTeamInviteEmail')
+        .mockResolvedValue({ sent: true });
+      await request
+        .post('/api/team/invite')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({
+          name: 'Delayed Manager',
+          email: 'delayed@yourguava.com',
+          cafeIds: [ownerUser.activeCafeId],
+        });
+      const token = inviteSpy.mock.calls[0][0].invitationToken;
+      await User.create({
+        name: 'Existing Manager',
+        email: 'existing@yourguava.com',
+        password: 'password123',
+        role: 'manager',
+        orgId: ownerUser.orgId,
+        cafeIds: [ownerUser.activeCafeId],
+        activeCafeId: ownerUser.activeCafeId,
+      });
+
+      const accepted = await request
+        .post('/api/team/invitations/accept')
+        .send({ token, password: 'chosen-password-123' });
+
+      expect(accepted.status).toBe(409);
+      expect(accepted.body.message).toMatch(/ask the account owner/i);
+      expect(await User.findOne({ email: 'delayed@yourguava.com' })).toBeNull();
+      expect((await TeamInvitation.findOne({ email: 'delayed@yourguava.com' })).status).toBe('pending');
+    });
+
+    it('rotates tokens on resend and revokes an unused invitation', async () => {
+      const inviteSpy = jest
+        .spyOn(emailService, 'sendTeamInviteEmail')
+        .mockResolvedValue({ sent: true });
+      const invited = await request
+        .post('/api/team/invite')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({
+          name: 'Resend Manager',
+          email: 'resend@yourguava.com',
+          cafeIds: [ownerUser.activeCafeId],
+        });
+      const firstToken = inviteSpy.mock.calls[0][0].invitationToken;
+
+      const resent = await request
+        .post(`/api/team/invitations/${invited.body.invitation.id}/resend`)
+        .set('Authorization', `Bearer ${ownerToken}`);
+      expect(resent.status).toBe(200);
+      const secondToken = inviteSpy.mock.calls[1][0].invitationToken;
+      expect(secondToken).not.toBe(firstToken);
+
+      expect((await request.post('/api/team/invitations/preview').send({ token: firstToken })).status).toBe(404);
+      expect((await request.post('/api/team/invitations/preview').send({ token: secondToken })).status).toBe(200);
+
+      const revoked = await request
+        .delete(`/api/team/invitations/${invited.body.invitation.id}`)
+        .set('Authorization', `Bearer ${ownerToken}`);
+      expect(revoked.status).toBe(200);
+      expect(revoked.body.seats).toEqual(expect.objectContaining({ active: 1, pending: 0, used: 1 }));
+      expect((await request.post('/api/team/invitations/preview').send({ token: secondToken })).status).toBe(404);
+    });
+  });
+
+  describe('GET /api/team', () => {
+    it('lists active members separately from pending invitations', async () => {
+      const cafeId = ownerUser.activeCafeId;
+      jest
+        .spyOn(emailService, 'sendTeamInviteEmail')
+        .mockResolvedValue({ sent: true });
+
+      // Send an invitation without accepting it.
       await request
         .post('/api/team/invite')
         .set('Authorization', `Bearer ${ownerToken}`)
@@ -189,8 +302,10 @@ describe('Team API', () => {
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(res.body.members).toBeDefined();
-      // Owner + Manager = 2 members
-      expect(res.body.members.length).toBe(2);
+      expect(res.body.members).toHaveLength(1);
+      expect(res.body.invitations).toHaveLength(1);
+      expect(res.body.invitations[0].email).toBe('team@yourguava.com');
+      expect(res.body.seats).toEqual(expect.objectContaining({ active: 1, pending: 1, used: 2 }));
     });
   });
 
@@ -233,22 +348,8 @@ describe('Team API', () => {
   describe('DELETE /api/team/:id', () => {
     it('removes manager from org', async () => {
       const cafeId = ownerUser.activeCafeId;
-      jest
-        .spyOn(emailService, 'sendTeamInviteEmail')
-        .mockResolvedValue({ sent: true });
-
-      // Invite a manager
-      const inviteRes = await request
-        .post('/api/team/invite')
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .send({
-          name: 'To Remove',
-          email: 'remove@yourguava.com',
-          password: 'password123',
-          cafeIds: [cafeId],
-        });
-
-      const managerId = inviteRes.body.manager.id;
+      const manager = await createTestManager(ownerToken, [cafeId]);
+      const managerId = manager.user.id;
 
       const res = await request
         .delete(`/api/team/${managerId}`)

@@ -3,8 +3,12 @@ const Item = require('../models/Item.model');
 const Transaction = require('../models/Transaction.model');
 const { inferItemCategory } = require('../utils/itemCategory');
 
+const MAX_CANONICAL_NAME_CHARS = 200;
+const MAX_ALIASES = 50;
+
 const normalizeItemName = (name = '') =>
   String(name)
+    .slice(0, MAX_CANONICAL_NAME_CHARS)
     .toLowerCase()
     .replace(/\s*\([^)]*\)\s*/g, ' ')
     .replace(/[^a-z0-9]+/g, ' ')
@@ -16,10 +20,16 @@ const toObjectId = (id) => (
 );
 
 const uniqueStrings = (values = []) =>
-  [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
+  [...new Set(
+    values
+      .map((value) => String(value || '').trim())
+      .filter((value) => value && value.length <= MAX_CANONICAL_NAME_CHARS)
+  )].slice(0, MAX_ALIASES);
 
 const buildAliasKeys = (aliases = []) =>
   uniqueStrings(aliases).map(normalizeItemName).filter(Boolean);
+
+const withSession = (query, session) => (session ? query.session(session) : query);
 
 const levenshteinDistance = (a = '', b = '') => {
   const rows = Array.from({ length: a.length + 1 }, (_, index) => [index]);
@@ -44,22 +54,23 @@ const stringSimilarity = (a = '', b = '') => {
   return 1 - (levenshteinDistance(a, b) / longest);
 };
 
-const ensureMenuItem = async (cafeId, rawName, item = {}) => {
+const ensureMenuItem = async (cafeId, rawName, item = {}, options = {}) => {
+  const { session } = options;
   const name = String(rawName || '').trim() || 'Unknown Item';
   const normalizedName = normalizeItemName(name);
-  const existing = await Item.findOne({
+  const existing = await withSession(Item.findOne({
     cafeId,
     $or: [
       { name },
       { normalizedName },
       { aliasKeys: normalizedName },
     ],
-  });
+  }), session);
 
   if (existing) return existing;
 
   const unitPrice = Number.isFinite(Number(item.unitPrice)) ? Number(item.unitPrice) : undefined;
-  return Item.create({
+  const document = {
     cafeId,
     name,
     normalizedName,
@@ -75,7 +86,9 @@ const ensureMenuItem = async (cafeId, rawName, item = {}) => {
     lastObservedPrice: unitPrice,
     firstSeenAt: new Date(),
     lastSeenAt: new Date(),
-  });
+  };
+  if (session) return (await Item.create([document], { session }))[0];
+  return Item.create(document);
 };
 
 const priceCheckForItem = (menuItem, unitPrice) => {
@@ -94,13 +107,14 @@ const priceCheckForItem = (menuItem, unitPrice) => {
   return { expectedPrice, priceVariancePct, isMismatch };
 };
 
-const reconcileTransactionItems = async (cafeId, items = []) => {
+const reconcileTransactionItems = async (cafeId, items = [], options = {}) => {
+  const { session } = options;
   const reconciled = [];
   const mismatchUpdates = new Map();
 
   for (const item of items) {
     const rawName = String(item.name || '').trim();
-    const menuItem = await ensureMenuItem(cafeId, rawName, item);
+    const menuItem = await ensureMenuItem(cafeId, rawName, item, { session });
     const priceCheck = priceCheckForItem(menuItem, item.unitPrice);
     const menuItemStatus = priceCheck.isMismatch
       ? 'price_mismatch'
@@ -131,16 +145,18 @@ const reconcileTransactionItems = async (cafeId, items = []) => {
       {
         $set: { lastPriceMismatchAt: new Date() },
         $inc: { priceMismatchCount: 1 },
-      }
+      },
+      session ? { session } : undefined
     );
   }
 
   return reconciled;
 };
 
-const rebuildItemsForCafe = async (cafeId) => {
+const rebuildItemsForCafe = async (cafeId, options = {}) => {
+  const { session } = options;
   const cafeObjectId = toObjectId(cafeId);
-  const stats = await Transaction.aggregate([
+  const aggregation = Transaction.aggregate([
     { $match: { cafeId: cafeObjectId, status: 'approved' } },
     { $unwind: '$items' },
     { $match: { 'items.name': { $nin: [null, ''] } } },
@@ -183,6 +199,8 @@ const rebuildItemsForCafe = async (cafeId) => {
       },
     },
   ]);
+  if (session) aggregation.session(session);
+  const stats = await aggregation;
 
   const activeIds = stats
     .map((entry) => entry._id.salesItemId)
@@ -204,22 +222,24 @@ const rebuildItemsForCafe = async (cafeId) => {
           }
         : {}),
     },
-    { $set: { totalSold: 0, avgPrice: 0 } }
+    { $set: { totalSold: 0, avgPrice: 0 } },
+    session ? { session } : undefined
   );
 
   for (const entry of stats) {
     const totalQty = entry.totalQty || 0;
     const name = entry._id.name;
     const aliases = uniqueStrings(entry.rawNames).filter((alias) => alias !== name);
-    const existing = entry._id.salesItemId
-      ? await Item.findOne({ _id: entry._id.salesItemId, cafeId: cafeObjectId })
-      : await Item.findOne({
+    const existingQuery = entry._id.salesItemId
+      ? Item.findOne({ _id: entry._id.salesItemId, cafeId: cafeObjectId })
+      : Item.findOne({
           cafeId: cafeObjectId,
           $or: [
             { name },
             { normalizedName: normalizeItemName(name) },
           ],
         });
+    const existing = await withSession(existingQuery, session);
     const reviewStatus = existing?.reviewStatus && existing.reviewStatus !== 'needs_review'
       ? existing.reviewStatus
       : entry.needsReviewCount > 0 || !existing
@@ -254,7 +274,7 @@ const rebuildItemsForCafe = async (cafeId) => {
         $set: setFields,
         $setOnInsert: { cafeId: cafeObjectId, source: 'imported' },
       },
-      { upsert: true, new: true }
+      { upsert: true, new: true, ...(session ? { session } : {}) }
     );
   }
 };

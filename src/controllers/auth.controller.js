@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const mongoose = require('mongoose');
 const User = require('../models/User.model');
 const Cafe = require('../models/Cafe.model');
 const Organization = require('../models/Organization.model');
@@ -9,26 +10,44 @@ const COOKIE_OPTIONS = {
   httpOnly: true,
   sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
   secure: process.env.NODE_ENV === 'production',
+  path: '/api/auth',
   maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days in ms
 };
 
 // Max stored refresh tokens per user (roughly one per device, plus rotations)
 const MAX_REFRESH_TOKENS = 10;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAX_PASSWORD_BYTES = 72;
 
-// Drops expired/invalid tokens so the stored list stays bounded and clean.
-const pruneRefreshTokens = (entries = []) =>
-  entries.filter((entry) => {
-    try {
-      jwt.verify(entry.token, process.env.JWT_REFRESH_SECRET);
-      return true;
-    } catch {
-      return false;
-    }
-  });
+const passwordTooLong = (password) =>
+  Buffer.byteLength(String(password), 'utf8') > MAX_PASSWORD_BYTES;
+
+const hashRefreshToken = (token) =>
+  crypto.createHash('sha256').update(String(token)).digest('hex');
+
+const refreshTokenExpiry = (token) => {
+  const decoded = jwt.decode(token);
+  return decoded?.exp ? new Date(decoded.exp * 1000) : new Date(Date.now() + COOKIE_OPTIONS.maxAge);
+};
+
+// New refresh tokens are stored as one-way digests. A database read can no
+// longer be turned directly into an authenticated browser session.
+const refreshTokenEntry = (token) => ({
+  tokenHash: hashRefreshToken(token),
+  expiresAt: refreshTokenExpiry(token),
+});
+
+const pruneRefreshTokens = (entries = []) => {
+  const now = Date.now();
+  return entries.filter((entry) => !entry.expiresAt || new Date(entry.expiresAt).getTime() > now);
+};
 
 const storeRefreshToken = (user, refreshToken) => {
   const pruned = pruneRefreshTokens(user.refreshTokens);
-  user.refreshTokens = [...pruned.slice(-(MAX_REFRESH_TOKENS - 1)), { token: refreshToken }];
+  user.refreshTokens = [
+    ...pruned.slice(-(MAX_REFRESH_TOKENS - 1)),
+    refreshTokenEntry(refreshToken),
+  ];
 };
 
 const generateTokens = (userId, cafeId, role, orgId, tokenVersion = 0) => {
@@ -56,6 +75,7 @@ const generateTokens = (userId, cafeId, role, orgId, tokenVersion = 0) => {
 };
 
 const register = async (req, res, next) => {
+  let session;
   try {
     const { email, password, name, cafeName, orgName } = req.body;
 
@@ -70,43 +90,78 @@ const register = async (req, res, next) => {
         .status(400)
         .json({ success: false, message: 'Password must be at least 8 characters' });
     }
-
-    const existingUser = await User.findOne({ email: email.toLowerCase().trim() });
-    if (existingUser) {
-      return res.status(409).json({ success: false, message: 'Email already registered' });
+    if (passwordTooLong(password)) {
+      return res
+        .status(400)
+        .json({ success: false, message: `Password cannot exceed ${MAX_PASSWORD_BYTES} UTF-8 bytes` });
     }
 
-    // Create user first (owner by default)
-    const user = await User.create({ email, password, name, role: 'owner' });
+    const normalizedEmail = String(email).toLowerCase().trim();
+    const normalizedName = String(name).trim();
+    const suppliedCafeName = cafeName == null ? '' : String(cafeName).trim();
+    const suppliedOrgName = orgName == null ? '' : String(orgName).trim();
+    const normalizedCafeName = suppliedCafeName || 'My Cafe';
+    const normalizedOrgName =
+      suppliedOrgName || `${normalizedName}'s Organization`.slice(0, 120);
+    if (!EMAIL_RE.test(normalizedEmail) || normalizedEmail.length > 254) {
+      return res.status(400).json({ success: false, message: 'Enter a valid email address' });
+    }
+    if (normalizedName.length < 2 || normalizedName.length > 120) {
+      return res.status(400).json({ success: false, message: 'Name must be between 2 and 120 characters' });
+    }
+    if (normalizedCafeName.length < 2 || normalizedCafeName.length > 120) {
+      return res.status(400).json({ success: false, message: 'Cafe name must be between 2 and 120 characters' });
+    }
+    if (normalizedOrgName.length < 2 || normalizedOrgName.length > 120) {
+      return res.status(400).json({ success: false, message: 'Organization name must be between 2 and 120 characters' });
+    }
 
-    // Create organization
-    const org = await Organization.create({
-      name: orgName || `${name}'s Organization`,
-      ownerId: user._id,
-      billingEmail: email,
+    let user;
+    let org;
+    let cafe;
+    let accessToken;
+    let refreshToken;
+
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      const existingUser = await User.findOne({ email: normalizedEmail }).session(session);
+      if (existingUser) {
+        const conflict = new Error('Email already registered');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+
+      [user] = await User.create(
+        [{ email: normalizedEmail, password, name: normalizedName, role: 'owner' }],
+        { session }
+      );
+      [org] = await Organization.create(
+        [{
+          name: normalizedOrgName,
+          ownerId: user._id,
+          billingEmail: normalizedEmail,
+        }],
+        { session }
+      );
+      [cafe] = await Cafe.create(
+        [{ name: normalizedCafeName, orgId: org._id }],
+        { session }
+      );
+
+      user.orgId = org._id;
+      user.cafeIds = [cafe._id];
+      user.activeCafeId = cafe._id;
+
+      ({ accessToken, refreshToken } = generateTokens(
+        user._id,
+        cafe._id,
+        'owner',
+        org._id,
+        user.tokenVersion
+      ));
+      storeRefreshToken(user, refreshToken);
+      await user.save({ session });
     });
-
-    // Create first cafe
-    const cafe = await Cafe.create({
-      name: cafeName || 'My Cafe',
-      orgId: org._id,
-    });
-
-    // Link user to org and cafe
-    user.orgId = org._id;
-    user.cafeIds = [cafe._id];
-    user.activeCafeId = cafe._id;
-
-    const { accessToken, refreshToken } = generateTokens(
-      user._id,
-      cafe._id,
-      'owner',
-      org._id,
-      user.tokenVersion
-    );
-
-    storeRefreshToken(user, refreshToken);
-    await user.save();
 
     try {
       const emailResult = await emailService.sendWelcomeEmail({ user, org, cafe });
@@ -144,7 +199,12 @@ const register = async (req, res, next) => {
       },
     });
   } catch (error) {
+    if (error?.code === 11000 && error?.keyPattern?.email) {
+      return res.status(409).json({ success: false, message: 'Email already registered' });
+    }
     next(error);
+  } finally {
+    if (session) await session.endSession();
   }
 };
 
@@ -158,7 +218,12 @@ const login = async (req, res, next) => {
         .json({ success: false, message: 'Email and password are required' });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    const normalizedEmail = String(email).toLowerCase().trim();
+    if (!EMAIL_RE.test(normalizedEmail) || passwordTooLong(password)) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    }
+
+    const user = await User.findOne({ email: normalizedEmail }).select('+password +refreshTokens');
     if (!user) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
@@ -212,23 +277,67 @@ const refresh = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'No refresh token' });
     }
 
-    // Find the user that holds this refresh token
-    const user = await User.findOne({ 'refreshTokens.token': token });
-    if (!user) {
-      return res.status(401).json({ success: false, message: 'Invalid refresh token' });
-    }
-
-    // Verify the token
-    jwt.verify(token, process.env.JWT_REFRESH_SECRET);
-
-    // Atomically consume the presented token. The $pull is the race gate:
-    // if two requests arrive with the same token, only the first removes it
-    // (modifiedCount === 1); the loser is treated as a replay and rejected.
-    const consume = await User.updateOne(
-      { _id: user._id, 'refreshTokens.token': token },
-      { $pull: { refreshTokens: { token } } }
+    const decoded = jwt.verify(token, process.env.JWT_REFRESH_SECRET);
+    const tokenHash = hashRefreshToken(token);
+    const newRefreshToken = jwt.sign(
+      { id: decoded.id, jti: crypto.randomUUID() },
+      process.env.JWT_REFRESH_SECRET,
+      { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' }
     );
-    if (consume.modifiedCount === 0) {
+    const newEntry = refreshTokenEntry(newRefreshToken);
+
+    // Consume the old digest and append the replacement in one database write.
+    // The query predicate is the replay gate: only one concurrent request can
+    // match the presented token.
+    const user = await User.findOneAndUpdate(
+      {
+        _id: decoded.id,
+        $or: [
+          { 'refreshTokens.tokenHash': tokenHash },
+          { 'refreshTokens.token': token },
+        ],
+      },
+      [
+        {
+          $set: {
+            refreshTokens: {
+              $slice: [
+                {
+                  $concatArrays: [
+                    {
+                      $filter: {
+                        input: { $ifNull: ['$refreshTokens', []] },
+                        as: 'entry',
+                        cond: {
+                          $and: [
+                            {
+                              $ne: [
+                                { $ifNull: ['$$entry.tokenHash', ''] },
+                                tokenHash,
+                              ],
+                            },
+                            {
+                              $ne: [
+                                { $ifNull: ['$$entry.token', ''] },
+                                token,
+                              ],
+                            },
+                          ],
+                        },
+                      },
+                    },
+                    [newEntry],
+                  ],
+                },
+                -MAX_REFRESH_TOKENS,
+              ],
+            },
+          },
+        },
+      ],
+      { new: true }
+    );
+    if (!user) {
       return res.status(401).json({ success: false, message: 'Invalid or expired refresh token' });
     }
 
@@ -242,21 +351,6 @@ const refresh = async (req, res, next) => {
       },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
-    );
-
-    // Rotate: issue and store a fresh, unique (jti) refresh token, bounded list.
-    const newRefreshToken = jwt.sign(
-      { id: user._id, jti: crypto.randomUUID() },
-      process.env.JWT_REFRESH_SECRET,
-      { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' }
-    );
-    await User.updateOne(
-      { _id: user._id },
-      {
-        $push: {
-          refreshTokens: { $each: [{ token: newRefreshToken }], $slice: -MAX_REFRESH_TOKENS },
-        },
-      }
     );
     res.cookie('refreshToken', newRefreshToken, COOKIE_OPTIONS);
 
@@ -274,10 +368,21 @@ const logout = async (req, res, next) => {
     const token = req.cookies?.refreshToken;
 
     if (token) {
-      // Remove the token from the user's refreshTokens array
+      const tokenHash = hashRefreshToken(token);
       await User.updateOne(
-        { 'refreshTokens.token': token },
-        { $pull: { refreshTokens: { token } } }
+        {
+          $or: [
+            { 'refreshTokens.tokenHash': tokenHash },
+            { 'refreshTokens.token': token },
+          ],
+        },
+        {
+          $pull: {
+            refreshTokens: {
+              $or: [{ tokenHash }, { token }],
+            },
+          },
+        }
       );
     }
 
@@ -285,6 +390,7 @@ const logout = async (req, res, next) => {
       httpOnly: true,
       sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       secure: process.env.NODE_ENV === 'production',
+      path: '/api/auth',
     });
 
     return res.status(200).json({ success: true, message: 'Logged out' });
@@ -308,8 +414,13 @@ const changePassword = async (req, res, next) => {
         .status(400)
         .json({ success: false, message: 'New password must be at least 8 characters' });
     }
+    if (passwordTooLong(newPassword)) {
+      return res
+        .status(400)
+        .json({ success: false, message: `New password cannot exceed ${MAX_PASSWORD_BYTES} UTF-8 bytes` });
+    }
 
-    const user = await User.findById(req.user.id);
+    const user = await User.findById(req.user.id).select('+password +refreshTokens');
     if (!user) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
@@ -335,6 +446,7 @@ const changePassword = async (req, res, next) => {
       httpOnly: true,
       sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       secure: process.env.NODE_ENV === 'production',
+      path: '/api/auth',
     });
 
     return res.status(200).json({

@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const mongoose = require('mongoose');
 const Forecast = require('../models/Forecast.model');
 const Cafe = require('../models/Cafe.model');
@@ -16,48 +17,41 @@ const {
   normalizeForecastSettings,
 } = require('../services/forecastFactors.service');
 const {
-  generateInsights,
   generateBusinessChatResponse,
+  getCachedInsights,
+  refreshInsights,
   streamBusinessChatResponse,
 } = require('../services/anthropic.service');
 const { meterGuavaCredits } = require('../services/usage.service');
+const {
+  addZonedDays,
+  safeTimezone,
+  zonedDateKey,
+  zonedDayStart,
+} = require('../services/parser.service');
 
 const REQUIRED_PLANNING_FACTOR_KEYS = ['weather', 'loadShedding', 'holiday', 'payday', 'events'];
 const HISTORY_BACKFILL_BATCH_SIZE = 14;
 const historyBackfillJobs = new Set();
 
-const startOfDay = (date) => {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return d;
-};
-
-const addDays = (date, days) => {
-  const d = new Date(date);
-  d.setDate(d.getDate() + days);
-  return d;
-};
-
-const toDateKey = (date) => {
-  const d = new Date(date);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-};
-
-const parseDateOnly = (value) => {
-  if (!value) return null;
-  const match = String(value).match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (match) {
-    const [, year, month, day] = match;
-    return startOfDay(new Date(Number(year), Number(month) - 1, Number(day)));
-  }
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? null : startOfDay(parsed);
-};
-
 const clampHistoryDays = (value) => {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed)) return 90;
   return Math.max(1, Math.min(366, parsed));
+};
+
+const getCafeTimezone = async (cafeId) => {
+  const cafe = await Cafe.findById(cafeId).select('timezone').lean();
+  return safeTimezone(cafe?.timezone);
+};
+
+const parseRequestedDay = (value, timezone) => {
+  if (!value) return null;
+  const parsed = zonedDayStart(value, timezone);
+  if (parsed) return parsed;
+  const error = new Error('Invalid date');
+  error.statusCode = 400;
+  throw error;
 };
 
 const hasMatchedActuals = (forecast) =>
@@ -119,7 +113,12 @@ const buildHistoryRow = (forecast, actual = {}) => {
       isPublicHoliday: Boolean(forecast.signals?.isPublicHoliday),
       isSchoolHoliday: Boolean(forecast.signals?.isSchoolHoliday),
       isPayday: Boolean(forecast.signals?.isPayday),
-      loadSheddingStage: forecast.signals?.loadSheddingStage || 0,
+      loadSheddingStage: Number.isFinite(forecast.signals?.loadSheddingStage)
+        ? forecast.signals.loadSheddingStage
+        : null,
+      loadSheddingAvailable: forecast.signals?.loadSheddingAvailable ?? null,
+      loadSheddingUnavailableReason:
+        forecast.signals?.loadSheddingUnavailableReason ?? null,
       events: forecast.signals?.events || [],
     },
     activeFactors,
@@ -145,7 +144,7 @@ const ensureHistoryForecast = async (cafeId, date) => {
   return updated || forecast;
 };
 
-const scheduleHistoryBackfill = (cafeId, dateKeys) => {
+const scheduleHistoryBackfill = (cafeId, dateKeys, timezone) => {
   if (dateKeys.length === 0 || process.env.NODE_ENV === 'test') return false;
 
   const key = String(cafeId);
@@ -158,7 +157,7 @@ const scheduleHistoryBackfill = (cafeId, dateKeys) => {
     try {
       for (const dateKey of batch) {
         try {
-          await ensureHistoryForecast(cafeId, parseDateOnly(dateKey));
+          await ensureHistoryForecast(cafeId, zonedDayStart(dateKey, timezone));
         } catch (error) {
           console.error('[history] backfill failed for', dateKey, error.message);
         }
@@ -174,8 +173,8 @@ const scheduleHistoryBackfill = (cafeId, dateKeys) => {
 const getToday = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const timezone = await getCafeTimezone(cafeId);
+    const today = zonedDayStart(new Date(), timezone);
 
     let forecast = await Forecast.findOne({ cafeId, date: today });
 
@@ -192,23 +191,26 @@ const getToday = async (req, res, next) => {
 const getWeek = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    const nextWeek = new Date(today);
-    nextWeek.setDate(nextWeek.getDate() + 7);
+    const timezone = await getCafeTimezone(cafeId);
+    const today = zonedDayStart(new Date(), timezone);
+    const nextWeek = addZonedDays(today, 7, timezone);
 
     const existing = await Forecast.find({
       cafeId,
       date: { $gte: today, $lt: nextWeek },
     }).sort({ date: 1 });
 
-    const existingByDate = new Map(existing.map((forecast) => [toDateKey(forecast.date), forecast]));
-    const targetDates = Array.from({ length: 7 }, (_, index) => addDays(today, index));
+    const existingByDate = new Map(
+      existing.map((forecast) => [zonedDateKey(forecast.date, timezone), forecast])
+    );
+    const targetDates = Array.from(
+      { length: 7 },
+      (_, index) => addZonedDays(today, index, timezone)
+    );
     // Resilient: a transient failure on one day still returns the other days.
     const settled = await Promise.allSettled(
       targetDates.map(async (targetDate) => {
-        const existingForecast = existingByDate.get(toDateKey(targetDate));
+        const existingForecast = existingByDate.get(zonedDateKey(targetDate, timezone));
         if (existingForecast && !needsPlanningRefresh(existingForecast)) {
           return existingForecast;
         }
@@ -238,7 +240,9 @@ const generate = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'date is required' });
     }
 
-    const forecast = await generateForecast(cafeId, new Date(date));
+    const timezone = await getCafeTimezone(cafeId);
+    const targetDate = parseRequestedDay(date, timezone);
+    const forecast = await generateForecast(cafeId, targetDate);
     clearApiCache();
     return res.status(200).json({ success: true, forecast });
   } catch (error) {
@@ -276,8 +280,7 @@ const updateFactors = async (req, res, next) => {
     cafe.forecastSettings = savedSettings;
     await cafe.save();
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = zonedDayStart(new Date(), safeTimezone(cafe.timezone));
     await Forecast.deleteMany({ cafeId: cafe._id, date: { $gte: today } });
     clearApiCache();
 
@@ -295,12 +298,13 @@ const updateFactors = async (req, res, next) => {
 const getAccuracy = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const timezone = await getCafeTimezone(cafeId);
+    const today = zonedDayStart(new Date(), timezone);
+    const thirtyDaysAgo = addZonedDays(today, -30, timezone);
 
     const forecasts = await Forecast.find({
       cafeId,
-      date: { $gte: thirtyDaysAgo, $lt: new Date() },
+      date: { $gte: thirtyDaysAgo, $lt: today },
       accuracy: { $exists: true, $ne: null },
       actualsUpdatedAt: { $exists: true, $ne: null },
     })
@@ -327,6 +331,13 @@ const getHistory = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
     const cafeObjectId = new mongoose.Types.ObjectId(String(cafeId));
+    const cafe = await Cafe.findOne({ _id: cafeId, orgId: req.user.orgId })
+      .select('timezone')
+      .lean();
+    if (!cafe) {
+      return res.status(404).json({ success: false, message: 'Cafe not found' });
+    }
+    const timezone = safeTimezone(cafe.timezone);
     const days = clampHistoryDays(req.query.days);
     const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit, 10) || 30));
     const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
@@ -334,12 +345,12 @@ const getHistory = async (req, res, next) => {
       req.query.backfill === 'sync'
         ? Math.max(1, Math.min(HISTORY_BACKFILL_BATCH_SIZE, Number.parseInt(req.query.backfillLimit, 10) || 1))
         : 0;
-    const yesterday = addDays(startOfDay(new Date()), -1);
-    const requestedEnd = parseDateOnly(req.query.endDate) || yesterday;
+    const yesterday = addZonedDays(new Date(), -1, timezone);
+    const requestedEnd = parseRequestedDay(req.query.endDate, timezone) || yesterday;
     const endDay = requestedEnd > yesterday ? yesterday : requestedEnd;
-    const requestedStart = parseDateOnly(req.query.startDate);
-    const startDay = requestedStart || addDays(endDay, -(days - 1));
-    const endExclusive = addDays(endDay, 1);
+    const requestedStart = parseRequestedDay(req.query.startDate, timezone);
+    const startDay = requestedStart || addZonedDays(endDay, -(days - 1), timezone);
+    const endExclusive = addZonedDays(endDay, 1, timezone);
 
     if (startDay > endDay) {
       return res.status(400).json({ success: false, message: 'startDate must be before endDate' });
@@ -359,7 +370,7 @@ const getHistory = async (req, res, next) => {
             $dateToString: {
               format: '%Y-%m-%d',
               date: '$date',
-              timezone: 'Africa/Johannesburg',
+              timezone,
             },
           },
           actualRevenue: { $sum: { $ifNull: ['$total', 0] } },
@@ -386,7 +397,9 @@ const getHistory = async (req, res, next) => {
     })
       .lean();
 
-    const forecastByDate = new Map(forecasts.map((forecast) => [toDateKey(forecast.date), forecast]));
+    const forecastByDate = new Map(
+      forecasts.map((forecast) => [zonedDateKey(forecast.date, timezone), forecast])
+    );
     let generated = 0;
     let missingDateKeys = dateKeys.filter((dateKey) => needsHistoryForecastRefresh(forecastByDate.get(dateKey)));
 
@@ -394,7 +407,7 @@ const getHistory = async (req, res, next) => {
       const syncDates = missingDateKeys.slice(-syncBackfillLimit).reverse();
 
       for (const dateKey of syncDates) {
-        const forecast = await ensureHistoryForecast(cafeId, parseDateOnly(dateKey));
+        const forecast = await ensureHistoryForecast(cafeId, zonedDayStart(dateKey, timezone));
         if (forecast) {
           forecastByDate.set(dateKey, typeof forecast.toObject === 'function' ? forecast.toObject() : forecast);
           generated += 1;
@@ -406,7 +419,7 @@ const getHistory = async (req, res, next) => {
 
     const jobStarted =
       req.query.backfill !== 'false' && req.query.backfill !== 'sync'
-        ? scheduleHistoryBackfill(cafeId, missingDateKeys)
+        ? scheduleHistoryBackfill(cafeId, missingDateKeys, timezone)
         : false;
 
     const rows = [];
@@ -438,8 +451,8 @@ const getHistory = async (req, res, next) => {
       rows: pagedRows,
       meta: {
         days,
-        startDate: toDateKey(startDay),
-        endDate: toDateKey(endDay),
+        startDate: zonedDateKey(startDay, timezone),
+        endDate: zonedDateKey(endDay, timezone),
         totalTradingDays: dateKeys.length,
         totalRows,
         generated,
@@ -474,18 +487,72 @@ const getHistory = async (req, res, next) => {
 
 const getInsights = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
-    const result = await generateInsights(cafeId);
+    const result = getCachedInsights(req.user.cafeId);
     return res.status(200).json({ success: true, ...result });
   } catch (error) {
     next(error);
   }
 };
 
+const paidRequestIdempotencyKey = (req, res) => {
+  const key = String(req.get('Idempotency-Key') || '').trim();
+  if (!key) {
+    res.status(400).json({
+      success: false,
+      message: 'Idempotency-Key is required for paid AI requests',
+    });
+    return null;
+  }
+  if (key.length > 160) {
+    res.status(400).json({ success: false, message: 'Idempotency-Key is too long' });
+    return null;
+  }
+  return key;
+};
+
+const conversationSemanticHash = (conversation) =>
+  crypto
+    .createHash('sha256')
+    .update(JSON.stringify(
+      conversation.map((message) => ({
+        role: String(message?.role || ''),
+        content: String(message?.content || ''),
+      }))
+    ))
+    .digest('hex');
+
+const refreshGeneratedInsights = async (req, res, next) => {
+  try {
+    const suppliedKey = String(req.get('Idempotency-Key') || '').trim();
+    if (suppliedKey.length > 160) {
+      return res.status(400).json({ success: false, message: 'Idempotency-Key is too long' });
+    }
+    const { result, guavaCredits, replayed, coalesced } = await refreshInsights({
+      cafeId: req.user.cafeId,
+      orgId: req.user.orgId,
+      userId: req.user.id,
+      idempotencyKey: suppliedKey || `insight-refresh:${req.user.id}:${req.id}`,
+    });
+    return res.status(200).json({
+      success: true,
+      ...result,
+      requiresRefresh: false,
+      cacheStatus: result.cacheStatus === 'unconfigured' ? 'unconfigured' : 'fresh',
+      guavaCredits,
+      aiCredits: guavaCredits,
+      meta: { replayed, coalesced },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 const chatInsights = async (req, res, next) => {
+  const requestAbort = abortWhenResponseCloses(res);
   try {
     const cafeId = req.user.cafeId;
     const orgId = req.user.orgId;
+    const authorizedCafeIds = req.user.role === 'manager' ? req.user.cafeIds : undefined;
     const { messages, question } = req.body;
 
     const conversation = Array.isArray(messages)
@@ -495,21 +562,44 @@ const chatInsights = async (req, res, next) => {
         : [];
 
     if (!process.env.ANTHROPIC_API_KEY) {
-      const result = await generateBusinessChatResponse({ cafeId, orgId, messages: conversation });
+      const result = await generateBusinessChatResponse({
+        cafeId,
+        orgId,
+        authorizedCafeIds,
+        messages: conversation,
+        signal: requestAbort.signal,
+      });
       return res.status(200).json({ success: true, ...result, aiCredits: null, guavaCredits: null });
     }
+
+    const idempotencyKey = paidRequestIdempotencyKey(req, res);
+    if (!idempotencyKey) return;
 
     const { result, guavaCredits } = await meterGuavaCredits({
       orgId,
       cafeId,
       userId: req.user.id,
       featureKey: 'ask_guava_chat',
-      metadata: { messageCount: conversation.length },
-      run: () => generateBusinessChatResponse({ cafeId, orgId, messages: conversation }),
+      metadata: {
+        messageCount: conversation.length,
+        semanticHash: conversationSemanticHash(conversation),
+      },
+      idempotencyKey,
+      signal: requestAbort.signal,
+      run: () => generateBusinessChatResponse({
+        cafeId,
+        orgId,
+        authorizedCafeIds,
+        messages: conversation,
+        signal: requestAbort.signal,
+      }),
     });
     return res.status(200).json({ success: true, ...result, aiCredits: guavaCredits, guavaCredits });
   } catch (error) {
+    if (requestAbort.signal.aborted || res.destroyed) return;
     next(error);
+  } finally {
+    requestAbort.dispose();
   }
 };
 
@@ -518,10 +608,27 @@ const writeStreamEvent = (res, event, data) => {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 };
 
+const abortWhenResponseCloses = (res) => {
+  const controller = new AbortController();
+  const onClose = () => {
+    if (res.writableEnded || controller.signal.aborted) return;
+    const error = new Error('Client disconnected');
+    error.name = 'AbortError';
+    controller.abort(error);
+  };
+  res.once('close', onClose);
+  return {
+    signal: controller.signal,
+    dispose: () => res.off('close', onClose),
+  };
+};
+
 const streamChatInsights = async (req, res, next) => {
+  const requestAbort = abortWhenResponseCloses(res);
   try {
     const cafeId = req.user.cafeId;
     const orgId = req.user.orgId;
+    const authorizedCafeIds = req.user.role === 'manager' ? req.user.cafeIds : undefined;
     const { messages, question } = req.body;
 
     const conversation = Array.isArray(messages)
@@ -541,8 +648,10 @@ const streamChatInsights = async (req, res, next) => {
       const result = await streamBusinessChatResponse({
         cafeId,
         orgId,
+        authorizedCafeIds,
         messages: conversation,
         onDelta: (text) => writeStreamEvent(res, 'delta', { text }),
+        signal: requestAbort.signal,
       });
 
       writeStreamEvent(res, 'done', {
@@ -555,12 +664,21 @@ const streamChatInsights = async (req, res, next) => {
       return;
     }
 
+    const idempotencyKey = paidRequestIdempotencyKey(req, res);
+    if (!idempotencyKey) return;
+
     const { result, guavaCredits } = await meterGuavaCredits({
       orgId,
       cafeId,
       userId: req.user.id,
       featureKey: 'ask_guava_chat',
-      metadata: { messageCount: conversation.length, stream: true },
+      metadata: {
+        messageCount: conversation.length,
+        semanticHash: conversationSemanticHash(conversation),
+        stream: true,
+      },
+      idempotencyKey,
+      signal: requestAbort.signal,
       run: () => {
         res.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8',
@@ -572,8 +690,10 @@ const streamChatInsights = async (req, res, next) => {
         return streamBusinessChatResponse({
           cafeId,
           orgId,
+          authorizedCafeIds,
           messages: conversation,
           onDelta: (text) => writeStreamEvent(res, 'delta', { text }),
+          signal: requestAbort.signal,
         });
       },
     });
@@ -586,20 +706,22 @@ const streamChatInsights = async (req, res, next) => {
     });
     res.end();
   } catch (error) {
+    if (requestAbort.signal.aborted || res.destroyed) return;
     if (res.headersSent) {
       writeStreamEvent(res, 'error', { message: error.message || 'AI chat failed' });
       return res.end();
     }
     return next(error);
+  } finally {
+    requestAbort.dispose();
   }
 };
 
 const getTomorrow = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    tomorrow.setHours(0, 0, 0, 0);
+    const timezone = await getCafeTimezone(cafeId);
+    const tomorrow = addZonedDays(new Date(), 1, timezone);
 
     let forecast = await Forecast.findOne({ cafeId, date: tomorrow });
 
@@ -616,10 +738,9 @@ const getTomorrow = async (req, res, next) => {
 const getRecent = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const sevenDaysAgo = new Date(today);
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const timezone = await getCafeTimezone(cafeId);
+    const today = zonedDayStart(new Date(), timezone);
+    const sevenDaysAgo = addZonedDays(today, -7, timezone);
 
     const forecasts = await Forecast.find({
       cafeId,
@@ -649,6 +770,7 @@ module.exports = {
   getAccuracy,
   getHistory,
   getInsights,
+  refreshGeneratedInsights,
   chatInsights,
   streamChatInsights,
   getRecent,

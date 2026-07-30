@@ -70,7 +70,7 @@ describe('Refresh token rotation', () => {
     expect(newCookie).toBeDefined();
     expect(String(newCookie)).toContain('refreshToken=');
 
-    const persisted = await User.findById(user.id);
+    const persisted = await User.findById(user.id).select('+refreshTokens');
     expect(persisted.refreshTokens.length).toBeLessThanOrEqual(10);
 
     // Run many refreshes — the list must stay bounded
@@ -80,7 +80,7 @@ describe('Refresh token rotation', () => {
       expect(r.status).toBe(200);
       currentCookie = r.headers['set-cookie'] || currentCookie;
     }
-    const after = await User.findById(user.id);
+    const after = await User.findById(user.id).select('+refreshTokens');
     expect(after.refreshTokens.length).toBeLessThanOrEqual(10);
   });
 
@@ -98,6 +98,47 @@ describe('Refresh token rotation', () => {
     // The freshly issued cookie still works
     const next = await request.post('/api/auth/refresh').set('Cookie', first.headers['set-cookie']);
     expect(next.status).toBe(200);
+  });
+
+  it('stores only a one-way digest of newly issued refresh tokens', async () => {
+    const { user, cookie } = await createTestUser();
+    const rawToken = String(cookie).match(/refreshToken=([^;]+)/)?.[1];
+    const defaultView = await User.findById(user.id).lean();
+    expect(defaultView.password).toBeUndefined();
+    expect(defaultView.refreshTokens).toBeUndefined();
+
+    const persisted = await User.findById(user.id)
+      .select('+password +refreshTokens')
+      .lean();
+
+    expect(rawToken).toBeDefined();
+    expect(persisted.password).toMatch(/^\$2[aby]\$/);
+    expect(persisted.refreshTokens).toHaveLength(1);
+    expect(persisted.refreshTokens[0].token).toBeUndefined();
+    expect(persisted.refreshTokens[0].tokenHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(persisted.refreshTokens[0].tokenHash).not.toBe(rawToken);
+  });
+});
+
+describe('Browser request origin protection', () => {
+  it('rejects a cross-site login POST in production', async () => {
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousClientUrl = process.env.CLIENT_URL;
+    process.env.NODE_ENV = 'production';
+    process.env.CLIENT_URL = 'https://portal.yourguava.example';
+    try {
+      const res = await request
+        .post('/api/auth/login')
+        .set('Origin', 'https://attacker.example')
+        .send({ email: 'victim@example.com', password: 'password123' });
+
+      expect(res.status).toBe(403);
+      expect(res.body.message).toMatch(/origin/i);
+    } finally {
+      process.env.NODE_ENV = previousNodeEnv;
+      if (previousClientUrl === undefined) delete process.env.CLIENT_URL;
+      else process.env.CLIENT_URL = previousClientUrl;
+    }
   });
 });
 

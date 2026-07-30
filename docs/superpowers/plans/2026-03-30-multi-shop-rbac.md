@@ -797,7 +797,7 @@ git commit -m "feat: cafe switcher in sidebar"
 
 Page shows:
 - List of team members (name, email, role badge, assigned cafes)
-- "Invite Manager" form (email, name, password, cafe selection checkboxes)
+- "Invite Manager" form (email, name, cafe selection checkboxes); the manager chooses a password from the single-use email link
 - Remove button per manager
 - "Add Cafe" button for owner to add a new shop
 

@@ -86,6 +86,28 @@ describe('Shifts API', () => {
 
       // The 5th shift (total 50 hrs) should be flagged overtime
       expect(lastRes.body.shift.type).toBe('overtime');
+      expect(lastRes.body.shift.regularHours).toBe(5);
+      expect(lastRes.body.shift.overtimeHours).toBe(5);
+    });
+
+    it('rejects malformed dates and unbounded query ranges', async () => {
+      const malformed = await request
+        .post('/api/shifts')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          staffId,
+          date: '2026-02-30',
+          startTime: '07:00',
+          endTime: '15:00',
+        });
+      expect(malformed.status).toBe(400);
+
+      const unbounded = await request
+        .get('/api/shifts')
+        .set('Authorization', `Bearer ${token}`)
+        .query({ startDate: '2020-01-01', endDate: '2026-01-01' });
+      expect(unbounded.status).toBe(400);
+      expect(unbounded.body.message).toMatch(/cannot exceed/i);
     });
   });
 
@@ -155,6 +177,33 @@ describe('Shifts API', () => {
         expect(entry.estimatedPay).toBeDefined();
         expect(entry.overThreshold).toBeDefined();
       }
+    });
+
+    it('applies the overtime threshold independently to each week', async () => {
+      const dates = [
+        '2026-04-06', '2026-04-07', '2026-04-08', '2026-04-09', '2026-04-10',
+        '2026-04-13', '2026-04-14', '2026-04-15', '2026-04-16', '2026-04-17',
+      ];
+      for (const date of dates) {
+        await request
+          .post('/api/shifts')
+          .set('Authorization', `Bearer ${token}`)
+          .send({ staffId, date, startTime: '06:00', endTime: '16:00' });
+      }
+
+      const res = await request
+        .get('/api/shifts/summary')
+        .set('Authorization', `Bearer ${token}`)
+        .query({ startDate: '2026-04-06', endDate: '2026-04-19' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.summary[0]).toEqual(expect.objectContaining({
+        totalHours: 100,
+        regularHours: 90,
+        overtimeHours: 10,
+        estimatedPay: 5775,
+      }));
+      expect(res.body.summaries).toEqual(res.body.summary);
     });
   });
 });

@@ -60,6 +60,7 @@ describe('weather service', () => {
       })
     );
     expect(result).toEqual({
+      available: true,
       temp: 15,
       condition: 'Patchy rain nearby',
       humidity: 82,
@@ -158,5 +159,64 @@ describe('weather service', () => {
         isRain: true,
       })
     );
+  });
+
+  it('returns an explicit unavailable signal when weather is not configured', async () => {
+    process.env.WEATHER_API_KEY = '';
+    process.env.WEATHER_API_URL = '';
+
+    const result = await getWeatherForecast(-33.9, 18.4, new Date());
+
+    expect(axios.get).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      available: false,
+      condition: 'Unavailable',
+      unavailableReason: 'Weather service is not configured',
+    });
+    expect(result).not.toHaveProperty('temp');
+    expect(result).not.toHaveProperty('humidity');
+  });
+
+  it('does not fabricate weather when the provider request fails', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    axios.get.mockRejectedValueOnce(new Error('provider offline'));
+
+    const result = await getWeatherForecast(-33.9, 18.4, new Date());
+
+    expect(result).toEqual({
+      available: false,
+      condition: 'Unavailable',
+      unavailableReason: 'Weather data is temporarily unavailable',
+    });
+    expect(result).not.toHaveProperty('temp');
+    expect(result).not.toHaveProperty('humidity');
+    errorSpy.mockRestore();
+  });
+
+  it('rejects impossible core weather metrics instead of applying them', async () => {
+    axios.get.mockResolvedValueOnce({
+      data: {
+        forecast: {
+          forecastday: [
+            {
+              date: new Date().toISOString().slice(0, 10),
+              day: {
+                avgtemp_c: 999,
+                avghumidity: 140,
+                condition: { text: 'Sunny' },
+              },
+            },
+          ],
+        },
+      },
+    });
+
+    const result = await getWeatherForecast(-33.9, 18.4, new Date());
+
+    expect(result).toEqual({
+      available: false,
+      condition: 'Unavailable',
+      unavailableReason: 'Weather provider returned no data for this date',
+    });
   });
 });

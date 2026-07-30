@@ -2,8 +2,31 @@ const crypto = require('crypto');
 const axios = require('axios');
 
 const DEFAULT_BASE_URL = 'https://payments.onegate.co.za';
+const OFFICIAL_ONEGATE_HOSTS = new Set(['payments.onegate.co.za']);
 
-const cleanBaseUrl = (url) => (url || DEFAULT_BASE_URL).replace(/\/$/, '');
+const cleanBaseUrl = (value) => {
+  let url;
+  try {
+    url = new URL(value || DEFAULT_BASE_URL);
+  } catch (_error) {
+    throw new Error('ONEGATE_API_URL must be a valid URL');
+  }
+  if (url.username || url.password) {
+    throw new Error('ONEGATE_API_URL must not contain credentials');
+  }
+  if (process.env.NODE_ENV === 'production') {
+    if (url.protocol !== 'https:') {
+      throw new Error('ONEGATE_API_URL must use HTTPS in production');
+    }
+    if (!OFFICIAL_ONEGATE_HOSTS.has(url.hostname.toLowerCase())) {
+      throw new Error('ONEGATE_API_URL must use the official OneGate payment host in production');
+    }
+    if ((url.port && url.port !== '443') || !['', '/'].includes(url.pathname) || url.search || url.hash) {
+      throw new Error('ONEGATE_API_URL must be the origin of the official OneGate payment host');
+    }
+  }
+  return url.toString().replace(/\/$/, '');
+};
 
 const getConfig = () => ({
   baseUrl: cleanBaseUrl(process.env.ONEGATE_API_URL),
@@ -149,4 +172,5 @@ module.exports = {
   isOneGateConfigured,
   isOneGateEnabled,
   lookupGatewayTransaction,
+  cleanBaseUrl,
 };

@@ -55,6 +55,45 @@ describe('forecast factors', () => {
     expect(coldRain.find((f) => f.key === 'weather').multiplier).toBeCloseTo(0.70, 2);
   });
 
+  it('keeps weather factors neutral when weather is explicitly unavailable', () => {
+    const settings = normalizeForecastSettings({ payday: { pct: 10 } });
+    const weather = {
+      available: false,
+      temp: 35,
+      condition: 'Rain',
+      isRain: true,
+      unavailableReason: 'Cafe coordinates are not configured',
+    };
+
+    const itemFactors = buildItemFactors({
+      category: 'cold_drink',
+      signals: { ...baseSignals, isPayday: true },
+      weather,
+      events: [],
+      settings,
+    });
+    const itemWeather = itemFactors.find((factor) => factor.key === 'weather');
+    expect(itemWeather).toEqual(expect.objectContaining({
+      active: false,
+      adjustmentPct: 0,
+      multiplier: 1,
+      reason: 'Cafe coordinates are not configured',
+    }));
+    expect(multiplyFactors(itemFactors)).toBeCloseTo(1.10, 2);
+
+    const summaryWeather = buildGlobalFactors({
+      signals: baseSignals,
+      weather,
+      events: [],
+      settings,
+    }).find((factor) => factor.key === 'weather');
+    expect(summaryWeather).toEqual(expect.objectContaining({
+      active: false,
+      multiplier: 1,
+      reason: 'Cafe coordinates are not configured',
+    }));
+  });
+
   it('keeps default load shedding, holiday, payday, and event weights', () => {
     const settings = normalizeForecastSettings();
     const factors = buildGlobalFactors({
@@ -73,6 +112,32 @@ describe('forecast factors', () => {
     expect(factors.find((f) => f.key === 'holiday').multiplier).toBeCloseTo(1.20, 2);
     expect(factors.find((f) => f.key === 'payday').multiplier).toBeCloseTo(1.20, 2);
     expect(factors.find((f) => f.key === 'events').multiplier).toBeCloseTo(1.35, 2);
+  });
+
+  it('keeps load-shedding factors neutral when the stage is unknown', () => {
+    const settings = normalizeForecastSettings();
+    const factors = buildItemFactors({
+      category: 'coffee',
+      signals: {
+        ...baseSignals,
+        loadSheddingStage: null,
+        loadSheddingAvailable: false,
+        loadSheddingUnavailableReason: 'Load-shedding data is temporarily unavailable',
+      },
+      weather: { available: true, temp: 22, condition: 'Clear', isRain: false },
+      events: [],
+      settings,
+    });
+
+    expect(factors.find((factor) => factor.key === 'loadShedding')).toEqual(
+      expect.objectContaining({
+        active: false,
+        adjustmentPct: 0,
+        multiplier: 1,
+        reason: 'Load-shedding data is temporarily unavailable',
+      })
+    );
+    expect(multiplyFactors(factors)).toBe(1);
   });
 
   it('gates effective factor settings by subscription plan', () => {

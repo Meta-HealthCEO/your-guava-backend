@@ -342,11 +342,10 @@ const loadSheddingAreaForCity = (city = '') =>
 /**
  * Fetches the current EskomSePush load shedding stage for the cafe's area.
  * Cape Town cafes use the City of Cape Town stage; all other locations use
- * the Eskom national stage. Returns 0 if unavailable. Caches for 30 minutes.
+ * the Eskom national stage. Returns an explicit availability signal and
+ * caches verified stages for 30 minutes.
  */
 const getLoadSheddingStage = async (city) => {
-  if (process.env.NODE_ENV === 'test') return 0;
-
   const area = loadSheddingAreaForCity(city);
   const now = Date.now();
   if (
@@ -354,12 +353,25 @@ const getLoadSheddingStage = async (city) => {
     now - loadSheddingCache.fetchedAt < LOAD_SHEDDING_CACHE_MS &&
     loadSheddingCache.stages
   ) {
-    return loadSheddingCache.stages[area] || 0;
+    const cachedStage = loadSheddingCache.stages[area];
+    return Number.isFinite(cachedStage)
+      ? { available: true, stage: cachedStage }
+      : {
+          available: false,
+          stage: null,
+          unavailableReason: 'Load-shedding provider returned no stage for this area',
+        };
   }
 
   try {
     const apiKey = process.env.ESKOMSEPUSH_API_KEY;
-    if (!apiKey) return 0;
+    if (!apiKey) {
+      return {
+        available: false,
+        stage: null,
+        unavailableReason: 'Load-shedding service is not configured',
+      };
+    }
 
     const response = await axios.get(
       'https://developer.sepush.co.za/business/2.0/status',
@@ -369,16 +381,35 @@ const getLoadSheddingStage = async (city) => {
       }
     );
 
+    const parseStage = (value) => {
+      if (value === undefined || value === null || value === '') return null;
+      const stage = Number(value);
+      return Number.isInteger(stage) && stage >= 0 && stage <= 8 ? stage : null;
+    };
     const stages = {
-      capetown: Number(response.data?.status?.capetown?.stage || 0),
-      eskom: Number(response.data?.status?.eskom?.stage || 0),
+      capetown: parseStage(response.data?.status?.capetown?.stage),
+      eskom: parseStage(response.data?.status?.eskom?.stage),
     };
     loadSheddingCache = { stages, fetchedAt: now };
-    return stages[area] || 0;
+    return Number.isFinite(stages[area])
+      ? { available: true, stage: stages[area] }
+      : {
+          available: false,
+          stage: null,
+          unavailableReason: 'Load-shedding provider returned no stage for this area',
+        };
   } catch (error) {
     console.error('[signals] Load shedding API error:', error.message);
-    return loadSheddingCache.stages?.[area] || 0;
+    return {
+      available: false,
+      stage: null,
+      unavailableReason: 'Load-shedding data is temporarily unavailable',
+    };
   }
+};
+
+const clearLoadSheddingCache = () => {
+  loadSheddingCache = { stages: null, fetchedAt: null };
 };
 
 /**
@@ -388,13 +419,23 @@ const getSignalsForDate = async (date, location = {}) => {
   const d = new Date(date);
   const dayOfWeek = d.getDay();
 
-  const loadSheddingStage = isSameLocalDate(d) ? await getLoadSheddingStage(location.city) : 0;
+  const loadShedding = isSameLocalDate(d)
+    ? await getLoadSheddingStage(location.city)
+    : {
+        available: false,
+        stage: null,
+        unavailableReason: 'Load-shedding data is only available for the current date',
+      };
 
   return {
     isPayday: isPayday(d),
     isPublicHoliday: isPublicHoliday(d),
     isSchoolHoliday: isSchoolHoliday(d),
-    loadSheddingStage,
+    loadSheddingStage: loadShedding.stage,
+    loadSheddingAvailable: loadShedding.available,
+    ...(loadShedding.unavailableReason
+      ? { loadSheddingUnavailableReason: loadShedding.unavailableReason }
+      : {}),
     dayOfWeek,
   };
 };
@@ -407,5 +448,6 @@ module.exports = {
   getSchoolCalendarForYear,
   isSchoolHoliday,
   getLoadSheddingStage,
+  clearLoadSheddingCache,
   getSignalsForDate,
 };

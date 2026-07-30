@@ -4,12 +4,87 @@ const Transaction = require('../models/Transaction.model');
 const Cafe = require('../models/Cafe.model');
 const { getForecastSettings, eventImpactPct } = require('../services/forecastFactors.service');
 
-const invalidatePlanningForecastsFrom = async (cafeId, date) => {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+const DEFAULT_TIMEZONE = 'Africa/Johannesburg';
+const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 
-  const start = new Date(date);
-  start.setHours(0, 0, 0, 0);
+const safeTimezone = (timezone) => {
+  try {
+    Intl.DateTimeFormat('en-ZA', { timeZone: timezone }).format(new Date());
+    return timezone;
+  } catch {
+    return DEFAULT_TIMEZONE;
+  }
+};
+
+const parseDateOnly = (value, field = 'date') => {
+  const match = String(value || '').match(DATE_ONLY_RE);
+  if (!match) {
+    const error = new Error(`${field} must use YYYY-MM-DD`);
+    error.statusCode = 400;
+    throw error;
+  }
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  if (
+    date.getUTCFullYear() !== Number(match[1]) ||
+    date.getUTCMonth() !== Number(match[2]) - 1 ||
+    date.getUTCDate() !== Number(match[3])
+  ) {
+    const error = new Error(`${field} must be a valid calendar date`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return date;
+};
+
+const localDateKey = (date, timezone) => {
+  const parts = new Intl.DateTimeFormat('en-ZA', {
+    timeZone: safeTimezone(timezone),
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+};
+
+const timezoneOffsetMs = (date, timezone) => {
+  const parts = new Intl.DateTimeFormat('en-ZA', {
+    timeZone: safeTimezone(timezone),
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return Date.UTC(
+    Number(values.year),
+    Number(values.month) - 1,
+    Number(values.day),
+    Number(values.hour),
+    Number(values.minute),
+    Number(values.second)
+  ) - date.getTime();
+};
+
+const localMidnightUtc = (nominalDate, timezone) => {
+  const guess = nominalDate.getTime();
+  const first = guess - timezoneOffsetMs(new Date(guess), timezone);
+  return new Date(guess - timezoneOffsetMs(new Date(first), timezone));
+};
+
+const invalidatePlanningForecastsFrom = async (cafeId, date) => {
+  const cafe = await Cafe.findById(cafeId).select('timezone').lean();
+  const timezone = safeTimezone(cafe?.timezone || DEFAULT_TIMEZONE);
+  const today = localMidnightUtc(parseDateOnly(localDateKey(
+    new Date(),
+    timezone
+  )), timezone);
+
+  const nominalStart = dateOnly(date);
+  const start = localMidnightUtc(nominalStart, timezone);
   if (start < today) start.setTime(today.getTime());
 
   await Forecast.deleteMany({ cafeId, date: { $gte: start } });
@@ -52,13 +127,22 @@ const parseClosureWindow = (type, closureWindow) => {
     error.statusCode = 400;
     throw error;
   }
+  if (endTime <= startTime) {
+    const error = new Error('closureWindow.endTime must be after startTime');
+    error.statusCode = 400;
+    throw error;
+  }
   return { startTime, endTime };
 };
 
 const dateOnly = (value) => {
-  const date = new Date(value);
-  date.setUTCHours(0, 0, 0, 0);
-  return date;
+  if (typeof value === 'string') return parseDateOnly(value);
+  const source = new Date(value);
+  return new Date(Date.UTC(
+    source.getUTCFullYear(),
+    source.getUTCMonth(),
+    source.getUTCDate()
+  ));
 };
 
 const addDays = (date, days) => {
@@ -74,7 +158,7 @@ const pctChange = (actual, baseline) => {
   return Number((((actual - baseline) / baseline) * 100).toFixed(1));
 };
 
-const getDailySales = async (cafeId, start, end) => Transaction.aggregate([
+const getDailySales = async (cafeId, start, end, timezone) => Transaction.aggregate([
   {
     $match: {
       cafeId,
@@ -84,7 +168,7 @@ const getDailySales = async (cafeId, start, end) => Transaction.aggregate([
   },
   {
     $group: {
-      _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
+      _id: { $dateToString: { format: '%Y-%m-%d', date: '$date', timezone } },
       revenue: { $sum: '$total' },
       transactions: { $sum: 1 },
     },
@@ -98,13 +182,17 @@ const eventEffects = async (req, res, next) => {
     const cafe = await Cafe.findById(cafeId).lean();
     if (!cafe) return res.status(404).json({ success: false, message: 'Cafe not found' });
 
-    const today = dateOnly(new Date());
+    const timezone = safeTimezone(cafe.timezone);
+    const today = parseDateOnly(localDateKey(new Date(), timezone));
     const limit = Math.max(1, Math.min(Number(req.query.limit) || 30, 100));
     const baselineWeeks = Math.max(3, Math.min(Number(req.query.baselineWeeks) || 8, 16));
-    const to = req.query.to ? dateOnly(req.query.to) : today;
+    const to = req.query.to ? parseDateOnly(req.query.to, 'to') : today;
     const from = req.query.from
-      ? dateOnly(req.query.from)
+      ? parseDateOnly(req.query.from, 'from')
       : addDays(to, -365);
+    if (from > to) {
+      return res.status(400).json({ success: false, message: 'from must be on or before to' });
+    }
     const settings = getForecastSettings(cafe);
 
     const events = await Event.find({
@@ -129,12 +217,17 @@ const eventEffects = async (req, res, next) => {
       });
     }
 
-    const earliestBaselineStart = addDays(dateOnly(events[events.length - 1].date), -baselineWeeks * 7);
-    const eventEnd = addDays(dateOnly(events[0].date), 1);
+    const earliestBaselineDate = addDays(dateOnly(events[events.length - 1].date), -baselineWeeks * 7);
+    const eventEndDate = addDays(dateOnly(events[0].date), 1);
+    const earliestBaselineStart = localMidnightUtc(earliestBaselineDate, timezone);
+    const eventEnd = localMidnightUtc(eventEndDate, timezone);
 
     const [dailySales, eventDates] = await Promise.all([
-      getDailySales(cafe._id, earliestBaselineStart, eventEnd),
-      Event.find({ cafeId, date: { $gte: earliestBaselineStart, $lt: eventEnd } }).select('date').lean(),
+      getDailySales(cafe._id, earliestBaselineStart, eventEnd, timezone),
+      Event.find({
+        cafeId,
+        date: { $gte: earliestBaselineDate, $lt: eventEndDate },
+      }).select('date').lean(),
     ]);
 
     const salesByDate = new Map(dailySales.map((row) => [row._id, row]));
@@ -227,12 +320,15 @@ const list = async (req, res, next) => {
 
     if (from || to) {
       filter.date = {};
-      if (from) filter.date.$gte = new Date(from);
-      if (to) filter.date.$lte = new Date(to);
+      if (from) filter.date.$gte = parseDateOnly(from, 'from');
+      if (to) filter.date.$lte = parseDateOnly(to, 'to');
+      if (filter.date.$gte && filter.date.$lte && filter.date.$gte > filter.date.$lte) {
+        return res.status(400).json({ success: false, message: 'from must be on or before to' });
+      }
     } else {
       // Default: show events from today onwards
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
+      const cafe = await Cafe.findById(cafeId).select('timezone').lean();
+      const today = parseDateOnly(localDateKey(new Date(), cafe?.timezone || DEFAULT_TIMEZONE));
       filter.date = { $gte: today };
     }
 
@@ -252,13 +348,14 @@ const create = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'name and date are required' });
     }
 
+    const parsedDate = parseDateOnly(date);
     const parsedType = parseEventType(type) || 'event';
     const parsedClosure = parseClosureWindow(parsedType, closureWindow);
 
     const event = await Event.create({
       cafeId,
-      name,
-      date: new Date(date),
+      name: String(name).trim(),
+      date: parsedDate,
       type: parsedType,
       closureWindow: parsedClosure,
       impact: impact || 'medium',
@@ -286,8 +383,8 @@ const update = async (req, res, next) => {
     }
 
     const update = {};
-    if (name !== undefined) update.name = name;
-    if (date !== undefined) update.date = new Date(date);
+    if (name !== undefined) update.name = String(name).trim();
+    if (date !== undefined) update.date = parseDateOnly(date);
     if (impact !== undefined) update.impact = impact;
     if (notes !== undefined) update.notes = notes;
     if (recurring !== undefined) update.recurring = recurring;
@@ -311,8 +408,8 @@ const update = async (req, res, next) => {
       { $set: update },
       { new: true, runValidators: true }
     );
-    const invalidateFrom = date !== undefined && new Date(date) < existing.date
-      ? new Date(date)
+    const invalidateFrom = date !== undefined && update.date < existing.date
+      ? update.date
       : existing.date;
     await invalidatePlanningForecastsFrom(cafeId, invalidateFrom);
 

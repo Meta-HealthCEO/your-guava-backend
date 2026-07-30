@@ -1,5 +1,5 @@
 const mongoose = require('mongoose');
-const { MongoMemoryServer } = require('mongodb-memory-server');
+const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const jwt = require('jsonwebtoken');
 
 // Set env vars before requiring app
@@ -20,14 +20,21 @@ delete process.env.ONEGATE_ORGANISATION_ID;
 delete process.env.ONEGATE_ORG_ID;
 delete process.env.ONEGATE_API_SALT;
 delete process.env.API_PUBLIC_URL;
+process.env.R2_ACCOUNT_ID = '';
+process.env.R2_ACCESS_KEY_ID = '';
+process.env.R2_SECRET_ACCESS_KEY = '';
+process.env.R2_BUCKET_NAME = '';
 
 const app = require('../src/app');
 
 let mongoServer;
 
 const setup = async () => {
-  mongoServer = await MongoMemoryServer.create();
+  mongoServer = await MongoMemoryReplSet.create({
+    replSet: { count: 1, storageEngine: 'wiredTiger' },
+  });
   const uri = mongoServer.getUri();
+  process.env.MONGODB_URI = uri;
   await mongoose.connect(uri);
 };
 
@@ -67,8 +74,8 @@ const createTestUser = async (overrides = {}) => {
   };
 };
 
-// Helper to create a manager directly. Invite endpoints never expose generated
-// temporary passwords, so tests should not depend on production invite secrets.
+// Helper to create a manager directly when a test is not exercising the
+// production invitation-acceptance lifecycle.
 const createTestManager = async (ownerToken, cafeIds) => {
   const supertest = require('supertest');
   const request = supertest(app);

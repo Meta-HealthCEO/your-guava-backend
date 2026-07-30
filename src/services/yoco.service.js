@@ -350,7 +350,9 @@ async function processWebhookEvent(payload) {
   if (event_type !== 'payment.created' || !order_id) return;
 
   // Find the cafe by yocoBusinessId
-  const cafe = await Cafe.findOne({ yocoBusinessId: business_id });
+  const cafe = await Cafe.findOne({ yocoBusinessId: business_id }).select(
+    '+yocoTokens.accessToken +yocoTokens.refreshToken'
+  );
   if (!cafe) {
     console.warn(`[yoco webhook] No cafe found for business_id: ${business_id}`);
     return;

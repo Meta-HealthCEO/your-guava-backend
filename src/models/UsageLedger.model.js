@@ -32,9 +32,21 @@ const usageLedgerSchema = new mongoose.Schema(
       required: true,
       min: 0,
     },
+    creditAllocation: {
+      included: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      bonus: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+    },
     status: {
       type: String,
-      enum: ['committed', 'refunded'],
+      enum: ['reserved', 'recovering', 'committed', 'refunded', 'failed'],
       default: 'committed',
       index: true,
     },
@@ -50,10 +62,44 @@ const usageLedgerSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       default: {},
     },
+    idempotencyKey: {
+      type: String,
+      maxlength: 160,
+    },
+    requestFingerprint: {
+      type: String,
+      maxlength: 64,
+    },
+    replayCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    recoveryReason: {
+      type: String,
+      maxlength: 120,
+    },
+    reservedAt: {
+      type: Date,
+    },
+    creditWindowResetAt: {
+      type: Date,
+    },
+    completedAt: {
+      type: Date,
+    },
   },
   { timestamps: true }
 );
 
 usageLedgerSchema.index({ orgId: 1, createdAt: -1 });
+usageLedgerSchema.index({ status: 1, reservedAt: 1 });
+usageLedgerSchema.index(
+  { orgId: 1, idempotencyKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { idempotencyKey: { $type: 'string' } },
+  }
+);
 
 module.exports = mongoose.model('UsageLedger', usageLedgerSchema);

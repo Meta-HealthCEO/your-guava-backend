@@ -1,3 +1,6 @@
+jest.mock('axios');
+
+const axios = require('axios');
 const {
   isPayday,
   isPublicHoliday,
@@ -5,6 +8,9 @@ const {
   getPublicHolidaysForYear,
   getSchoolCalendarForYear,
   isSchoolHoliday,
+  getLoadSheddingStage,
+  clearLoadSheddingCache,
+  getSignalsForDate,
 } = require('../../src/utils/signals');
 
 describe('signals utility', () => {
@@ -214,6 +220,85 @@ describe('signals utility', () => {
 
       expect(getSchoolCalendarForYear(2030)).toBeNull();
       expect(isSchoolHoliday(new Date(2030, 0, 15))).toBe(false);
+    });
+  });
+
+  describe('load-shedding signals', () => {
+    const originalApiKey = process.env.ESKOMSEPUSH_API_KEY;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      clearLoadSheddingCache();
+      process.env.ESKOMSEPUSH_API_KEY = 'test-eskom-key';
+    });
+
+    afterAll(() => {
+      if (originalApiKey === undefined) delete process.env.ESKOMSEPUSH_API_KEY;
+      else process.env.ESKOMSEPUSH_API_KEY = originalApiKey;
+    });
+
+    it('distinguishes an unconfigured service from a verified stage zero', async () => {
+      process.env.ESKOMSEPUSH_API_KEY = '';
+      await expect(getLoadSheddingStage('Cape Town')).resolves.toEqual({
+        available: false,
+        stage: null,
+        unavailableReason: 'Load-shedding service is not configured',
+      });
+
+      process.env.ESKOMSEPUSH_API_KEY = 'test-eskom-key';
+      axios.get.mockResolvedValueOnce({
+        data: {
+          status: {
+            capetown: { stage: 0 },
+            eskom: { stage: 2 },
+          },
+        },
+      });
+      await expect(getLoadSheddingStage('Cape Town')).resolves.toEqual({
+        available: true,
+        stage: 0,
+      });
+    });
+
+    it('returns unknown rather than stage zero when the provider fails', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      axios.get.mockRejectedValueOnce(new Error('provider offline'));
+
+      await expect(getLoadSheddingStage('Johannesburg')).resolves.toEqual({
+        available: false,
+        stage: null,
+        unavailableReason: 'Load-shedding data is temporarily unavailable',
+      });
+      errorSpy.mockRestore();
+    });
+
+    it('rejects malformed or out-of-range provider stages', async () => {
+      axios.get.mockResolvedValueOnce({
+        data: {
+          status: {
+            capetown: { stage: 999 },
+            eskom: { stage: 1.5 },
+          },
+        },
+      });
+
+      await expect(getLoadSheddingStage('Cape Town')).resolves.toEqual({
+        available: false,
+        stage: null,
+        unavailableReason: 'Load-shedding provider returned no stage for this area',
+      });
+    });
+
+    it('marks future-date load-shedding data unavailable', async () => {
+      const future = new Date();
+      future.setDate(future.getDate() + 1);
+
+      const signals = await getSignalsForDate(future, { city: 'Cape Town' });
+
+      expect(signals.loadSheddingStage).toBeNull();
+      expect(signals.loadSheddingAvailable).toBe(false);
+      expect(signals.loadSheddingUnavailableReason).toMatch(/only available for the current date/i);
+      expect(axios.get).not.toHaveBeenCalled();
     });
   });
 });

@@ -6,19 +6,68 @@ const path = require('path');
 
 let client = null;
 
+const DEFAULT_MAX_OBJECT_BYTES = 10 * 1024 * 1024;
+const HARD_MAX_OBJECT_BYTES = 25 * 1024 * 1024;
+const R2_ENV_KEYS = [
+  'R2_ACCOUNT_ID',
+  'R2_ACCESS_KEY_ID',
+  'R2_SECRET_ACCESS_KEY',
+  'R2_BUCKET_NAME',
+];
+
+const storageError = (message, statusCode, code) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  if (code) error.code = code;
+  return error;
+};
+
+const maxObjectBytes = () => {
+  const configured = Number.parseInt(process.env.UPLOAD_MAX_BYTES, 10);
+  if (!Number.isFinite(configured)) return DEFAULT_MAX_OBJECT_BYTES;
+  return Math.max(1024, Math.min(configured, HARD_MAX_OBJECT_BYTES));
+};
+
+const getConfigurationStatus = () => {
+  const missing = R2_ENV_KEYS.filter((key) => !process.env[key]);
+  const configured = missing.length === 0;
+  const partiallyConfigured = missing.length > 0 && missing.length < R2_ENV_KEYS.length;
+  const production = process.env.NODE_ENV === 'production';
+  return {
+    ok: configured || (!production && !partiallyConfigured),
+    configured,
+    mode: configured ? 'r2' : partiallyConfigured ? 'misconfigured' : 'local',
+    missing,
+  };
+};
+
 const localRoot = () => path.join(process.cwd(), 'uploads', 'r2');
 
-const useLocalStorage = () =>
-  !process.env.R2_ACCOUNT_ID ||
-  !process.env.R2_ACCESS_KEY_ID ||
-  !process.env.R2_SECRET_ACCESS_KEY ||
-  !process.env.R2_BUCKET_NAME;
+const useLocalStorage = () => {
+  const status = getConfigurationStatus();
+  if (!status.ok) {
+    const context = process.env.NODE_ENV === 'production'
+      ? 'R2 storage is required in production'
+      : 'R2 storage configuration is incomplete';
+    throw new Error(`${context}; missing ${status.missing.join(', ')}`);
+  }
+  return !status.configured;
+};
+
+const assertBufferSize = (buffer) => {
+  if (!Buffer.isBuffer(buffer)) throw new TypeError('Storage payload must be a Buffer');
+  if (buffer.length > maxObjectBytes()) {
+    const error = new Error(`File exceeds ${maxObjectBytes()} bytes`);
+    error.statusCode = 400;
+    throw error;
+  }
+};
 
 const localPathForKey = (key) => {
   const root = path.resolve(localRoot());
-  const target = path.resolve(root, key);
+  const target = path.resolve(root, String(key || ''));
   if (!target.startsWith(root + path.sep)) {
-    throw new Error('Invalid storage key');
+    throw storageError('Invalid storage key', 400, 'INVALID_STORAGE_KEY');
   }
   return target;
 };
@@ -60,6 +109,7 @@ const bucket = () => process.env.R2_BUCKET_NAME;
  * @returns {Promise<void>}
  */
 const uploadFile = async (buffer, key, contentType = 'application/octet-stream') => {
+  assertBufferSize(buffer);
   if (useLocalStorage()) {
     const target = localPathForKey(key);
     await fs.promises.mkdir(path.dirname(target), { recursive: true });
@@ -84,13 +134,31 @@ const uploadFile = async (buffer, key, contentType = 'application/octet-stream')
  */
 const downloadFile = async (key) => {
   if (useLocalStorage()) {
-    return fs.promises.readFile(localPathForKey(key));
+    const filePath = localPathForKey(key);
+    const stat = await fs.promises.stat(filePath);
+    if (stat.size > maxObjectBytes()) {
+      const error = new Error('Stored upload exceeds the configured size limit');
+      error.statusCode = 413;
+      throw error;
+    }
+    return fs.promises.readFile(filePath);
   }
 
   const res = await getClient().send(new GetObjectCommand({ Bucket: bucket(), Key: key }));
+  if (Number.isFinite(Number(res.ContentLength)) && Number(res.ContentLength) > maxObjectBytes()) {
+    if (typeof res.Body?.destroy === 'function') res.Body.destroy();
+    throw storageError('Stored upload exceeds the configured size limit', 413, 'OBJECT_TOO_LARGE');
+  }
   const chunks = [];
+  let totalBytes = 0;
   for await (const chunk of res.Body) {
-    chunks.push(chunk);
+    const buffered = Buffer.from(chunk);
+    totalBytes += buffered.length;
+    if (totalBytes > maxObjectBytes()) {
+      if (typeof res.Body.destroy === 'function') res.Body.destroy();
+      throw storageError('Stored upload exceeds the configured size limit', 413, 'OBJECT_TOO_LARGE');
+    }
+    chunks.push(buffered);
   }
   return Buffer.concat(chunks);
 };
@@ -103,7 +171,9 @@ const downloadFile = async (key) => {
  */
 const getSignedDownloadUrl = async (key, ttlSeconds = 900) => {
   if (useLocalStorage()) {
-    const expires = Date.now() + ttlSeconds * 1000;
+    const boundedTtl = Math.max(1, Math.min(Number.parseInt(ttlSeconds, 10) || 900, 3600));
+    localPathForKey(key);
+    const expires = Date.now() + boundedTtl * 1000;
     const sig = signLocalUrl(key, expires);
     const baseUrl = process.env.API_PUBLIC_URL || `http://localhost:${process.env.PORT || 5000}`;
     return `${baseUrl}/api/uploads/local-download?key=${encodeURIComponent(key)}&expires=${expires}&sig=${sig}`;
@@ -131,19 +201,35 @@ const getLocalDownloadPath = (key, expires, sig) => {
   if (!useLocalStorage()) {
     throw new Error('Local storage download is disabled');
   }
-  if (!key || !expires || !sig || Number(expires) < Date.now()) {
-    throw new Error('Download link expired');
+  if (!key || !sig || !/^\d{10,16}$/.test(String(expires || ''))) {
+    throw storageError('Invalid download link', 403, 'INVALID_DOWNLOAD_LINK');
+  }
+  const expiresAt = Number(expires);
+  if (!Number.isSafeInteger(expiresAt)) {
+    throw storageError('Invalid download link', 403, 'INVALID_DOWNLOAD_LINK');
+  }
+  if (expiresAt <= Date.now()) {
+    throw storageError('Download link expired', 410, 'DOWNLOAD_LINK_EXPIRED');
+  }
+  let filePath;
+  try {
+    filePath = localPathForKey(key);
+  } catch (error) {
+    throw storageError('Invalid download link', 403, 'INVALID_DOWNLOAD_LINK');
   }
   const expected = signLocalUrl(key, expires);
-  const sigBuffer = Buffer.from(sig);
-  const expectedBuffer = Buffer.from(expected);
+  if (!/^[a-f0-9]{64}$/i.test(sig)) {
+    throw storageError('Invalid download signature', 403, 'INVALID_DOWNLOAD_SIGNATURE');
+  }
+  const sigBuffer = Buffer.from(sig, 'hex');
+  const expectedBuffer = Buffer.from(expected, 'hex');
   const valid =
     sigBuffer.length === expectedBuffer.length &&
     crypto.timingSafeEqual(sigBuffer, expectedBuffer);
   if (!valid) {
-    throw new Error('Invalid download signature');
+    throw storageError('Invalid download signature', 403, 'INVALID_DOWNLOAD_SIGNATURE');
   }
-  return localPathForKey(key);
+  return filePath;
 };
 
 /**
@@ -160,5 +246,7 @@ module.exports = {
   deleteFile,
   getLocalDownloadPath,
   useLocalStorage,
+  getConfigurationStatus,
+  maxObjectBytes,
   _resetClient,
 };

@@ -2,11 +2,31 @@ const Shift = require('../models/Shift.model');
 const Staff = require('../models/Staff.model');
 
 const WEEKLY_HOUR_THRESHOLD = 45; // South African BCEA law
+const MAX_SHIFT_RANGE_DAYS = 93;
+const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+const parseDateOnly = (value) => {
+  const match = String(value || '').match(DATE_ONLY_RE);
+  if (!match) return null;
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  return date.getUTCFullYear() === Number(match[1]) &&
+    date.getUTCMonth() === Number(match[2]) - 1 &&
+    date.getUTCDate() === Number(match[3])
+    ? date
+    : null;
+};
+
+const formatDateOnly = (date) => new Date(date).toISOString().slice(0, 10);
+const inclusiveDays = (start, end) => Math.floor((end - start) / 86400000) + 1;
 
 /**
  * Calculate hours between two HH:MM time strings.
  */
 function calcHours(startTime, endTime) {
+  if (!TIME_RE.test(String(startTime || '')) || !TIME_RE.test(String(endTime || ''))) {
+    return NaN;
+  }
   const [sh, sm] = startTime.split(':').map(Number);
   const [eh, em] = endTime.split(':').map(Number);
   return ((eh * 60 + em) - (sh * 60 + sm)) / 60;
@@ -17,15 +37,15 @@ function calcHours(startTime, endTime) {
  */
 function getWeekBounds(date) {
   const d = new Date(date);
-  const day = d.getDay(); // 0 = Sunday
+  const day = d.getUTCDay(); // 0 = Sunday
   const diffToMonday = day === 0 ? -6 : 1 - day;
   const monday = new Date(d);
-  monday.setDate(d.getDate() + diffToMonday);
-  monday.setHours(0, 0, 0, 0);
+  monday.setUTCDate(d.getUTCDate() + diffToMonday);
+  monday.setUTCHours(0, 0, 0, 0);
 
   const sunday = new Date(monday);
-  sunday.setDate(monday.getDate() + 6);
-  sunday.setHours(23, 59, 59, 999);
+  sunday.setUTCDate(monday.getUTCDate() + 6);
+  sunday.setUTCHours(23, 59, 59, 999);
 
   return { monday, sunday };
 }
@@ -63,6 +83,7 @@ const create = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
     const { staffId, date, startTime, endTime, status, notes } = req.body;
+    const shiftDate = parseDateOnly(date);
 
     if (!staffId || !date || !startTime || !endTime) {
       return res.status(400).json({
@@ -70,10 +91,16 @@ const create = async (req, res, next) => {
         message: 'staffId, date, startTime, and endTime are required',
       });
     }
+    if (!shiftDate) {
+      return res.status(400).json({ success: false, message: 'date must use YYYY-MM-DD' });
+    }
 
     const hoursWorked = calcHours(startTime, endTime);
-    if (hoursWorked <= 0) {
-      return res.status(400).json({ success: false, message: 'endTime must be after startTime' });
+    if (!Number.isFinite(hoursWorked) || hoursWorked <= 0 || hoursWorked > 24) {
+      return res.status(400).json({
+        success: false,
+        message: 'endTime must be after startTime and both times must use HH:MM',
+      });
     }
 
     if (!(await staffBelongsToCafe(staffId, cafeId))) {
@@ -81,16 +108,20 @@ const create = async (req, res, next) => {
     }
 
     // Check if weekly total exceeds 45hrs — auto-flag overtime
-    const existingWeeklyHours = await getWeeklyHours(cafeId, staffId, date);
-    const type = existingWeeklyHours + hoursWorked > WEEKLY_HOUR_THRESHOLD ? 'overtime' : 'regular';
+    const existingWeeklyHours = await getWeeklyHours(cafeId, staffId, shiftDate);
+    const regularHours = Math.min(hoursWorked, Math.max(0, WEEKLY_HOUR_THRESHOLD - existingWeeklyHours));
+    const overtimeHours = Math.max(0, hoursWorked - regularHours);
+    const type = overtimeHours > 0 ? 'overtime' : 'regular';
 
     const shift = await Shift.create({
       cafeId,
       staffId,
-      date: new Date(date),
+      date: shiftDate,
       startTime,
       endTime,
       hoursWorked,
+      regularHours,
+      overtimeHours,
       type,
       status,
       notes,
@@ -114,9 +145,21 @@ const list = async (req, res, next) => {
       startDate = monday;
       endDate = sunday;
     } else {
-      startDate = new Date(startDate);
-      endDate = new Date(endDate);
-      endDate.setHours(23, 59, 59, 999);
+      startDate = parseDateOnly(startDate);
+      endDate = parseDateOnly(endDate);
+      if (!startDate || !endDate || endDate < startDate) {
+        return res.status(400).json({
+          success: false,
+          message: 'startDate and endDate must be a valid YYYY-MM-DD range',
+        });
+      }
+      if (inclusiveDays(startDate, endDate) > MAX_SHIFT_RANGE_DAYS) {
+        return res.status(400).json({
+          success: false,
+          message: `Shift ranges cannot exceed ${MAX_SHIFT_RANGE_DAYS} days`,
+        });
+      }
+      endDate.setUTCHours(23, 59, 59, 999);
     }
 
     const shifts = await Shift.find({
@@ -153,13 +196,13 @@ const getWeek = async (req, res, next) => {
     const roster = {};
     for (let i = 0; i < 7; i++) {
       const dayDate = new Date(monday);
-      dayDate.setDate(monday.getDate() + i);
-      const key = dayDate.toISOString().split('T')[0];
+      dayDate.setUTCDate(monday.getUTCDate() + i);
+      const key = formatDateOnly(dayDate);
       roster[key] = { day: days[i], date: key, shifts: [] };
     }
 
     for (const shift of shifts) {
-      const key = new Date(shift.date).toISOString().split('T')[0];
+      const key = formatDateOnly(shift.date);
       if (roster[key]) {
         roster[key].shifts.push(shift);
       }
@@ -182,9 +225,21 @@ const getSummary = async (req, res, next) => {
       startDate = monday;
       endDate = sunday;
     } else {
-      startDate = new Date(startDate);
-      endDate = new Date(endDate);
-      endDate.setHours(23, 59, 59, 999);
+      startDate = parseDateOnly(startDate);
+      endDate = parseDateOnly(endDate);
+      if (!startDate || !endDate || endDate < startDate) {
+        return res.status(400).json({
+          success: false,
+          message: 'startDate and endDate must be a valid YYYY-MM-DD range',
+        });
+      }
+      if (inclusiveDays(startDate, endDate) > MAX_SHIFT_RANGE_DAYS) {
+        return res.status(400).json({
+          success: false,
+          message: `Summary ranges cannot exceed ${MAX_SHIFT_RANGE_DAYS} days`,
+        });
+      }
+      endDate.setUTCHours(23, 59, 59, 999);
     }
 
     const shifts = await Shift.find({
@@ -193,10 +248,12 @@ const getSummary = async (req, res, next) => {
       status: { $ne: 'cancelled' },
     })
       .populate('staffId', 'name hourlyRate')
+      .sort({ staffId: 1, date: 1, startTime: 1 })
       .lean();
 
     // Aggregate by staff
     const staffMap = {};
+    const weeklyHours = {};
     for (const shift of shifts) {
       if (!shift.staffId) continue;
       const sid = shift.staffId._id.toString();
@@ -210,13 +267,15 @@ const getSummary = async (req, res, next) => {
           overtimeHours: 0,
         };
       }
-      const hours = shift.hoursWorked || 0;
+      const hours = Number(shift.hoursWorked || 0);
+      const weekKey = `${sid}:${formatDateOnly(getWeekBounds(shift.date).monday)}`;
+      const hoursBeforeShift = weeklyHours[weekKey] || 0;
+      const regularHours = Math.min(hours, Math.max(0, WEEKLY_HOUR_THRESHOLD - hoursBeforeShift));
+      const overtimeHours = Math.max(0, hours - regularHours);
+      weeklyHours[weekKey] = hoursBeforeShift + hours;
       staffMap[sid].totalHours += hours;
-      if (shift.type === 'overtime') {
-        staffMap[sid].overtimeHours += hours;
-      } else {
-        staffMap[sid].regularHours += hours;
-      }
+      staffMap[sid].regularHours += regularHours;
+      staffMap[sid].overtimeHours += overtimeHours;
     }
 
     const summary = Object.values(staffMap).map((s) => ({
@@ -231,7 +290,7 @@ const getSummary = async (req, res, next) => {
       overThreshold: s.totalHours > WEEKLY_HOUR_THRESHOLD,
     }));
 
-    return res.status(200).json({ success: true, summary });
+    return res.status(200).json({ success: true, summary, summaries: summary });
   } catch (error) {
     next(error);
   }
@@ -251,12 +310,18 @@ const update = async (req, res, next) => {
 
     const newStartTime = startTime || existing.startTime;
     const newEndTime = endTime || existing.endTime;
-    const newDate = date ? new Date(date) : existing.date;
+    const newDate = date ? parseDateOnly(date) : existing.date;
     const newStaffId = staffId || existing.staffId;
 
+    if (date && !newDate) {
+      return res.status(400).json({ success: false, message: 'date must use YYYY-MM-DD' });
+    }
     const hoursWorked = calcHours(newStartTime, newEndTime);
-    if (hoursWorked <= 0) {
-      return res.status(400).json({ success: false, message: 'endTime must be after startTime' });
+    if (!Number.isFinite(hoursWorked) || hoursWorked <= 0 || hoursWorked > 24) {
+      return res.status(400).json({
+        success: false,
+        message: 'endTime must be after startTime and both times must use HH:MM',
+      });
     }
 
     if (staffId && !(await staffBelongsToCafe(staffId, cafeId))) {
@@ -265,7 +330,9 @@ const update = async (req, res, next) => {
 
     // Re-check overtime threshold
     const existingWeeklyHours = await getWeeklyHours(cafeId, newStaffId, newDate, existing._id);
-    const type = existingWeeklyHours + hoursWorked > WEEKLY_HOUR_THRESHOLD ? 'overtime' : 'regular';
+    const regularHours = Math.min(hoursWorked, Math.max(0, WEEKLY_HOUR_THRESHOLD - existingWeeklyHours));
+    const overtimeHours = Math.max(0, hoursWorked - regularHours);
+    const type = overtimeHours > 0 ? 'overtime' : 'regular';
 
     const shift = await Shift.findOneAndUpdate(
       { _id: id, cafeId },
@@ -278,6 +345,8 @@ const update = async (req, res, next) => {
           ...(status !== undefined && { status }),
           ...(notes !== undefined && { notes }),
           hoursWorked,
+          regularHours,
+          overtimeHours,
           type,
         },
       },

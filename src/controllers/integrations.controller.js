@@ -155,7 +155,9 @@ const sync = async (req, res, next) => {
     const service = getService(provider);
     if (!service) return res.status(400).json({ success: false, message: 'Unknown provider' });
 
-    const cafe = await Cafe.findById(req.user.cafeId);
+    const cafe = await Cafe.findById(req.user.cafeId).select(
+      `+accountingIntegrations.${provider}.accessToken +accountingIntegrations.${provider}.refreshToken`
+    );
     const integ = cafe?.accountingIntegrations?.[provider];
     if (!integ?.connected) {
       return res.status(400).json({ success: false, message: 'Not connected' });

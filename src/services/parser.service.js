@@ -1,14 +1,283 @@
 const csv = require('csv-parser');
 const { Readable } = require('stream');
+const zlib = require('zlib');
 const readXlsxFile = require('read-excel-file/node');
 
 const REQUIRED_FIELDS = ['date', 'items', 'total'];
 const UNNAMED_COLUMN_RE = /^_(\d+)$/;
 const VALID_ITEMS_MODES = new Set(['packed', 'line-per-row']);
 const SOURCE_ROW_NUMBERS = '__sourceRowNumbers';
+const DEFAULT_TIMEZONE = 'Africa/Johannesburg';
+const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const MAX_ROW_ERRORS = 50;
 const MAX_ROW_ERROR_COLUMNS = 12;
 const MAX_ROW_ERROR_VALUE_LENGTH = 160;
+const DEFAULT_MAX_ROWS = 10000;
+const HARD_MAX_ROWS = 25000;
+const DEFAULT_MAX_COLUMNS = 100;
+const HARD_MAX_COLUMNS = 250;
+const DEFAULT_MAX_CELL_CHARS = 10000;
+const HARD_MAX_CELL_CHARS = 100000;
+const DEFAULT_MAX_ITEMS_PER_TRANSACTION = 100;
+const HARD_MAX_ITEMS_PER_TRANSACTION = 500;
+const DEFAULT_MAX_ITEM_QUANTITY = 10000;
+const HARD_MAX_ITEM_QUANTITY = 1000000;
+const DEFAULT_MAX_ABSOLUTE_AMOUNT = 10000000;
+const HARD_MAX_ABSOLUTE_AMOUNT = 1000000000;
+const DEFAULT_MAX_ITEM_NAME_CHARS = 200;
+const HARD_MAX_ITEM_NAME_CHARS = 1000;
+const DEFAULT_MAX_IDENTIFIER_CHARS = 200;
+const HARD_MAX_IDENTIFIER_CHARS = 1000;
+const DEFAULT_MAX_DATE_RANGE_DAYS = 5 * 366;
+const HARD_MAX_DATE_RANGE_DAYS = 10 * 366;
+const DEFAULT_MAX_FUTURE_DAYS = 366;
+const HARD_MAX_FUTURE_DAYS = 5 * 366;
+const DEFAULT_MIN_YEAR = 2000;
+const DEFAULT_XLSX_MAX_ENTRIES = 1000;
+const HARD_XLSX_MAX_ENTRIES = 5000;
+const DEFAULT_XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES = 50 * 1024 * 1024;
+const HARD_XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES = 200 * 1024 * 1024;
+const DEFAULT_XLSX_MAX_ENTRY_UNCOMPRESSED_BYTES = 20 * 1024 * 1024;
+const HARD_XLSX_MAX_ENTRY_UNCOMPRESSED_BYTES = 100 * 1024 * 1024;
+const DEFAULT_XLSX_MAX_COMPRESSION_RATIO = 200;
+const HARD_XLSX_MAX_COMPRESSION_RATIO = 1000;
+
+const boundedInteger = (value, fallback, min, max) => {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(parsed, max));
+};
+
+const parserLimits = () => ({
+  maxRows: boundedInteger(process.env.UPLOAD_MAX_ROWS, DEFAULT_MAX_ROWS, 1, HARD_MAX_ROWS),
+  maxColumns: boundedInteger(process.env.UPLOAD_MAX_COLUMNS, DEFAULT_MAX_COLUMNS, 2, HARD_MAX_COLUMNS),
+  maxCellChars: boundedInteger(
+    process.env.UPLOAD_MAX_CELL_CHARS,
+    DEFAULT_MAX_CELL_CHARS,
+    100,
+    HARD_MAX_CELL_CHARS
+  ),
+  maxItemsPerTransaction: boundedInteger(
+    process.env.UPLOAD_MAX_ITEMS_PER_TRANSACTION,
+    DEFAULT_MAX_ITEMS_PER_TRANSACTION,
+    1,
+    HARD_MAX_ITEMS_PER_TRANSACTION
+  ),
+  maxItemQuantity: boundedInteger(
+    process.env.UPLOAD_MAX_ITEM_QUANTITY,
+    DEFAULT_MAX_ITEM_QUANTITY,
+    1,
+    HARD_MAX_ITEM_QUANTITY
+  ),
+  maxAbsoluteAmount: boundedInteger(
+    process.env.UPLOAD_MAX_ABSOLUTE_AMOUNT,
+    DEFAULT_MAX_ABSOLUTE_AMOUNT,
+    1,
+    HARD_MAX_ABSOLUTE_AMOUNT
+  ),
+  maxItemNameChars: boundedInteger(
+    process.env.UPLOAD_MAX_ITEM_NAME_CHARS,
+    DEFAULT_MAX_ITEM_NAME_CHARS,
+    1,
+    HARD_MAX_ITEM_NAME_CHARS
+  ),
+  maxIdentifierChars: boundedInteger(
+    process.env.UPLOAD_MAX_IDENTIFIER_CHARS,
+    DEFAULT_MAX_IDENTIFIER_CHARS,
+    1,
+    HARD_MAX_IDENTIFIER_CHARS
+  ),
+  maxDateRangeDays: boundedInteger(
+    process.env.UPLOAD_MAX_DATE_RANGE_DAYS,
+    DEFAULT_MAX_DATE_RANGE_DAYS,
+    1,
+    HARD_MAX_DATE_RANGE_DAYS
+  ),
+  maxFutureDays: boundedInteger(
+    process.env.UPLOAD_MAX_FUTURE_DAYS,
+    DEFAULT_MAX_FUTURE_DAYS,
+    0,
+    HARD_MAX_FUTURE_DAYS
+  ),
+  minYear: boundedInteger(process.env.UPLOAD_MIN_YEAR, DEFAULT_MIN_YEAR, 1970, 2100),
+  xlsxMaxEntries: boundedInteger(
+    process.env.XLSX_MAX_ENTRIES,
+    DEFAULT_XLSX_MAX_ENTRIES,
+    1,
+    HARD_XLSX_MAX_ENTRIES
+  ),
+  xlsxMaxTotalUncompressedBytes: boundedInteger(
+    process.env.XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES,
+    DEFAULT_XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES,
+    1024,
+    HARD_XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES
+  ),
+  xlsxMaxEntryUncompressedBytes: boundedInteger(
+    process.env.XLSX_MAX_ENTRY_UNCOMPRESSED_BYTES,
+    DEFAULT_XLSX_MAX_ENTRY_UNCOMPRESSED_BYTES,
+    1024,
+    HARD_XLSX_MAX_ENTRY_UNCOMPRESSED_BYTES
+  ),
+  xlsxMaxCompressionRatio: boundedInteger(
+    process.env.XLSX_MAX_COMPRESSION_RATIO,
+    DEFAULT_XLSX_MAX_COMPRESSION_RATIO,
+    1,
+    HARD_XLSX_MAX_COMPRESSION_RATIO
+  ),
+});
+
+const createClientInputError = (message) => {
+  const error = new Error(message);
+  error.statusCode = 400;
+  return error;
+};
+
+const safeTimezone = (timezone) => {
+  const candidate = String(timezone || DEFAULT_TIMEZONE);
+  try {
+    Intl.DateTimeFormat('en-ZA', { timeZone: candidate }).format(new Date());
+    return candidate;
+  } catch {
+    return DEFAULT_TIMEZONE;
+  }
+};
+
+const getTimeZoneOffsetMs = (date, timezone) => {
+  const parts = new Intl.DateTimeFormat('en-ZA', {
+    timeZone: safeTimezone(timezone),
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(date);
+  const values = Object.fromEntries(
+    parts.filter((part) => part.type !== 'literal').map((part) => [part.type, Number(part.value)])
+  );
+  const asUtc = Date.UTC(
+    values.year,
+    values.month - 1,
+    values.day,
+    values.hour,
+    values.minute,
+    values.second
+  );
+  return asUtc + date.getUTCMilliseconds() - date.getTime();
+};
+
+const zonedDateTimeToUtc = (
+  { year, month, day, hour = 0, minute = 0, second = 0, ms = 0 },
+  timezone
+) => {
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute, second, ms);
+  const firstOffset = getTimeZoneOffsetMs(new Date(utcGuess), timezone);
+  const firstUtc = utcGuess - firstOffset;
+  const secondOffset = getTimeZoneOffsetMs(new Date(firstUtc), timezone);
+  return new Date(utcGuess - secondOffset);
+};
+
+const getZonedDateParts = (date, timezone) => {
+  const parsed = new Date(date);
+  if (Number.isNaN(parsed.getTime())) return null;
+  const parts = new Intl.DateTimeFormat('en-ZA', {
+    timeZone: safeTimezone(timezone),
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(parsed);
+  const values = Object.fromEntries(
+    parts.filter((part) => part.type !== 'literal').map((part) => [part.type, Number(part.value)])
+  );
+  return {
+    year: values.year,
+    month: values.month,
+    day: values.day,
+    hour: values.hour,
+    minute: values.minute,
+    second: values.second,
+  };
+};
+
+const dateOnlyParts = (value, timezone) => {
+  const match = typeof value === 'string' ? String(value).trim().match(DATE_ONLY_RE) : null;
+  if (match) {
+    const parts = {
+      year: Number(match[1]),
+      month: Number(match[2]),
+      day: Number(match[3]),
+    };
+    const check = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+    if (
+      check.getUTCFullYear() !== parts.year ||
+      check.getUTCMonth() !== parts.month - 1 ||
+      check.getUTCDate() !== parts.day
+    ) return null;
+    return parts;
+  }
+  const parts = getZonedDateParts(value, timezone);
+  return parts && { year: parts.year, month: parts.month, day: parts.day };
+};
+
+const addDatePartsDays = (parts, days) => {
+  const cursor = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+  cursor.setUTCDate(cursor.getUTCDate() + days);
+  return {
+    year: cursor.getUTCFullYear(),
+    month: cursor.getUTCMonth() + 1,
+    day: cursor.getUTCDate(),
+  };
+};
+
+const zonedDayStart = (value, timezone = DEFAULT_TIMEZONE) => {
+  const parts = dateOnlyParts(value, timezone);
+  if (!parts) return null;
+  return zonedDateTimeToUtc(parts, timezone);
+};
+
+const zonedDayEnd = (value, timezone = DEFAULT_TIMEZONE) => {
+  const parts = dateOnlyParts(value, timezone);
+  if (!parts) return null;
+  return zonedDateTimeToUtc(
+    { ...parts, hour: 23, minute: 59, second: 59, ms: 999 },
+    timezone
+  );
+};
+
+const addZonedDays = (value, days, timezone = DEFAULT_TIMEZONE) => {
+  const parts = dateOnlyParts(value, timezone);
+  if (!parts) return null;
+  return zonedDateTimeToUtc(addDatePartsDays(parts, days), timezone);
+};
+
+const zonedDayOrdinal = (value, timezone = DEFAULT_TIMEZONE) => {
+  const parts = dateOnlyParts(value, timezone);
+  if (!parts) return null;
+  return Math.floor(Date.UTC(parts.year, parts.month - 1, parts.day) / 86400000);
+};
+
+const zonedDateKey = (value, timezone = DEFAULT_TIMEZONE) => {
+  const parts = dateOnlyParts(value, timezone);
+  if (!parts) return null;
+  return `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
+};
+
+const zonedDayOfWeek = (value, timezone = DEFAULT_TIMEZONE) => {
+  const parts = dateOnlyParts(value, timezone);
+  if (!parts) return null;
+  return new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay();
+};
+
+const processLocalCalendarDate = (value, timezone = DEFAULT_TIMEZONE) => {
+  const parts = dateOnlyParts(value, timezone);
+  if (!parts) return null;
+  return new Date(parts.year, parts.month - 1, parts.day, 12, 0, 0, 0);
+};
 
 const requiredFieldsForMode = (itemsMode = 'packed') =>
   itemsMode === 'line-per-row'
@@ -20,7 +289,14 @@ const normaliseHeader = (header, index = 0) => {
   return value || `Column ${index + 1}`;
 };
 
-const normaliseCell = (value) => (typeof value === 'string' ? value.trim() : value);
+const normaliseCell = (value) => {
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if (trimmed.length > parserLimits().maxCellChars) {
+    throw createClientInputError(`A cell exceeds the ${parserLimits().maxCellChars} character limit`);
+  }
+  return trimmed;
+};
 
 const normaliseRow = (row) => {
   const normalised = {};
@@ -40,7 +316,7 @@ const normaliseRow = (row) => {
 
 const normaliseRows = (rows) => rows.map(normaliseRow);
 
-const excelSerialDateToDate = (serial) => {
+const excelSerialDateToDate = (serial, timezone = DEFAULT_TIMEZONE) => {
   if (!Number.isFinite(serial) || serial <= 0) return null;
 
   const wholeDays = Math.floor(serial);
@@ -48,21 +324,28 @@ const excelSerialDateToDate = (serial) => {
   const epoch = Date.UTC(1899, 11, 30);
   const date = new Date(epoch + wholeDays * 86400000 + Math.round(dayFraction * 86400000));
 
-  return new Date(
-    date.getUTCFullYear(),
-    date.getUTCMonth(),
-    date.getUTCDate(),
-    date.getUTCHours(),
-    date.getUTCMinutes(),
-    date.getUTCSeconds()
-  );
+  return zonedDateTimeToUtc({
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+    hour: date.getUTCHours(),
+    minute: date.getUTCMinutes(),
+    second: date.getUTCSeconds(),
+  }, timezone);
 };
 
 const readWorkbookRows = async (buffer) => {
+  const limits = parserLimits();
   const matrix = await readXlsxFile(buffer);
   if (!matrix.length) return [];
+  if (matrix.length - 1 > limits.maxRows) {
+    throw createClientInputError(`File exceeds the ${limits.maxRows} row limit`);
+  }
 
   const [headerRow, ...dataRows] = matrix;
+  if (headerRow.length > limits.maxColumns) {
+    throw createClientInputError(`File exceeds the ${limits.maxColumns} column limit`);
+  }
   const headers = headerRow.map((header, index) => normaliseHeader(header, index));
 
   return dataRows
@@ -80,6 +363,268 @@ const readWorkbookRows = async (buffer) => {
       });
       return mapped;
     });
+};
+
+const ZIP_LOCAL_HEADER = 0x04034b50;
+const ZIP_CENTRAL_HEADER = 0x02014b50;
+const ZIP_END_OF_CENTRAL_DIRECTORY = 0x06054b50;
+const ZIP64_END_LOCATOR = 0x07064b50;
+const ZIP_ENCRYPTION_FLAGS = 0x0001 | 0x0040 | 0x2000;
+
+const assertZipExtraFields = (buffer, start, length) => {
+  const end = start + length;
+  if (start < 0 || end > buffer.length) throw createClientInputError('XLSX ZIP metadata is malformed');
+  let offset = start;
+  while (offset < end) {
+    if (offset + 4 > end) throw createClientInputError('XLSX ZIP extra fields are malformed');
+    const headerId = buffer.readUInt16LE(offset);
+    const dataLength = buffer.readUInt16LE(offset + 2);
+    offset += 4;
+    if (offset + dataLength > end) throw createClientInputError('XLSX ZIP extra fields are malformed');
+    if (headerId === 0x0001) throw createClientInputError('ZIP64 XLSX archives are not supported');
+    offset += dataLength;
+  }
+};
+
+const findZipEndRecord = (buffer) => {
+  if (buffer.length < 22) return null;
+  const earliest = Math.max(0, buffer.length - 22 - 0xffff);
+  for (let offset = buffer.length - 22; offset >= earliest; offset -= 1) {
+    if (buffer.readUInt32LE(offset) !== ZIP_END_OF_CENTRAL_DIRECTORY) continue;
+    const commentLength = buffer.readUInt16LE(offset + 20);
+    if (offset + 22 + commentLength === buffer.length) return offset;
+  }
+  return null;
+};
+
+const assertSafeZipEntryName = (name) => {
+  const normalized = String(name || '').replace(/\\/g, '/');
+  const segments = normalized.split('/');
+  if (
+    !normalized ||
+    normalized.length > 1024 ||
+    normalized.includes('\0') ||
+    normalized.startsWith('/') ||
+    /^[a-zA-Z]:/.test(normalized) ||
+    segments.includes('..')
+  ) {
+    throw createClientInputError('XLSX archive contains an unsafe entry name');
+  }
+};
+
+const assertSafeXlsxArchive = (buffer) => {
+  const limits = parserLimits();
+  const endOffset = findZipEndRecord(buffer);
+  if (endOffset == null) throw createClientInputError('XLSX ZIP directory is missing or malformed');
+  if (endOffset >= 20 && buffer.readUInt32LE(endOffset - 20) === ZIP64_END_LOCATOR) {
+    throw createClientInputError('ZIP64 XLSX archives are not supported');
+  }
+
+  const diskNumber = buffer.readUInt16LE(endOffset + 4);
+  const centralDisk = buffer.readUInt16LE(endOffset + 6);
+  const entriesOnDisk = buffer.readUInt16LE(endOffset + 8);
+  const entryCount = buffer.readUInt16LE(endOffset + 10);
+  const centralSize = buffer.readUInt32LE(endOffset + 12);
+  const centralOffset = buffer.readUInt32LE(endOffset + 16);
+  if (
+    diskNumber !== 0 ||
+    centralDisk !== 0 ||
+    entriesOnDisk !== entryCount ||
+    entryCount === 0 ||
+    entryCount === 0xffff ||
+    centralSize === 0xffffffff ||
+    centralOffset === 0xffffffff
+  ) {
+    throw createClientInputError('Multi-disk or ZIP64 XLSX archives are not supported');
+  }
+  if (entryCount > limits.xlsxMaxEntries) {
+    throw createClientInputError(`XLSX archive exceeds the ${limits.xlsxMaxEntries} entry limit`);
+  }
+  if (centralOffset + centralSize !== endOffset || centralOffset >= endOffset) {
+    throw createClientInputError('XLSX ZIP directory offsets are malformed');
+  }
+
+  let offset = centralOffset;
+  let totalCompressed = 0;
+  let totalUncompressed = 0;
+  let actualTotalUncompressed = 0;
+  const localRanges = [];
+  for (let index = 0; index < entryCount; index += 1) {
+    if (offset + 46 > endOffset || buffer.readUInt32LE(offset) !== ZIP_CENTRAL_HEADER) {
+      throw createClientInputError('XLSX ZIP central directory is malformed');
+    }
+    const versionMadeBy = buffer.readUInt16LE(offset + 4);
+    const versionNeeded = buffer.readUInt16LE(offset + 6);
+    const flags = buffer.readUInt16LE(offset + 8);
+    const compressionMethod = buffer.readUInt16LE(offset + 10);
+    const expectedCrc = buffer.readUInt32LE(offset + 16);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const uncompressedSize = buffer.readUInt32LE(offset + 24);
+    const fileNameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const entryDisk = buffer.readUInt16LE(offset + 34);
+    const externalAttributes = buffer.readUInt32LE(offset + 38);
+    const localOffset = buffer.readUInt32LE(offset + 42);
+    const centralEntryEnd = offset + 46 + fileNameLength + extraLength + commentLength;
+
+    if (
+      centralEntryEnd > endOffset ||
+      versionNeeded >= 45 ||
+      (flags & ZIP_ENCRYPTION_FLAGS) !== 0 ||
+      ![0, 8].includes(compressionMethod) ||
+      compressedSize === 0xffffffff ||
+      uncompressedSize === 0xffffffff ||
+      localOffset === 0xffffffff ||
+      entryDisk !== 0
+    ) {
+      throw createClientInputError('XLSX archive uses unsupported or unsafe ZIP features');
+    }
+    const unixMode = externalAttributes >>> 16;
+    if ((versionMadeBy >>> 8) === 3 && (unixMode & 0xf000) === 0xa000) {
+      throw createClientInputError('XLSX archive symbolic-link entries are not supported');
+    }
+
+    const fileNameStart = offset + 46;
+    const fileNameBuffer = buffer.subarray(fileNameStart, fileNameStart + fileNameLength);
+    const fileName = fileNameBuffer.toString((flags & 0x0800) !== 0 ? 'utf8' : 'latin1');
+    assertSafeZipEntryName(fileName);
+    assertZipExtraFields(buffer, fileNameStart + fileNameLength, extraLength);
+
+    if (uncompressedSize > limits.xlsxMaxEntryUncompressedBytes) {
+      throw createClientInputError(
+        `XLSX entry exceeds the ${limits.xlsxMaxEntryUncompressedBytes} byte expanded-size limit`
+      );
+    }
+    if (
+      uncompressedSize > 0 &&
+      (compressedSize === 0 || uncompressedSize / compressedSize > limits.xlsxMaxCompressionRatio)
+    ) {
+      throw createClientInputError(
+        `XLSX entry exceeds the ${limits.xlsxMaxCompressionRatio}:1 compression-ratio limit`
+      );
+    }
+    if (compressionMethod === 0 && compressedSize !== uncompressedSize) {
+      throw createClientInputError('Stored XLSX ZIP entry sizes are inconsistent');
+    }
+
+    totalCompressed += compressedSize;
+    totalUncompressed += uncompressedSize;
+    if (totalUncompressed > limits.xlsxMaxTotalUncompressedBytes) {
+      throw createClientInputError(
+        `XLSX archive exceeds the ${limits.xlsxMaxTotalUncompressedBytes} byte expanded-size limit`
+      );
+    }
+
+    if (localOffset + 30 > centralOffset || buffer.readUInt32LE(localOffset) !== ZIP_LOCAL_HEADER) {
+      throw createClientInputError('XLSX ZIP local-file offsets are malformed');
+    }
+    const localVersionNeeded = buffer.readUInt16LE(localOffset + 4);
+    const localFlags = buffer.readUInt16LE(localOffset + 6);
+    const localMethod = buffer.readUInt16LE(localOffset + 8);
+    const localCrc = buffer.readUInt32LE(localOffset + 14);
+    const localCompressedSize = buffer.readUInt32LE(localOffset + 18);
+    const localUncompressedSize = buffer.readUInt32LE(localOffset + 22);
+    const localNameLength = buffer.readUInt16LE(localOffset + 26);
+    const localExtraLength = buffer.readUInt16LE(localOffset + 28);
+    const localNameStart = localOffset + 30;
+    const dataStart = localNameStart + localNameLength + localExtraLength;
+    const dataEnd = dataStart + compressedSize;
+    if (
+      localVersionNeeded >= 45 ||
+      localFlags !== flags ||
+      localMethod !== compressionMethod ||
+      localNameLength !== fileNameLength ||
+      dataStart > centralOffset ||
+      dataEnd > centralOffset ||
+      !buffer.subarray(localNameStart, localNameStart + localNameLength).equals(fileNameBuffer)
+    ) {
+      throw createClientInputError('XLSX ZIP local-file metadata is inconsistent');
+    }
+    if (
+      (flags & 0x0008) === 0 &&
+      (
+        localCrc !== expectedCrc ||
+        localCompressedSize !== compressedSize ||
+        localUncompressedSize !== uncompressedSize
+      )
+    ) {
+      throw createClientInputError('XLSX ZIP entry sizes are inconsistent');
+    }
+    assertZipExtraFields(buffer, localNameStart + localNameLength, localExtraLength);
+    let expanded;
+    if (compressionMethod === 8) {
+      const verificationLimit = Math.max(1, Math.min(
+        limits.xlsxMaxEntryUncompressedBytes,
+        limits.xlsxMaxTotalUncompressedBytes - actualTotalUncompressed,
+        uncompressedSize + 1
+      ));
+      try {
+        expanded = zlib.inflateRawSync(buffer.subarray(dataStart, dataEnd), {
+          maxOutputLength: verificationLimit,
+        });
+      } catch (error) {
+        throw createClientInputError('XLSX ZIP entry could not be safely decompressed');
+      }
+    } else {
+      expanded = buffer.subarray(dataStart, dataEnd);
+    }
+    if (expanded.length !== uncompressedSize) {
+      throw createClientInputError('XLSX ZIP expanded sizes are inconsistent');
+    }
+    if ((zlib.crc32(expanded) >>> 0) !== expectedCrc) {
+      throw createClientInputError('XLSX ZIP entry CRC checksum is inconsistent');
+    }
+    actualTotalUncompressed += expanded.length;
+    if (actualTotalUncompressed > limits.xlsxMaxTotalUncompressedBytes) {
+      throw createClientInputError(
+        `XLSX archive exceeds the ${limits.xlsxMaxTotalUncompressedBytes} byte actual expanded-size limit`
+      );
+    }
+    localRanges.push({ start: localOffset, end: dataEnd });
+    offset = centralEntryEnd;
+  }
+
+  if (offset !== endOffset) throw createClientInputError('XLSX ZIP central directory size is inconsistent');
+  if (
+    totalUncompressed > 0 &&
+    (totalCompressed === 0 || totalUncompressed / totalCompressed > limits.xlsxMaxCompressionRatio)
+  ) {
+    throw createClientInputError(
+      `XLSX archive exceeds the ${limits.xlsxMaxCompressionRatio}:1 compression-ratio limit`
+    );
+  }
+  localRanges.sort((left, right) => left.start - right.start);
+  for (let index = 1; index < localRanges.length; index += 1) {
+    if (localRanges[index].start < localRanges[index - 1].end) {
+      throw createClientInputError('XLSX ZIP entries overlap');
+    }
+  }
+};
+
+const assertSupportedFileBuffer = (buffer, fileExt = 'csv') => {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+    throw createClientInputError('Uploaded file is empty');
+  }
+
+  const ext = String(fileExt || '').toLowerCase();
+  if (ext === 'xlsx') {
+    const validZipSuffixes = new Set(['3:4', '5:6', '7:8']);
+    const isZip = buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b &&
+      validZipSuffixes.has(`${buffer[2]}:${buffer[3]}`);
+    if (!isZip) throw createClientInputError('XLSX file signature is invalid');
+    assertSafeXlsxArchive(buffer);
+    return;
+  }
+
+  if (ext !== 'csv') {
+    throw createClientInputError('Only CSV and XLSX files are supported');
+  }
+
+  const sample = buffer.subarray(0, Math.min(buffer.length, 8192));
+  if (sample.includes(0)) {
+    throw createClientInputError('CSV file contains binary data');
+  }
 };
 
 const detectCsvSeparator = (buffer) => {
@@ -123,18 +668,25 @@ const parsePackedItems = (str) => {
     .filter((item) => item.name && item.quantity > 0);
 };
 
-const cleanNumber = (raw) => {
-  if (raw == null || raw === '') return 0;
-  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : 0;
+const parseCleanNumber = (raw) => {
+  if (raw == null || raw === '') return { valid: false, value: 0 };
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw)
+      ? { valid: true, value: raw }
+      : { valid: false, value: 0 };
+  }
 
   let value = String(raw).trim();
+  if (/\d[eE][+-]?\d/.test(value)) return { valid: false, value: 0 };
   const parenthesisedNegative = /^\(.*\)$/.test(value);
   value = value
     .replace(/[()]/g, '')
     .replace(/\s+/g, '')
     .replace(/[^\d,.-]/g, '');
 
-  if (!value || value === '-' || value === '.' || value === ',') return 0;
+  if (!value || value === '-' || value === '.' || value === ',') {
+    return { valid: false, value: 0 };
+  }
 
   const lastComma = value.lastIndexOf(',');
   const lastDot = value.lastIndexOf('.');
@@ -153,13 +705,26 @@ const cleanNumber = (raw) => {
 
   value = value.replace(/(?!^)-/g, '');
   const parsed = parseFloat(value);
-  if (!Number.isFinite(parsed)) return 0;
-  return parenthesisedNegative ? -Math.abs(parsed) : parsed;
+  if (!Number.isFinite(parsed)) return { valid: false, value: 0 };
+  return {
+    valid: true,
+    value: parenthesisedNegative ? -Math.abs(parsed) : parsed,
+  };
 };
 
-const parseQuantity = (raw) => {
-  const quantity = Math.trunc(cleanNumber(raw));
-  return Number.isFinite(quantity) && quantity > 0 ? quantity : null;
+const parseBoundedAmount = (raw, limits = parserLimits()) => {
+  const parsed = parseCleanNumber(raw);
+  if (!parsed.valid || Math.abs(parsed.value) > limits.maxAbsoluteAmount) return null;
+  return parsed.value;
+};
+
+const parseQuantity = (raw, limits = parserLimits()) => {
+  const parsed = parseCleanNumber(raw);
+  const quantity = Math.trunc(parsed.value);
+  return parsed.valid && Number.isSafeInteger(quantity) &&
+    quantity > 0 && quantity <= limits.maxItemQuantity
+    ? quantity
+    : null;
 };
 
 const extraColumnIndex = (key) => {
@@ -211,6 +776,7 @@ const repairOverflowColumns = (rawRows, mapping) =>
   });
 
 const readRows = (buffer, fileExt) => {
+  assertSupportedFileBuffer(buffer, fileExt);
   if (fileExt === 'xlsx') {
     return readWorkbookRows(buffer);
   }
@@ -218,15 +784,35 @@ const readRows = (buffer, fileExt) => {
     return Promise.reject(new Error('Legacy XLS files are not supported. Please export as CSV or XLSX.'));
   }
   return new Promise((resolve, reject) => {
+    const limits = parserLimits();
     const rows = [];
     let rowNumber = 1;
-    Readable.from(buffer)
-      .pipe(csv({
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    const input = Readable.from(buffer);
+    const parserStream = csv({
         separator: detectCsvSeparator(buffer),
         mapHeaders: ({ header, index }) => normaliseHeader(header, index),
         mapValues: ({ value }) => normaliseCell(value),
-      }))
+      });
+    input
+      .pipe(parserStream)
       .on('data', (row) => {
+        if (settled) return;
+        if (Object.keys(row).length > limits.maxColumns) {
+          const error = createClientInputError(`File exceeds the ${limits.maxColumns} column limit`);
+          parserStream.destroy(error);
+          return;
+        }
+        if (rows.length >= limits.maxRows) {
+          const error = createClientInputError(`File exceeds the ${limits.maxRows} row limit`);
+          parserStream.destroy(error);
+          return;
+        }
         rowNumber += 1;
         Object.defineProperty(row, SOURCE_ROW_NUMBERS, {
           value: [rowNumber],
@@ -235,8 +821,12 @@ const readRows = (buffer, fileExt) => {
         });
         rows.push(row);
       })
-      .on('error', reject)
-      .on('end', () => resolve(normaliseRows(rows)));
+      .on('error', fail)
+      .on('end', () => {
+        if (settled) return;
+        settled = true;
+        resolve(normaliseRows(rows));
+      });
   });
 };
 
@@ -294,9 +884,9 @@ const parseTimeParts = (timeStr) => {
   if (!timeStr) return null;
   if (timeStr instanceof Date) {
     return {
-      hours: timeStr.getHours(),
-      minutes: timeStr.getMinutes(),
-      seconds: timeStr.getSeconds(),
+      hours: timeStr.getUTCHours(),
+      minutes: timeStr.getUTCMinutes(),
+      seconds: timeStr.getUTCSeconds(),
     };
   }
   if (typeof timeStr === 'number') {
@@ -326,28 +916,47 @@ const parseTimeParts = (timeStr) => {
   return parts;
 };
 
-const applyTimeParts = (date, timeStr) => {
+const applyTimeParts = (date, timeStr, timezone = DEFAULT_TIMEZONE) => {
   const hasExplicitTime = timeStr != null && String(timeStr).trim() !== '';
   if (!hasExplicitTime) return date;
   const time = parseTimeParts(timeStr);
   if (!time) return null;
-  date.setHours(time.hours, time.minutes, time.seconds, 0);
-  return date;
+  const localDate = getZonedDateParts(date, timezone);
+  if (!localDate) return null;
+  return zonedDateTimeToUtc({
+    year: localDate.year,
+    month: localDate.month,
+    day: localDate.day,
+    hour: time.hours,
+    minute: time.minutes,
+    second: time.seconds,
+  }, timezone);
 };
 
-const dateFromParts = (year, month, day, timeStr) => {
-  const date = new Date(year, month - 1, day);
+const dateFromParts = (year, month, day, timeStr, timezone = DEFAULT_TIMEZONE) => {
+  const date = new Date(Date.UTC(year, month - 1, day));
   if (
-    date.getFullYear() !== year ||
-    date.getMonth() !== month - 1 ||
-    date.getDate() !== day
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
   ) {
     return null;
   }
-  return applyTimeParts(date, timeStr);
+  const time = timeStr != null && String(timeStr).trim() !== ''
+    ? parseTimeParts(timeStr)
+    : { hours: 0, minutes: 0, seconds: 0 };
+  if (!time) return null;
+  return zonedDateTimeToUtc({
+    year,
+    month,
+    day,
+    hour: time.hours,
+    minute: time.minutes,
+    second: time.seconds,
+  }, timezone);
 };
 
-const parseDateString = (dateStr, timeStr) => {
+const parseDateString = (dateStr, timeStr, timezone = DEFAULT_TIMEZONE) => {
   const value = String(dateStr).trim();
 
   let match = value.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
@@ -356,7 +965,8 @@ const parseDateString = (dateStr, timeStr) => {
       parseInt(match[1], 10),
       parseInt(match[2], 10),
       parseInt(match[3], 10),
-      timeStr
+      timeStr,
+      timezone
     );
   }
 
@@ -366,57 +976,116 @@ const parseDateString = (dateStr, timeStr) => {
       parseInt(match[3], 10),
       parseInt(match[2], 10),
       parseInt(match[1], 10),
-      timeStr
+      timeStr,
+      timezone
     );
   }
 
   const parsed = new Date(value);
   if (isNaN(parsed.getTime())) return null;
-  return applyTimeParts(parsed, timeStr);
+  return applyTimeParts(parsed, timeStr, timezone);
 };
 
-const parseDate = (dateStr, timeStr) => {
+const parseDate = (dateStr, timeStr, timezone = DEFAULT_TIMEZONE) => {
   if (!dateStr) return null;
   if (dateStr instanceof Date) {
-    const date = new Date(dateStr);
-    const withTime = applyTimeParts(date, timeStr);
+    const source = new Date(dateStr);
+    const sourceTime = timeStr != null && String(timeStr).trim() !== ''
+      ? timeStr
+      : `${source.getUTCHours()}:${String(source.getUTCMinutes()).padStart(2, '0')}:${String(source.getUTCSeconds()).padStart(2, '0')}`;
+    const withTime = dateFromParts(
+      source.getUTCFullYear(),
+      source.getUTCMonth() + 1,
+      source.getUTCDate(),
+      sourceTime,
+      timezone
+    );
     return !withTime || isNaN(withTime.getTime()) ? null : withTime;
   }
   if (typeof dateStr === 'number') {
-    const date = excelSerialDateToDate(dateStr);
+    const date = excelSerialDateToDate(dateStr, timezone);
     if (date) {
-      const withTime = applyTimeParts(date, timeStr);
+      const withTime = applyTimeParts(date, timeStr, timezone);
       return !withTime || isNaN(withTime.getTime()) ? null : withTime;
     }
   }
-  return parseDateString(dateStr, timeStr);
+  return parseDateString(dateStr, timeStr, timezone);
 };
 
-const buildPackedRow = (raw, mapping, rowNumber) => {
-  const date = parseDate(raw[mapping.date], mapping.time && raw[mapping.time]);
+const transactionDateError = (date, timezone) => {
+  const limits = parserLimits();
+  const earliest = zonedDayStart(`${limits.minYear}-01-01`, timezone);
+  const latest = addZonedDays(new Date(), limits.maxFutureDays, timezone);
+  if (!date || Number.isNaN(date.getTime())) return 'Could not parse date or time';
+  if (date < earliest) return `Transaction date is before ${limits.minYear}`;
+  if (date > latest) return `Transaction date is more than ${limits.maxFutureDays} days in the future`;
+  return null;
+};
+
+const temporalFields = (date, timezone) => {
+  const parts = getZonedDateParts(date, timezone);
+  return {
+    hour: parts.hour,
+    dayOfWeek: new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay(),
+  };
+};
+
+const buildPackedRow = (raw, mapping, rowNumber, timezone) => {
+  const limits = parserLimits();
+  const date = parseDate(raw[mapping.date], mapping.time && raw[mapping.time], timezone);
   if (!date) return { error: 'Could not parse date or time' };
+  const dateError = transactionDateError(date, timezone);
+  if (dateError) return { error: dateError };
   const items = parsePackedItems(raw[mapping.items] || '');
   if (items.length === 0) return { error: 'Missing or invalid items' };
-  const total = cleanNumber(raw[mapping.total]);
+  if (items.length > limits.maxItemsPerTransaction) {
+    return { error: `Transaction exceeds the ${limits.maxItemsPerTransaction} item limit` };
+  }
+  if (items.some((item) => item.name.length > limits.maxItemNameChars)) {
+    return { error: `Item name exceeds the ${limits.maxItemNameChars} character limit` };
+  }
+  if (items.some((item) => !Number.isSafeInteger(item.quantity) ||
+    item.quantity <= 0 || item.quantity > limits.maxItemQuantity)) {
+    return { error: `Item quantity exceeds the ${limits.maxItemQuantity} limit` };
+  }
+  const receiptId = mapping.receiptId ? String(raw[mapping.receiptId] || '').trim() : '';
+  if (receiptId.length > limits.maxIdentifierChars) {
+    return { error: `Receipt ID exceeds the ${limits.maxIdentifierChars} character limit` };
+  }
+  const paymentMethod = mapping.paymentMethod
+    ? String(raw[mapping.paymentMethod] || '').trim()
+    : '';
+  if (paymentMethod.length > limits.maxIdentifierChars) {
+    return { error: `Payment method exceeds the ${limits.maxIdentifierChars} character limit` };
+  }
+  const total = parseBoundedAmount(raw[mapping.total], limits);
+  if (total === null) {
+    return { error: `Invalid transaction total or amount exceeds ${limits.maxAbsoluteAmount}` };
+  }
+  const tip = mapping.tip ? parseBoundedAmount(raw[mapping.tip], limits) : 0;
+  const discount = mapping.discount ? parseBoundedAmount(raw[mapping.discount], limits) : 0;
+  if (tip === null || discount === null) {
+    return { error: `Invalid tip or discount, or amount exceeds ${limits.maxAbsoluteAmount}` };
+  }
   const totalQty = items.reduce((s, i) => s + i.quantity, 0);
   if (totalQty <= 0) return { error: 'Invalid item quantity' };
   const unitPrice = totalQty > 0 ? total / totalQty : 0;
   const row = {
-    receiptId: mapping.receiptId ? String(raw[mapping.receiptId] || '').trim() || undefined : undefined,
+    receiptId: receiptId || undefined,
     date,
-    hour: date.getHours(),
-    dayOfWeek: date.getDay(),
+    ...temporalFields(date, timezone),
     items: items.map((i) => ({ ...i, unitPrice: parseFloat(unitPrice.toFixed(2)) })),
     total,
-    tip: mapping.tip ? cleanNumber(raw[mapping.tip]) : 0,
-    discount: mapping.discount ? cleanNumber(raw[mapping.discount]) : 0,
-    paymentMethod: mapping.paymentMethod ? String(raw[mapping.paymentMethod] || '').trim() : undefined,
+    tip,
+    discount,
+    paymentMethod: paymentMethod || undefined,
     status: mapping.status ? String(raw[mapping.status] || 'approved').trim().toLowerCase() : 'approved',
   };
   return { row: setSourceRowNumbers(row, [rowNumber]) };
 };
 
-const groupLinePerRow = (rawRows, mapping) => {
+const groupLinePerRow = (rawRows, mapping, timezone) => {
+  const limits = parserLimits();
   const groups = new Map();
   const rowErrors = [];
   let errors = 0;
@@ -425,16 +1094,32 @@ const groupLinePerRow = (rawRows, mapping) => {
   for (const [index, raw] of rawRows.entries()) {
     const rowNumber = sourceRowNumber(raw, index);
     try {
-      const date = parseDate(raw[mapping.date], mapping.time && raw[mapping.time]);
+      const date = parseDate(raw[mapping.date], mapping.time && raw[mapping.time], timezone);
       if (!date) {
         errors++;
         addRowError(rowErrors, rowNumber, 'Could not parse date or time', raw);
+        continue;
+      }
+      const dateError = transactionDateError(date, timezone);
+      if (dateError) {
+        errors++;
+        addRowError(rowErrors, rowNumber, dateError, raw);
         continue;
       }
       const receiptId = String(raw[mapping.receiptId] || '').trim();
       if (!receiptId) {
         errors++;
         addRowError(rowErrors, rowNumber, 'Missing receipt ID', raw);
+        continue;
+      }
+      if (receiptId.length > limits.maxIdentifierChars) {
+        errors++;
+        addRowError(
+          rowErrors,
+          rowNumber,
+          `Receipt ID exceeds the ${limits.maxIdentifierChars} character limit`,
+          raw
+        );
         continue;
       }
       const groupKey = receiptId;
@@ -444,28 +1129,82 @@ const groupLinePerRow = (rawRows, mapping) => {
         addRowError(rowErrors, rowNumber, 'Missing item name', raw);
         continue;
       }
-      const quantity = mapping.quantity ? parseQuantity(raw[mapping.quantity]) : 1;
+      if (itemName.length > limits.maxItemNameChars) {
+        errors++;
+        addRowError(
+          rowErrors,
+          rowNumber,
+          `Item name exceeds the ${limits.maxItemNameChars} character limit`,
+          raw
+        );
+        continue;
+      }
+      const quantity = mapping.quantity ? parseQuantity(raw[mapping.quantity], limits) : 1;
       if (!quantity) {
         errors++;
         addRowError(rowErrors, rowNumber, 'Invalid item quantity', raw);
         continue;
       }
-      const total = cleanNumber(raw[mapping.total]);
+      const total = parseBoundedAmount(raw[mapping.total], limits);
+      if (total === null) {
+        errors++;
+        addRowError(
+          rowErrors,
+          rowNumber,
+          `Invalid transaction total or amount exceeds ${limits.maxAbsoluteAmount}`,
+          raw
+        );
+        continue;
+      }
+      const tip = mapping.tip ? parseBoundedAmount(raw[mapping.tip], limits) : 0;
+      const discount = mapping.discount ? parseBoundedAmount(raw[mapping.discount], limits) : 0;
+      if (tip === null || discount === null) {
+        errors++;
+        addRowError(
+          rowErrors,
+          rowNumber,
+          `Invalid tip or discount, or amount exceeds ${limits.maxAbsoluteAmount}`,
+          raw
+        );
+        continue;
+      }
+      const paymentMethod = mapping.paymentMethod
+        ? String(raw[mapping.paymentMethod] || '').trim()
+        : '';
+      if (paymentMethod.length > limits.maxIdentifierChars) {
+        errors++;
+        addRowError(
+          rowErrors,
+          rowNumber,
+          `Payment method exceeds the ${limits.maxIdentifierChars} character limit`,
+          raw
+        );
+        continue;
+      }
       if (!groups.has(groupKey)) {
         groups.set(groupKey, setSourceRowNumbers({
           receiptId,
           date,
-          hour: date.getHours(),
-          dayOfWeek: date.getDay(),
+          ...temporalFields(date, timezone),
           items: [],
           totals: [],
-          tip: mapping.tip ? cleanNumber(raw[mapping.tip]) : 0,
-          discount: mapping.discount ? cleanNumber(raw[mapping.discount]) : 0,
-          paymentMethod: mapping.paymentMethod ? String(raw[mapping.paymentMethod] || '').trim() : undefined,
+          tip,
+          discount,
+          paymentMethod: paymentMethod || undefined,
           status: mapping.status ? String(raw[mapping.status] || 'approved').trim().toLowerCase() : 'approved',
         }, []));
       }
       const group = groups.get(groupKey);
+      if (group.items.length >= limits.maxItemsPerTransaction) {
+        errors++;
+        addRowError(
+          rowErrors,
+          rowNumber,
+          `Transaction exceeds the ${limits.maxItemsPerTransaction} item limit`,
+          raw
+        );
+        continue;
+      }
       group[SOURCE_ROW_NUMBERS].push(rowNumber);
       group.items.push({ name: itemName, quantity, lineTotal: total });
       group.totals.push(total);
@@ -474,15 +1213,26 @@ const groupLinePerRow = (rawRows, mapping) => {
       addRowError(rowErrors, rowNumber, 'Could not parse row', raw);
     }
   }
-  const rows = [...groups.values()].map((row) => {
+  const rows = [];
+  for (const row of groups.values()) {
     const totalQty = row.items.reduce((sum, item) => sum + item.quantity, 0);
     const uniqueTotals = [...new Set(row.totals.map((total) => Number(total.toFixed(2))))];
     const total = !totalsAreLineAmounts && uniqueTotals.length === 1
       ? uniqueTotals[0]
       : row.totals.reduce((sum, value) => sum + value, 0);
+    if (!Number.isFinite(total) || Math.abs(total) > limits.maxAbsoluteAmount) {
+      errors++;
+      addRowError(
+        rowErrors,
+        row[SOURCE_ROW_NUMBERS]?.[0] || 1,
+        `Transaction total exceeds the ${limits.maxAbsoluteAmount} amount limit`,
+        { receiptId: row.receiptId }
+      );
+      continue;
+    }
     const averageUnitPrice = totalQty > 0 ? parseFloat((total / totalQty).toFixed(2)) : 0;
     const { totals, ...cleanRow } = row;
-    return setSourceRowNumbers({
+    rows.push(setSourceRowNumbers({
       ...cleanRow,
       total,
       items: row.items.map(({ lineTotal, ...item }) => ({
@@ -491,8 +1241,8 @@ const groupLinePerRow = (rawRows, mapping) => {
           ? parseFloat((lineTotal / item.quantity).toFixed(2))
           : averageUnitPrice,
       })),
-    }, row[SOURCE_ROW_NUMBERS] || []);
-  });
+    }, row[SOURCE_ROW_NUMBERS] || []));
+  }
   return { rows, errors, rowErrors };
 };
 
@@ -506,19 +1256,25 @@ const groupLinePerRow = (rawRows, mapping) => {
  * @param {string} [opts.fileExt='csv']
  * @returns {Promise<{rows: object[], errors: number, rowErrors: object[], totalRows: number, dateRange: {firstDate: Date, lastDate: Date}}>}
  */
-const parseBuffer = async (buffer, { columnMapping, itemsMode = 'packed', fileExt = 'csv' }) => {
+const parseBuffer = async (
+  buffer,
+  { columnMapping, itemsMode = 'packed', fileExt = 'csv', timezone = DEFAULT_TIMEZONE }
+) => {
   if (!VALID_ITEMS_MODES.has(itemsMode)) {
     throw new Error(`Invalid itemsMode: ${itemsMode}`);
   }
+  const resolvedTimezone = safeTimezone(timezone);
+  const normalizedExt = String(fileExt || 'csv').toLowerCase();
+  assertSupportedFileBuffer(buffer, normalizedExt);
   validateMapping(columnMapping, itemsMode);
-  const rawRows = repairOverflowColumns(await readRows(buffer, fileExt), columnMapping);
+  const rawRows = repairOverflowColumns(await readRows(buffer, normalizedExt), columnMapping);
 
   let rows;
   let errors = 0;
   let rowErrors = [];
 
   if (itemsMode === 'line-per-row') {
-    const grouped = groupLinePerRow(rawRows, columnMapping);
+    const grouped = groupLinePerRow(rawRows, columnMapping, resolvedTimezone);
     rows = grouped.rows;
     errors = grouped.errors;
     rowErrors = grouped.rowErrors;
@@ -527,7 +1283,7 @@ const parseBuffer = async (buffer, { columnMapping, itemsMode = 'packed', fileEx
     for (const [index, raw] of rawRows.entries()) {
       const rowNumber = sourceRowNumber(raw, index);
       try {
-        const parsed = buildPackedRow(raw, columnMapping, rowNumber);
+        const parsed = buildPackedRow(raw, columnMapping, rowNumber, resolvedTimezone);
         if (parsed.row) {
           rows.push(parsed.row);
         } else {
@@ -547,6 +1303,15 @@ const parseBuffer = async (buffer, { columnMapping, itemsMode = 'packed', fileEx
     if (!firstDate || r.date < firstDate) firstDate = r.date;
     if (!lastDate || r.date > lastDate) lastDate = r.date;
   }
+  if (firstDate && lastDate) {
+    const rangeDays = zonedDayOrdinal(lastDate, resolvedTimezone) -
+      zonedDayOrdinal(firstDate, resolvedTimezone) + 1;
+    if (rangeDays > parserLimits().maxDateRangeDays) {
+      throw createClientInputError(
+        `Upload date range exceeds the ${parserLimits().maxDateRangeDays} day limit`
+      );
+    }
+  }
 
   return {
     rows,
@@ -554,6 +1319,7 @@ const parseBuffer = async (buffer, { columnMapping, itemsMode = 'packed', fileEx
     rowErrors,
     totalRows: rawRows.length,
     dateRange: { firstDate, lastDate },
+    timezone: resolvedTimezone,
   };
 };
 
@@ -565,6 +1331,18 @@ module.exports = {
   normaliseRow,
   normaliseRows,
   detectCsvSeparator,
+  assertSupportedFileBuffer,
   readWorkbookRows,
   requiredFieldsForMode,
+  parserLimits,
+  safeTimezone,
+  getZonedDateParts,
+  zonedDateTimeToUtc,
+  zonedDayStart,
+  zonedDayEnd,
+  addZonedDays,
+  zonedDayOrdinal,
+  zonedDateKey,
+  zonedDayOfWeek,
+  processLocalCalendarDate,
 };

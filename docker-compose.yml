@@ -3,12 +3,25 @@ services:
     image: mongo:7
     container_name: your-guava-mongo
     restart: unless-stopped
+    command: ['mongod', '--replSet', 'rs0', '--bind_ip_all']
     ports:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
     environment:
       MONGO_INITDB_DATABASE: your-guava
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - >-
+          let ok=0; try { ok=rs.status().ok } catch (e) { ok=rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]}).ok } quit(ok ? 0 : 1)
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
 
 volumes:
   mongo_data:

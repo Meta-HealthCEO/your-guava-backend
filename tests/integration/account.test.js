@@ -83,8 +83,38 @@ describe('Account API', () => {
     expect(res.body.account.organization.billingEmail).toBe('billing@yourguava.com');
   });
 
+  it('rejects invalid profile fields without partially updating the account', async () => {
+    const invalid = await request
+      .patch('/api/account/profile')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({
+        name: 'Should Not Persist',
+        organizationName: 'Also Should Not Persist',
+        billingEmail: 'not-an-email',
+      });
+
+    expect(invalid.status).toBe(400);
+
+    const account = await request
+      .get('/api/account')
+      .set('Authorization', `Bearer ${ownerToken}`);
+    expect(account.body.account.user.name).not.toBe('Should Not Persist');
+    expect(account.body.account.organization.name).not.toBe('Also Should Not Persist');
+  });
+
   it('mock checkout changes plan and resets included Guava Credits', async () => {
     const Forecast = require('../../src/models/Forecast.model');
+    const Organization = require('../../src/models/Organization.model');
+    await Organization.updateOne(
+      { _id: ownerUser.orgId },
+      {
+        $set: {
+          'aiCredits.bonus': 500,
+          'aiCredits.bonusUsed': 200,
+          'aiCredits.used': 600,
+        },
+      }
+    );
     await request.get('/api/forecasts/week').set('Authorization', `Bearer ${ownerToken}`);
     expect(await Forecast.countDocuments({})).toBe(7);
 
@@ -98,6 +128,9 @@ describe('Account API', () => {
     expect(res.body.account.organization.plan).toBe('growth');
     expect(res.body.account.organization.billingCycle).toBe('annual');
     expect(res.body.account.usage.guavaCredits.included).toBe(1800);
+    expect(res.body.account.usage.guavaCredits.bonus).toBe(500);
+    expect(res.body.account.usage.guavaCredits.bonusUsed).toBe(200);
+    expect(res.body.account.usage.guavaCredits.used).toBe(200);
     expect(await Forecast.countDocuments({})).toBe(0);
   });
 
@@ -139,6 +172,7 @@ describe('Account API', () => {
     const res = await request
       .post('/api/account/checkout')
       .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Idempotency-Key', 'account-hosted-plan-checkout')
       .send({ plan: 'growth', billingCycle: 'monthly' });
 
     expect(res.status).toBe(200);
@@ -157,6 +191,178 @@ describe('Account API', () => {
         amount: 899,
       })
     );
+  });
+
+  it('requires a bounded Idempotency-Key before creating a OneGate session', async () => {
+    const oneGate = require('../../src/services/onegate.service');
+    const PaymentSession = require('../../src/models/PaymentSession.model');
+    process.env.PAYMENT_PROVIDER = 'onegate';
+    process.env.ONEGATE_API_URL = 'https://payments.onegate.co.za';
+    process.env.ONEGATE_ORGANISATION_ID = '21234';
+    process.env.ONEGATE_API_SALT = 'test-salt';
+    process.env.API_PUBLIC_URL = 'http://api.test';
+    const createPaymentKey = jest.spyOn(oneGate, 'createPaymentKey');
+
+    const missing = await request
+      .post('/api/account/checkout')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({ plan: 'growth', billingCycle: 'monthly' });
+    const oversized = await request
+      .post('/api/account/checkout')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Idempotency-Key', 'x'.repeat(161))
+      .send({ plan: 'growth', billingCycle: 'monthly' });
+
+    expect(missing.status).toBe(400);
+    expect(missing.body.details.code).toBe('PAYMENT_IDEMPOTENCY_KEY_REQUIRED');
+    expect(oversized.status).toBe(400);
+    expect(oversized.body.details.code).toBe('PAYMENT_IDEMPOTENCY_KEY_INVALID');
+    expect(createPaymentKey).not.toHaveBeenCalled();
+    expect(await PaymentSession.countDocuments({})).toBe(0);
+  });
+
+  it('replays concurrent checkout initiation without creating a second provider session', async () => {
+    const oneGate = require('../../src/services/onegate.service');
+    const PaymentSession = require('../../src/models/PaymentSession.model');
+    process.env.PAYMENT_PROVIDER = 'onegate';
+    process.env.ONEGATE_API_URL = 'https://payments.onegate.co.za';
+    process.env.ONEGATE_ORGANISATION_ID = '21234';
+    process.env.ONEGATE_API_SALT = 'test-salt';
+    process.env.API_PUBLIC_URL = 'http://api.test';
+    await PaymentSession.init();
+
+    let releaseProvider;
+    let providerStarted;
+    const started = new Promise((resolve) => { providerStarted = resolve; });
+    const createPaymentKey = jest.spyOn(oneGate, 'createPaymentKey').mockImplementation(() => {
+      providerStarted();
+      return new Promise((resolve) => { releaseProvider = resolve; });
+    });
+    const sendCheckout = (cycle = 'monthly') => request
+      .post('/api/account/checkout')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Idempotency-Key', 'concurrent-plan-checkout')
+      .send({ plan: 'growth', billingCycle: cycle });
+
+    const firstPromise = sendCheckout().then((response) => response);
+    await started;
+    const concurrentReplay = await sendCheckout();
+    expect(concurrentReplay.status).toBe(202);
+    expect(concurrentReplay.body.code).toBe('PAYMENT_SESSION_INITIALIZING');
+    expect(concurrentReplay.body.checkout.redirectUrl).toBeUndefined();
+
+    releaseProvider({
+      key: 'single_provider_key',
+      url: 'https://payments.onegate.co.za/pay/hosted?payment_key=single_provider_key',
+      origin: 'https://payments.onegate.co.za',
+    });
+    const first = await firstPromise;
+    const readyReplay = await sendCheckout();
+    const conflictingReplay = await sendCheckout('annual');
+
+    expect(first.status).toBe(200);
+    expect(readyReplay.status).toBe(200);
+    expect(readyReplay.body.checkout.reference).toBe(first.body.checkout.reference);
+    expect(conflictingReplay.status).toBe(409);
+    expect(conflictingReplay.body.details.code).toBe('PAYMENT_IDEMPOTENCY_CONFLICT');
+    expect(createPaymentKey).toHaveBeenCalledTimes(1);
+    expect(await PaymentSession.countDocuments({})).toBe(1);
+  });
+
+  it('reclaims one stale checkout-initialization lease with the original reference', async () => {
+    const oneGate = require('../../src/services/onegate.service');
+    const Organization = require('../../src/models/Organization.model');
+    const PaymentSession = require('../../src/models/PaymentSession.model');
+    const { paymentRequestFingerprint } = require('../../src/services/billingPayments.service');
+    process.env.PAYMENT_PROVIDER = 'onegate';
+    process.env.ONEGATE_API_URL = 'https://payments.onegate.co.za';
+    process.env.ONEGATE_ORGANISATION_ID = '21234';
+    process.env.ONEGATE_API_SALT = 'test-salt';
+    process.env.API_PUBLIC_URL = 'http://api.test';
+    await PaymentSession.init();
+
+    const org = await Organization.findById(ownerUser.orgId);
+    const requestData = {
+      kind: 'plan',
+      plan: 'growth',
+      billingCycle: 'monthly',
+      amount: 899,
+    };
+    const stale = await PaymentSession.create({
+      orgId: org._id,
+      userId: ownerUser.id,
+      provider: 'onegate',
+      ...requestData,
+      currency: 'ZAR',
+      reference: 'stale-initialization-reference',
+      idempotencyKey: 'stale-plan-checkout',
+      requestFingerprint: paymentRequestFingerprint(requestData),
+      initializationStatus: 'initializing',
+      initializationStartedAt: new Date(Date.now() - 2 * 60_000),
+      initializationAttempts: 1,
+    });
+
+    let releaseProvider;
+    let providerStarted;
+    const started = new Promise((resolve) => { providerStarted = resolve; });
+    const createPaymentKey = jest.spyOn(oneGate, 'createPaymentKey').mockImplementation(() => {
+      providerStarted();
+      return new Promise((resolve) => { releaseProvider = resolve; });
+    });
+    const sendCheckout = () => request
+      .post('/api/account/checkout')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Idempotency-Key', 'stale-plan-checkout')
+      .send({ plan: 'growth', billingCycle: 'monthly' });
+
+    const recoveryPromise = sendCheckout().then((response) => response);
+    await started;
+    const concurrentReplay = await sendCheckout();
+    expect(concurrentReplay.status).toBe(202);
+    expect(concurrentReplay.body.checkout.reference).toBe(stale.reference);
+
+    releaseProvider({
+      key: 'recovered_provider_key',
+      url: 'https://payments.onegate.co.za/pay/hosted?payment_key=recovered_provider_key',
+      origin: 'https://payments.onegate.co.za',
+    });
+    const recovered = await recoveryPromise;
+    const stored = await PaymentSession.findById(stale._id).lean();
+    expect(recovered.status).toBe(200);
+    expect(recovered.body.checkout.reference).toBe(stale.reference);
+    expect(createPaymentKey).toHaveBeenCalledTimes(1);
+    expect(stored.initializationStatus).toBe('ready');
+    expect(stored.initializationAttempts).toBe(2);
+    expect(await PaymentSession.countDocuments({})).toBe(1);
+  });
+
+  it('returns a safe terminal response when an idempotent checkout initialization failed', async () => {
+    const oneGate = require('../../src/services/onegate.service');
+    const PaymentSession = require('../../src/models/PaymentSession.model');
+    process.env.PAYMENT_PROVIDER = 'onegate';
+    process.env.ONEGATE_API_URL = 'https://payments.onegate.co.za';
+    process.env.ONEGATE_ORGANISATION_ID = '21234';
+    process.env.ONEGATE_API_SALT = 'test-salt';
+    process.env.API_PUBLIC_URL = 'http://api.test';
+    await PaymentSession.init();
+    const providerError = new Error('provider unavailable');
+    providerError.statusCode = 502;
+    const createPaymentKey = jest.spyOn(oneGate, 'createPaymentKey').mockRejectedValue(providerError);
+    const sendCheckout = () => request
+      .post('/api/account/checkout')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Idempotency-Key', 'failed-plan-checkout')
+      .send({ plan: 'growth', billingCycle: 'monthly' });
+
+    const first = await sendCheckout();
+    const replay = await sendCheckout();
+
+    expect(first.status).toBe(502);
+    expect(replay.status).toBe(409);
+    expect(replay.body.code).toBe('PAYMENT_SESSION_INITIALIZATION_FAILED');
+    expect(replay.body.checkout.redirectUrl).toBeUndefined();
+    expect(createPaymentKey).toHaveBeenCalledTimes(1);
+    expect(await PaymentSession.countDocuments({})).toBe(1);
   });
 
   it('activates a OneGate plan payment after webhook verification', async () => {
@@ -179,6 +385,7 @@ describe('Account API', () => {
     const checkout = await request
       .post('/api/account/checkout')
       .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Idempotency-Key', 'account-paid-plan-checkout')
       .send({ plan: 'growth', billingCycle: 'monthly' });
 
     const reference = checkout.body.checkout.reference;

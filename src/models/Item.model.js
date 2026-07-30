@@ -10,13 +10,14 @@ const itemSchema = new mongoose.Schema(
     name: {
       type: String,
       required: true,
+      maxlength: 200,
     },
     normalizedName: {
       type: String,
       index: true,
     },
-    aliases: [{ type: String }],
-    aliasKeys: [{ type: String }],
+    aliases: [{ type: String, maxlength: 200 }],
+    aliasKeys: [{ type: String, maxlength: 200 }],
     category: {
       type: String,
       enum: ['coffee', 'food', 'cold_drink', 'water', 'retail', 'other'],
@@ -24,10 +25,14 @@ const itemSchema = new mongoose.Schema(
     },
     expectedPrice: {
       type: Number,
+      min: 0,
+      max: 1000000,
     },
     priceTolerancePct: {
       type: Number,
       default: 10,
+      min: 0,
+      max: 100,
     },
     reviewStatus: {
       type: String,
@@ -50,7 +55,7 @@ const itemSchema = new mongoose.Schema(
     firstSeenAt: { type: Date },
     lastPriceMismatchAt: { type: Date },
     priceMismatchCount: { type: Number, default: 0 },
-    notes: { type: String },
+    notes: { type: String, maxlength: 2000 },
     mergedInto: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Item',

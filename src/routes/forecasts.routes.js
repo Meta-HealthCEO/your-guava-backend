@@ -11,6 +11,7 @@ const {
   getAccuracy,
   getHistory,
   getInsights,
+  refreshGeneratedInsights,
   chatInsights,
   streamChatInsights,
   getRecent,
@@ -31,6 +32,7 @@ router.put('/factors', updateFactors);
 router.post('/generate', generate);
 router.get('/accuracy', getAccuracy);
 router.get('/insights', getInsights);
+router.post('/insights/refresh', refreshGeneratedInsights);
 router.post('/insights/chat', chatInsights);
 router.post('/insights/chat/stream', streamChatInsights);
 

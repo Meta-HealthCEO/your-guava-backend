@@ -52,6 +52,41 @@ describe('Cafe API', () => {
       expect(res.body.success).toBe(true);
       expect(res.body.cafe.location.city).toBe('Cape Town');
     });
+
+    it('validates coordinates and preserves them during address-only edits', async () => {
+      const coordinates = await request
+        .put('/api/cafe/me')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ location: { lat: -33.9249, lng: 18.4241 } });
+      expect(coordinates.status).toBe(200);
+      expect(coordinates.body.cafe.location).toMatchObject({
+        lat: -33.9249,
+        lng: 18.4241,
+      });
+
+      const addressOnly = await request
+        .put('/api/cafe/me')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ location: { address: 'Updated address' } });
+      expect(addressOnly.status).toBe(200);
+      expect(addressOnly.body.cafe.location).toMatchObject({
+        address: 'Updated address',
+        lat: -33.9249,
+        lng: 18.4241,
+      });
+
+      const partial = await request
+        .put('/api/cafe/me')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ location: { lat: -33.9 } });
+      expect(partial.status).toBe(400);
+
+      const outOfRange = await request
+        .put('/api/cafe/me')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ location: { lat: -33.9, lng: 181 } });
+      expect(outOfRange.status).toBe(400);
+    });
   });
 
   describe('Trading hours', () => {

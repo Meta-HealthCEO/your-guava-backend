@@ -21,7 +21,10 @@ const request = supertest(app);
 
 beforeAll(setup);
 afterAll(teardown);
-afterEach(clearDB);
+afterEach(async () => {
+  jest.restoreAllMocks();
+  await clearDB();
+});
 
 describe('Analytics API', () => {
   let token;
@@ -280,7 +283,8 @@ describe('Analytics API', () => {
 
       const res = await request
         .get('/api/analytics/customers')
-        .set('Authorization', `Bearer ${token}`);
+        .set('Authorization', `Bearer ${token}`)
+        .query({ startDate: '2026-01-01', endDate: '2026-01-31' });
 
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
@@ -356,6 +360,152 @@ describe('Analytics API', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.data).toEqual([{ pair: ['Brownie', 'Flat White'], count: 1 }]);
+    });
+
+    it('caps the older-Mongo JavaScript fallback before loading an unbounded dataset', async () => {
+      jest.spyOn(Transaction, 'aggregate').mockRejectedValueOnce(
+        new Error('Unrecognized expression $sortArray')
+      );
+      const lean = jest.fn().mockResolvedValue(
+        Array.from({ length: 5001 }, () => ({ items: [] }))
+      );
+      const limit = jest.fn().mockReturnValue({ lean });
+      const sort = jest.fn().mockReturnValue({ limit });
+      const select = jest.fn().mockReturnValue({ sort });
+      jest.spyOn(Transaction, 'find').mockReturnValue({ select });
+
+      const res = await request
+        .get('/api/analytics/combos')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(503);
+      expect(res.body.details.code).toBe('COMBO_FALLBACK_RANGE_TOO_LARGE');
+      expect(limit).toHaveBeenCalledWith(5001);
+    });
+
+    it('caps pair-generation work in the older-Mongo fallback', async () => {
+      jest.spyOn(Transaction, 'aggregate').mockRejectedValueOnce(
+        new Error('Unrecognized expression $sortArray')
+      );
+      const items = Array.from({ length: 100 }, (_, index) => ({ name: `Item ${index}` }));
+      const lean = jest.fn().mockResolvedValue(
+        Array.from({ length: 21 }, () => ({ items }))
+      );
+      const limit = jest.fn().mockReturnValue({ lean });
+      const sort = jest.fn().mockReturnValue({ limit });
+      const select = jest.fn().mockReturnValue({ sort });
+      jest.spyOn(Transaction, 'find').mockReturnValue({ select });
+
+      const res = await request
+        .get('/api/analytics/combos')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(503);
+      expect(res.body.details.code).toBe('COMBO_FALLBACK_WORK_LIMIT');
+    });
+  });
+
+  describe('bounded date windows', () => {
+    it('defaults items, heatmap, customers, and combos to the latest 30 local days', async () => {
+      await Transaction.insertMany([
+        {
+          cafeId,
+          date: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000),
+          hour: 9,
+          dayOfWeek: 1,
+          status: 'approved',
+          items: [
+            { name: 'Recent Coffee', quantity: 1, unitPrice: 60 },
+            { name: 'Recent Muffin', quantity: 1, unitPrice: 40 },
+          ],
+          total: 100,
+        },
+        {
+          cafeId,
+          date: new Date(Date.now() - 45 * 24 * 60 * 60 * 1000),
+          hour: 9,
+          dayOfWeek: 1,
+          status: 'approved',
+          items: [
+            { name: 'Old Coffee', quantity: 1, unitPrice: 500 },
+            { name: 'Old Cake', quantity: 1, unitPrice: 400 },
+          ],
+          total: 900,
+        },
+      ]);
+
+      const [revenue, items, heatmap, customers, combos] = await Promise.all([
+        request.get('/api/analytics/revenue').set('Authorization', `Bearer ${token}`),
+        request.get('/api/analytics/items').set('Authorization', `Bearer ${token}`),
+        request.get('/api/analytics/heatmap').set('Authorization', `Bearer ${token}`),
+        request.get('/api/analytics/customers').set('Authorization', `Bearer ${token}`),
+        request.get('/api/analytics/combos').set('Authorization', `Bearer ${token}`),
+      ]);
+
+      for (const response of [revenue, items, heatmap, customers, combos]) {
+        expect(response.status).toBe(200);
+        expect(response.body.meta).toEqual(expect.objectContaining({
+          defaultWindowDays: 30,
+          defaultedStartDate: true,
+          defaultedEndDate: true,
+          effectiveStartDate: expect.any(String),
+          effectiveEndDate: expect.any(String),
+        }));
+      }
+      expect(items.body.items.map((item) => item.name)).toEqual(
+        expect.arrayContaining(['Recent Coffee', 'Recent Muffin'])
+      );
+      expect(items.body.items.map((item) => item.name)).not.toContain('Old Coffee');
+      expect(revenue.body.summary.totalRevenue).toBe(100);
+      expect(customers.body.insights.avgTransactionValue).toBe(100);
+      expect(heatmap.body.heatmap.reduce((sum, cell) => sum + cell.totalRevenue, 0)).toBe(100);
+      expect(combos.body.data).toEqual([
+        { pair: ['Recent Coffee', 'Recent Muffin'], count: 1 },
+      ]);
+    });
+
+    it('bounds end-only ranges and rejects overlong start-only ranges', async () => {
+      await Transaction.insertMany([
+        {
+          cafeId,
+          date: new Date('2026-01-15T09:00:00+02:00'),
+          hour: 9,
+          dayOfWeek: 4,
+          status: 'approved',
+          items: [{ name: 'In Window', quantity: 1, unitPrice: 50 }],
+          total: 50,
+        },
+        {
+          cafeId,
+          date: new Date('2025-12-01T09:00:00+02:00'),
+          hour: 9,
+          dayOfWeek: 1,
+          status: 'approved',
+          items: [{ name: 'Before Window', quantity: 1, unitPrice: 500 }],
+          total: 500,
+        },
+      ]);
+
+      const bounded = await request
+        .get('/api/analytics/items')
+        .set('Authorization', `Bearer ${token}`)
+        .query({ endDate: '2026-01-31' });
+      const overlong = await request
+        .get('/api/analytics/customers')
+        .set('Authorization', `Bearer ${token}`)
+        .query({ startDate: '2020-01-01' });
+
+      expect(bounded.status).toBe(200);
+      expect(bounded.body.items.map((item) => item.name)).toContain('In Window');
+      expect(bounded.body.items.map((item) => item.name)).not.toContain('Before Window');
+      expect(bounded.body.meta).toEqual(expect.objectContaining({
+        startDate: null,
+        endDate: '2026-01-31',
+        defaultedStartDate: true,
+        defaultedEndDate: false,
+      }));
+      expect(overlong.status).toBe(400);
+      expect(overlong.body.message).toMatch(/cannot exceed 1830 days/i);
     });
   });
 });

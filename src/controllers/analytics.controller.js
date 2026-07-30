@@ -5,6 +5,10 @@ const { isWeekdayHourOpen } = require('../utils/tradingHours');
 
 const DEFAULT_TIMEZONE = 'Africa/Johannesburg';
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const DEFAULT_ANALYTICS_RANGE_DAYS = 30;
+const MAX_ANALYTICS_RANGE_DAYS = 1830;
+const MAX_COMBO_FALLBACK_TRANSACTIONS = 5000;
+const MAX_COMBO_FALLBACK_PAIR_WORK = 100000;
 const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 const safeTimezone = (timezone) => {
@@ -104,6 +108,20 @@ const parseDateBoundary = (value, timezone, boundary = 'start') => {
   const match = str.match(DATE_ONLY_RE);
 
   if (match) {
+    const nominal = new Date(Date.UTC(
+      Number(match[1]),
+      Number(match[2]) - 1,
+      Number(match[3])
+    ));
+    if (
+      nominal.getUTCFullYear() !== Number(match[1]) ||
+      nominal.getUTCMonth() !== Number(match[2]) - 1 ||
+      nominal.getUTCDate() !== Number(match[3])
+    ) {
+      const error = new Error(`Invalid ${boundary === 'end' ? 'endDate' : 'startDate'}`);
+      error.statusCode = 400;
+      throw error;
+    }
     return zonedTimeToUtc({
       year: Number(match[1]),
       month: Number(match[2]),
@@ -124,12 +142,43 @@ const parseDateBoundary = (value, timezone, boundary = 'start') => {
   return parsed;
 };
 
-const buildDateMatch = (query, timezone) => {
-  const dateMatch = {};
-  if (query.startDate) dateMatch.$gte = parseDateBoundary(query.startDate, timezone, 'start');
-  if (query.endDate) dateMatch.$lte = parseDateBoundary(query.endDate, timezone, 'end');
-  return dateMatch;
+const assertDateRange = (startDate, endDate, timezone) => {
+  if (startDate && endDate && startDate > endDate) {
+    const error = new Error('startDate must be on or before endDate');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (
+    startDate &&
+    endDate &&
+    inclusiveLocalDayCount(startDate, endDate, timezone) > MAX_ANALYTICS_RANGE_DAYS
+  ) {
+    const error = new Error(`Analytics ranges cannot exceed ${MAX_ANALYTICS_RANGE_DAYS} days`);
+    error.statusCode = 400;
+    throw error;
+  }
 };
+
+const buildDateMatch = (query, timezone) => {
+  const endDate = query.endDate
+    ? parseDateBoundary(query.endDate, timezone, 'end')
+    : new Date();
+  const startDate = query.startDate
+    ? parseDateBoundary(query.startDate, timezone, 'start')
+    : localDayBoundaryUtc(endDate, timezone, 'start', -(DEFAULT_ANALYTICS_RANGE_DAYS - 1));
+  assertDateRange(startDate, endDate, timezone);
+  return { $gte: startDate, $lte: endDate };
+};
+
+const analyticsRangeMeta = (query, dateMatch) => ({
+  startDate: query.startDate || null,
+  endDate: query.endDate || null,
+  effectiveStartDate: dateMatch.$gte.toISOString(),
+  effectiveEndDate: dateMatch.$lte.toISOString(),
+  defaultWindowDays: DEFAULT_ANALYTICS_RANGE_DAYS,
+  defaultedStartDate: !query.startDate,
+  defaultedEndDate: !query.endDate,
+});
 
 const dateToString = (format, timezone) => ({
   $dateToString: {
@@ -150,10 +199,9 @@ const getRevenue = async (req, res, next) => {
     const timezone = await getCafeTimezone(cafeId);
 
     const { period = 'daily' } = req.query;
-    const endDate = req.query.endDate ? parseDateBoundary(req.query.endDate, timezone, 'end') : new Date();
-    const startDate = req.query.startDate
-      ? parseDateBoundary(req.query.startDate, timezone, 'start')
-      : new Date(endDate.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const dateMatch = buildDateMatch(req.query, timezone);
+    const startDate = dateMatch.$gte;
+    const endDate = dateMatch.$lte;
 
     // Build date grouping expression based on period
     let dateGroup;
@@ -207,8 +255,8 @@ const getRevenue = async (req, res, next) => {
     }
 
     // Calculate trend: compare current period total vs previous period of same length
-    const periodLength = endDate.getTime() - startDate.getTime();
-    const prevStartDate = new Date(startDate.getTime() - periodLength);
+    const rangeDays = inclusiveLocalDayCount(startDate, endDate, timezone);
+    const prevStartDate = localDayBoundaryUtc(startDate, timezone, 'start', -rangeDays);
     const prevEndDate = new Date(startDate.getTime() - 1);
 
     const prevPipeline = [
@@ -248,8 +296,7 @@ const getRevenue = async (req, res, next) => {
       data,
       summary,
       meta: {
-        startDate: req.query.startDate || null,
-        endDate: req.query.endDate || null,
+        ...analyticsRangeMeta(req.query, dateMatch),
         summary,
         period,
       },
@@ -269,7 +316,6 @@ const getItems = async (req, res, next) => {
     const cafeObjectId = mongoose.Types.ObjectId.createFromHexString(cafeId);
     const timezone = await getCafeTimezone(cafeId);
 
-    const { startDate, endDate } = req.query;
     const dateMatch = buildDateMatch(req.query, timezone);
     const matchStage = {
       cafeId: cafeObjectId,
@@ -297,8 +343,7 @@ const getItems = async (req, res, next) => {
         risingItems: [],
         decliningItems: [],
         meta: {
-          startDate: startDate || null,
-          endDate: endDate || null,
+          ...analyticsRangeMeta(req.query, dateMatch),
           risingItems: [],
           decliningItems: [],
         },
@@ -418,8 +463,7 @@ const getItems = async (req, res, next) => {
       items: itemsWithTrend,
       data: itemsWithTrend,
       meta: {
-        startDate: startDate || null,
-        endDate: endDate || null,
+        ...analyticsRangeMeta(req.query, dateMatch),
         risingItems,
         decliningItems,
       },
@@ -440,7 +484,6 @@ const getHeatmap = async (req, res, next) => {
     const cafe = await Cafe.findById(cafeId).select('timezone tradingHours').lean();
     const timezone = safeTimezone(cafe?.timezone);
 
-    const { startDate, endDate } = req.query;
     const dateMatch = buildDateMatch(req.query, timezone);
     const baseMatchStage = {
       cafeId: cafeObjectId,
@@ -545,8 +588,7 @@ const getHeatmap = async (req, res, next) => {
       heatmap,
       data: heatmap,
       meta: {
-        startDate: startDate || null,
-        endDate: endDate || null,
+        ...analyticsRangeMeta(req.query, dateMatch),
         metric: 'average_per_observed_weekday',
       },
     });
@@ -565,7 +607,6 @@ const getCustomers = async (req, res, next) => {
     const cafeObjectId = mongoose.Types.ObjectId.createFromHexString(cafeId);
     const timezone = await getCafeTimezone(cafeId);
 
-    const { startDate, endDate } = req.query;
     const dateMatch = buildDateMatch(req.query, timezone);
     const matchStage = {
       cafeId: cafeObjectId,
@@ -641,7 +682,7 @@ const getCustomers = async (req, res, next) => {
         success: true,
         insights: emptyInsights,
         data: emptyInsights,
-        meta: { startDate: startDate || null, endDate: endDate || null },
+        meta: analyticsRangeMeta(req.query, dateMatch),
       });
     }
 
@@ -687,7 +728,7 @@ const getCustomers = async (req, res, next) => {
       success: true,
       insights,
       data: insights,
-      meta: { startDate: startDate || null, endDate: endDate || null },
+      meta: analyticsRangeMeta(req.query, dateMatch),
     });
   } catch (error) {
     next(error);
@@ -702,7 +743,6 @@ const getCombos = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
     const timezone = await getCafeTimezone(cafeId);
-    const { startDate, endDate } = req.query;
     const dateMatch = buildDateMatch(req.query, timezone);
 
     const matchStage = {
@@ -764,7 +804,7 @@ const getCombos = async (req, res, next) => {
     return res.status(200).json({
       success: true,
       data: combos,
-      meta: { startDate: startDate || null, endDate: endDate || null },
+      meta: analyticsRangeMeta(req.query, dateMatch),
     });
   } catch (error) {
     // If $sortArray is not available (older MongoDB), fall back to JS-side pair generation
@@ -772,7 +812,6 @@ const getCombos = async (req, res, next) => {
       try {
         const cafeId = req.user.cafeId;
         const timezone = await getCafeTimezone(cafeId);
-        const { startDate, endDate } = req.query;
         const dateMatch = buildDateMatch(req.query, timezone);
 
         const matchStage = {
@@ -786,11 +825,32 @@ const getCombos = async (req, res, next) => {
           'items.1': { $exists: true },
         })
           .select('items.name')
+          .sort({ date: -1, _id: -1 })
+          .limit(MAX_COMBO_FALLBACK_TRANSACTIONS + 1)
           .lean();
 
+        if (transactions.length > MAX_COMBO_FALLBACK_TRANSACTIONS) {
+          const capacityError = new Error(
+            `Combo analytics fallback is limited to ${MAX_COMBO_FALLBACK_TRANSACTIONS} transactions; narrow the date range`
+          );
+          capacityError.statusCode = 503;
+          capacityError.details = { code: 'COMBO_FALLBACK_RANGE_TOO_LARGE' };
+          throw capacityError;
+        }
+
         const pairCounts = {};
+        let pairWork = 0;
         for (const tx of transactions) {
           const names = [...new Set(tx.items.map((i) => i.name))].sort();
+          pairWork += (names.length * (names.length - 1)) / 2;
+          if (pairWork > MAX_COMBO_FALLBACK_PAIR_WORK) {
+            const capacityError = new Error(
+              `Combo analytics fallback exceeds its ${MAX_COMBO_FALLBACK_PAIR_WORK}-pair work budget; narrow the date range`
+            );
+            capacityError.statusCode = 503;
+            capacityError.details = { code: 'COMBO_FALLBACK_WORK_LIMIT' };
+            throw capacityError;
+          }
           for (let i = 0; i < names.length; i++) {
             for (let j = i + 1; j < names.length; j++) {
               const key = JSON.stringify([names[i], names[j]]);
@@ -807,7 +867,7 @@ const getCombos = async (req, res, next) => {
         return res.status(200).json({
           success: true,
           data: combos,
-          meta: { startDate: startDate || null, endDate: endDate || null },
+          meta: analyticsRangeMeta(req.query, dateMatch),
         });
       } catch (fallbackError) {
         next(fallbackError);
