@@ -8,6 +8,8 @@ const {
   getPaymentStatus,
   handleOneGateReturn,
   handleOneGateWebhook,
+  handlePaystackWebhook,
+  handlePaystackReturn,
   updateProfile,
   buyAiCredits,
 } = require('../controllers/account.controller');
@@ -15,6 +17,8 @@ const {
 const router = express.Router();
 
 router.post('/payments/onegate/notify', handleOneGateWebhook);
+router.post('/payments/paystack/webhook', handlePaystackWebhook);
+router.get('/payments/paystack/return', handlePaystackReturn);
 router.get('/payments/onegate/return', handleOneGateReturn);
 
 router.use(authMiddleware);

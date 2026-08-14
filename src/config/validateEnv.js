@@ -106,20 +106,39 @@ const validateEnv = () => {
     if (enabled('BILLING_MOCK_ENABLED')) {
       errors.push('BILLING_MOCK_ENABLED cannot be true in production');
     }
-    if (process.env.PAYMENT_PROVIDER !== 'onegate') {
-      errors.push('PAYMENT_PROVIDER must be set to "onegate" in production');
+    const paymentProviderName = (process.env.PAYMENT_PROVIDER || '').trim().toLowerCase();
+    if (!['paystack', 'onegate'].includes(paymentProviderName)) {
+      errors.push('PAYMENT_PROVIDER must be set to "paystack" (or "onegate") in production');
     }
-    if (!process.env.ONEGATE_ORGANISATION_ID && !process.env.ONEGATE_ORG_ID) {
-      errors.push('ONEGATE_ORGANISATION_ID or ONEGATE_ORG_ID is required for production billing');
+
+    if (paymentProviderName === 'paystack') {
+      const paystackKey = (process.env.PAYSTACK_SECRET_KEY || '').trim();
+      if (!paystackKey) {
+        errors.push('PAYSTACK_SECRET_KEY is required for production billing');
+      } else if (!paystackKey.startsWith('sk_live_')) {
+        // A test key in production takes real orders and settles none of them.
+        errors.push('PAYSTACK_SECRET_KEY must be a live key (sk_live_...) in production');
+      }
     }
-    if (!process.env.ONEGATE_API_SALT) {
-      errors.push('ONEGATE_API_SALT is required for production billing');
+
+    if (paymentProviderName === 'onegate') {
+      if (!process.env.ONEGATE_ORGANISATION_ID && !process.env.ONEGATE_ORG_ID) {
+        errors.push('ONEGATE_ORGANISATION_ID or ONEGATE_ORG_ID is required for production billing');
+      }
+      if (!process.env.ONEGATE_API_SALT) {
+        errors.push('ONEGATE_API_SALT is required for production billing');
+      }
+      if (!isOfficialOneGateUrl(process.env.ONEGATE_API_URL)) {
+        errors.push('ONEGATE_API_URL must be the HTTPS origin of the official OneGate payment host');
+      }
     }
-    if (!isOfficialOneGateUrl(process.env.ONEGATE_API_URL)) {
-      errors.push('ONEGATE_API_URL must be the HTTPS origin of the official OneGate payment host');
-    }
+
+    // Both providers redirect the customer back through API_PUBLIC_URL, so it
+    // has to be publicly resolvable in production. Locally it can stay on
+    // localhost, because the browser doing the redirect is the same machine --
+    // which is why Paystack needs no tunnel for development.
     if (!process.env.API_PUBLIC_URL) {
-      errors.push('API_PUBLIC_URL is required in production for OneGate return and webhook callbacks');
+      errors.push('API_PUBLIC_URL is required in production for payment return and webhook callbacks');
     } else if (!isHttpsUrl(process.env.API_PUBLIC_URL)) {
       errors.push('API_PUBLIC_URL must be a valid HTTPS URL in production');
     }

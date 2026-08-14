@@ -4,7 +4,8 @@ const Forecast = require('../models/Forecast.model');
 const Organization = require('../models/Organization.model');
 const PaymentSession = require('../models/PaymentSession.model');
 const { addBillingCycle, getPlan, nextCreditResetDate } = require('./billingPlans.service');
-const oneGate = require('./onegate.service');
+const paymentProvider = require('./paymentProvider.service');
+const User = require('../models/User.model');
 const { assertPlanChangeCapacity } = require('./planCapacity.service');
 const { bonusUsedForCredits } = require('./usage.service');
 const { safeTimezone, zonedDayStart } = require('./parser.service');
@@ -73,7 +74,22 @@ const invalidateFutureForecastsForOrg = async (orgId) => {
 };
 
 const cardDetailsFromTransaction = (transaction) => {
+  // Paystack reports the card under `authorization` with discrete fields.
+  // OneGate returns a masked PAN inside its gateway response parameters, so the
+  // brand and last four have to be picked out of loose strings.
+  const authorization = transaction?.authorization;
+  if (authorization?.last4 || authorization?.brand) {
+    const brand = String(authorization.brand || '').trim().toLowerCase();
+    const last4 = String(authorization.last4 || '').trim();
+    return {
+      ...(brand ? { brand } : {}),
+      ...(last4 ? { last4 } : {}),
+      provider: paymentProvider.providerName() || 'paystack',
+    };
+  }
+
   const params = transaction?.gateway_response_parameters || transaction?.gateway_response || {};
+  if (typeof params !== 'object') return null;
   const maskedCard = String(params.card || params.Card || '');
   const last4Match = maskedCard.match(/(\d{4})\D*$/);
   const last4 = last4Match?.[1];
@@ -85,7 +101,7 @@ const cardDetailsFromTransaction = (transaction) => {
   return {
     ...(brand ? { brand } : {}),
     ...(last4 ? { last4 } : {}),
-    provider: 'onegate',
+    provider: paymentProvider.providerName() || 'onegate',
   };
 };
 
@@ -330,10 +346,18 @@ const releaseProcessingSession = (sessionId, processingStartedAt, status = 'pend
 const initializeHostedPaymentSession = async (paymentSession, org) => {
   const leaseStartedAt = new Date(paymentSession.initializationStartedAt);
   try {
-    const paymentKey = await oneGate.createPaymentKey({
+    const provider = paymentProvider.requireProvider();
+    // Paystack opens checkout against a customer email; OneGate does not take
+    // one. Only pay for the lookup when the active provider needs it.
+    const email = provider.requiresCustomerEmail
+      ? (await User.findById(paymentSession.userId).select('email').lean())?.email
+      : undefined;
+
+    const paymentKey = await provider.createPaymentKey({
       reference: paymentSession.reference,
       amount: paymentSession.amount,
       customerReference: org.name,
+      email,
     });
 
     const ready = await PaymentSession.findOneAndUpdate(
@@ -391,8 +415,8 @@ const createHostedPaymentSession = async ({
   amount,
   idempotencyKey,
 }) => {
-  if (!oneGate.isOneGateConfigured()) {
-    const err = new Error('OneGate card payments are not configured');
+  if (!paymentProvider.isHostedCheckoutConfigured()) {
+    const err = new Error('Card payments are not configured');
     err.statusCode = 503;
     throw err;
   }
@@ -412,7 +436,7 @@ const createHostedPaymentSession = async ({
     paymentSession = await PaymentSession.create({
       orgId: org._id,
       userId,
-      provider: 'onegate',
+      provider: paymentProvider.providerName(),
       kind,
       idempotencyKey: key,
       requestFingerprint,
@@ -479,7 +503,9 @@ const reconcileOneGatePayment = async (reference, webhookPayload = null, options
 
   let financialEffectApplied = false;
   try {
-    const transaction = await oneGate.lookupGatewayTransaction(reference);
+    const transaction = await paymentProvider
+      .providerForSession(paymentSession)
+      .lookupGatewayTransaction(reference);
     if (!validateTransactionForSession(paymentSession, transaction)) {
       await releaseProcessingSession(
         paymentSession._id,

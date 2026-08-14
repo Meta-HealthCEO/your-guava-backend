@@ -1,4 +1,5 @@
 require('dotenv').config();
+const paymentProvider = require('./services/paymentProvider.service');
 
 process.env.TZ = process.env.TZ || process.env.DEFAULT_TIMEZONE || 'Africa/Johannesburg';
 
@@ -87,7 +88,7 @@ const schedulePendingUploadCleanup = () => {
 
 const runPaymentReconciliation = () => {
   if (paymentReconciliationPromise) return paymentReconciliationPromise;
-  if (process.env.PAYMENT_PROVIDER !== 'onegate') return Promise.resolve();
+  if (!paymentProvider.isHostedCheckoutEnabled()) return Promise.resolve();
   paymentReconciliationPromise = (async () => {
     try {
       const summary = await reconcilePendingOneGatePayments();
@@ -104,7 +105,7 @@ const runPaymentReconciliation = () => {
 };
 
 const schedulePaymentReconciliation = () => {
-  if (process.env.PAYMENT_PROVIDER !== 'onegate') return;
+  if (!paymentProvider.isHostedCheckoutEnabled()) return;
   void runPaymentReconciliation();
   const intervalMs = boundedInteger(
     process.env.PAYMENT_RECONCILIATION_INTERVAL_MS,
