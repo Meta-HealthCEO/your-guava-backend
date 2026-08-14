@@ -453,6 +453,34 @@ const buildSummaryStats = (transactions, timezone = 'Africa/Johannesburg') => {
 
 const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
+const MS_PER_DAY = 86_400_000;
+
+/**
+ * Weekday for a YYYY-MM-DD key.
+ *
+ * Anchored at midday UTC on purpose. Forecast dates are stored at cafe-local
+ * midnight, so reading a weekday off the raw instant reports the previous day
+ * for any timezone ahead of UTC. Working from the key at midday cannot drift.
+ */
+const weekdayForKey = (dateKey) => {
+  if (!dateKey) return null;
+  const parsed = new Date(`${dateKey}T12:00:00Z`);
+  return Number.isNaN(parsed.getTime()) ? null : dayNames[parsed.getUTCDay()];
+};
+
+/** Labels a date key against today: "today", "tomorrow", or "in 3 days". */
+const relativeDayLabel = (dateKey, todayKey) => {
+  if (!dateKey || !todayKey) return null;
+  const from = new Date(`${todayKey}T12:00:00Z`).getTime();
+  const to = new Date(`${dateKey}T12:00:00Z`).getTime();
+  if (Number.isNaN(from) || Number.isNaN(to)) return null;
+  const days = Math.round((to - from) / MS_PER_DAY);
+  if (days === 0) return 'today';
+  if (days === 1) return 'tomorrow';
+  if (days === -1) return 'yesterday';
+  return days > 0 ? `in ${days} days` : `${Math.abs(days)} days ago`;
+};
+
 const roundMoney = (value) => parseFloat((value || 0).toFixed(2));
 
 const zonedDateTimeLabel = (value, timezone) => {
@@ -497,6 +525,7 @@ const buildBusinessContext = async ({ cafeId, orgId, authorizedCafeIds }) => {
 
   const now = new Date();
   const today = zonedDayStart(now, activeTimezone);
+  const todayKey = zonedDateKey(today, activeTimezone);
   const ninetyDaysAgo = addZonedDays(today, -90, activeTimezone);
   const forecastRangeEnd = addZonedDays(today, 7, activeTimezone);
   const eventRangeEnd = addZonedDays(today, 30, activeTimezone);
@@ -753,8 +782,21 @@ const buildBusinessContext = async ({ cafeId, orgId, authorizedCafeIds }) => {
       observedPriceMin: item.observedPriceMin,
       observedPriceMax: item.observedPriceMax,
     })),
+    // Relative-date questions -- "what should I prepare tomorrow", "how does this
+    // weekend look" -- are the most common thing anyone asks. Without an explicit
+    // anchor the model has to infer which forecast is which from bare date keys,
+    // and defaults to the first entry, answering for today under a "tomorrow"
+    // heading. State the current cafe-local day, and label each forecast relative
+    // to it so the mapping is never a guess.
+    currentDate: {
+      date: todayKey,
+      dayOfWeek: weekdayForKey(todayKey),
+      timezone: activeTimezone,
+    },
     upcomingForecasts: forecasts.map((forecast) => ({
       date: zonedDateKey(forecast.date, activeTimezone),
+      dayOfWeek: weekdayForKey(zonedDateKey(forecast.date, activeTimezone)),
+      relativeDay: relativeDayLabel(zonedDateKey(forecast.date, activeTimezone), todayKey),
       totalPredictedRevenue: forecast.totalPredictedRevenue,
       topItems: (forecast.items || [])
         .slice()
