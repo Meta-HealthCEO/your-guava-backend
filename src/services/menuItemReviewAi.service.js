@@ -87,7 +87,7 @@ const fallbackSuggestion = (item, candidates = []) => {
       action: 'confirm',
       expectedPrice: price,
       confidence: 0.68,
-      reason: 'The POS price differs from the saved menu price. Approve this to update the menu price to the POS value.',
+      reason: 'The POS price differs from the saved menu price. Approve this to adopt the most recent POS price (the card also shows the POS average and range, which will differ).',
       source: 'rules',
     }, item, candidates);
   }

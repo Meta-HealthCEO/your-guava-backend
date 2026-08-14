@@ -85,6 +85,8 @@ const forecastSchema = new mongoose.Schema(
       type: Date,
     },
     availability: {
+      // True when the day is configured closed but the weekday has sales history.
+      contradictsHistory: { type: Boolean, default: false },
       status: {
         type: String,
         enum: ['ready', 'insufficient_data', 'closed'],
@@ -97,6 +99,9 @@ const forecastSchema = new mongoose.Schema(
         itemName: { type: String },
         baseQty: { type: Number },
         predictedQty: { type: Number },
+        // How much weight this single item's number can bear. Driven by volume:
+        // low-volume lines are dominated by day-to-day randomness.
+        confidence: { type: String, enum: ['high', 'medium', 'low'], default: 'low' },
         actualQty: { type: Number },
         suggestedStock: { type: Number },
         factors: [factorSchema],

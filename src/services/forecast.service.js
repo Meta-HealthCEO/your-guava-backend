@@ -26,40 +26,94 @@ const {
 const { getCafeTradingHours, parseTime } = require('../utils/tradingHours');
 
 const CALIBRATION_LOOKBACK_DAYS = 60;
-const MIN_OVERALL_CALIBRATION_SAMPLES = 3;
-const MIN_FACTOR_CALIBRATION_SAMPLES = 3;
-const MIN_ITEM_CALIBRATION_SAMPLES = 3;
+// Sample floors for the learning correction. These were 3, which let a factor
+// swing demand double digits off three observations (payday was applying -11.6%
+// from n=3). A correction is only worth applying once the evidence behind it
+// outweighs ordinary day-to-day variation.
+const MIN_OVERALL_CALIBRATION_SAMPLES = 10;
+const MIN_FACTOR_CALIBRATION_SAMPLES = 12;
+const MIN_ITEM_CALIBRATION_SAMPLES = 20;
+// Volume-proportional shrinkage for per-item learning corrections.
+// shrink = MAX * units / (units + PRIOR): an item with PRIOR units of predicted
+// history gets half of MAX, a very low-volume line gets almost none.
+const ITEM_CALIBRATION_MAX_SHRINK = 0.5;
+const ITEM_CALIBRATION_VOLUME_PRIOR = 300;
+// How trustworthy a single item's number is, which is almost entirely a
+// function of how many units it moves. Backtested error by tier on real cafe
+// data: >=5/day ~25-35%, 2-5/day ~61%, <2/day ~113%. A line selling one unit
+// some days and none on others cannot be forecast -- the honest thing is to
+// label it rather than print a confident-looking figure next to it.
+const CONFIDENCE_HIGH_MIN_QTY = 5;
+const CONFIDENCE_MEDIUM_MIN_QTY = 2;
+
+const forecastConfidence = (expectedQty) => {
+  if (!Number.isFinite(expectedQty)) return 'low';
+  if (expectedQty >= CONFIDENCE_HIGH_MIN_QTY) return 'high';
+  if (expectedQty >= CONFIDENCE_MEDIUM_MIN_QTY) return 'medium';
+  return 'low';
+};
+
 const MIN_HISTORY_WEEKS = 3;
 const FORECAST_MODEL_VERSION = '2026-07-30.1';
 const MAX_STORED_FORECAST_ITEMS = 25;
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
-const accumulateRatio = (bucket, ratio, weight) => {
-  bucket.weightedRatio += ratio * weight;
-  bucket.totalWeight += weight;
+const newBucket = () => ({ sumActual: 0, sumPredicted: 0, sampleSize: 0 });
+
+// Accumulate raw quantities, not per-observation ratios. Averaging ratios
+// (even weighted) inflates the result on low-volume items, because for small
+// integer counts the ratio distribution is right-skewed: predicting 1 and
+// selling 2 gives 2.0, while predicting 2 and selling 1 gives only 0.5.
+// A ratio of sums is the unbiased estimator of systematic bias.
+const accumulateTotals = (bucket, actual, predicted) => {
+  bucket.sumActual += actual;
+  bucket.sumPredicted += predicted;
   bucket.sampleSize += 1;
 };
+
+const bucketRatio = (bucket) =>
+  (bucket.sumPredicted > 0 ? clamp(bucket.sumActual / bucket.sumPredicted, 0.25, 2) : 1);
 
 const calibratedMultiplier = (averageRatio, shrink, min, max) =>
   clamp(1 + (averageRatio - 1) * shrink, min, max);
 
 const buildLearningFactor = (multiplier, sampleSize, options = {}) => {
   const enabled = options.enabled !== false;
-  const adjustmentPct = (multiplier - 1) * 100;
-  const active = enabled && Math.abs(adjustmentPct) >= 1 && sampleSize >= MIN_OVERALL_CALIBRATION_SAMPLES;
+  const measuredPct = (multiplier - 1) * 100;
+  const hasEvidence = enabled && sampleSize >= MIN_OVERALL_CALIBRATION_SAMPLES;
+  // Applied only when the correction is switched on AND large enough to matter.
+  const applied = hasEvidence && Math.abs(measuredPct) >= 1;
+
+  const formattedBias = `${measuredPct > 0 ? '+' : ''}${Number(measuredPct.toFixed(1))}%`;
+  let effect;
+  if (applied) effect = formattedBias;
+  else if (hasEvidence && Math.abs(measuredPct) >= 1) effect = `${formattedBias} measured, not applied`;
+  else effect = 'no effect';
+
+  let reason;
+  if (!enabled) {
+    reason = options.reason || 'Upgrade to Pro to apply learning corrections';
+  } else if (!hasEvidence) {
+    reason = sampleSize > 0
+      ? `${sampleSize} matched days so far; ${MIN_OVERALL_CALIBRATION_SAMPLES} needed`
+      : 'not enough history yet';
+  } else if (!applied) {
+    reason = `Tracking a ${formattedBias} bias over ${sampleSize} days — too small to act on.`;
+  } else {
+    reason = `${sampleSize} matched historical item outcomes`;
+  }
+
   return {
     key: 'learning',
     label: 'Learning correction',
-    active,
-    adjustmentPct: active ? Number(adjustmentPct.toFixed(2)) : 0,
-    multiplier: active ? Number(multiplier.toFixed(4)) : 1,
-    effect: active
-      ? `${adjustmentPct > 0 ? '+' : ''}${Number(adjustmentPct.toFixed(1))}%`
-      : 'no effect',
-    reason: enabled
-      ? (sampleSize > 0 ? `${sampleSize} matched historical item outcomes` : 'not enough history yet')
-      : (options.reason || 'Upgrade to Pro to apply learning corrections'),
+    active: applied,
+    measuredPct: hasEvidence ? Number(measuredPct.toFixed(2)) : 0,
+    sampleSize,
+    adjustmentPct: applied ? Number(measuredPct.toFixed(2)) : 0,
+    multiplier: applied ? Number(multiplier.toFixed(4)) : 1,
+    effect,
+    reason,
   };
 };
 
@@ -76,7 +130,7 @@ const computeForecastCalibration = async (cafeId, targetDate, timezone) => {
     .select('date items')
     .lean();
 
-  const overall = { weightedRatio: 0, totalWeight: 0, sampleSize: 0 };
+  const overall = newBucket();
   const factorBuckets = new Map();
   const itemBuckets = new Map();
   const dailyObservations = [];
@@ -91,69 +145,68 @@ const computeForecastCalibration = async (cafeId, targetDate, timezone) => {
     for (const item of forecast.items || []) {
       if (item.actualQty == null || !Number.isFinite(item.predictedQty) || item.predictedQty <= 0) continue;
 
-      const ratio = clamp(item.actualQty / item.predictedQty, 0.25, 2);
-      const weight = Math.max(item.actualQty || 0, item.predictedQty || 0, 1);
       const activeFactors = (item.factors || []).filter((factor) => factor.active && factor.key !== 'learning');
 
       dailyPredicted += item.predictedQty;
       dailyActual += item.actualQty;
       hasActual = true;
-      itemObservations.push({ ratio, weight, itemName: item.itemName });
+      itemObservations.push({
+        actual: item.actualQty,
+        predicted: item.predictedQty,
+        itemName: item.itemName,
+      });
       for (const activeFactor of activeFactors) {
         if (!dailyFactors.has(activeFactor.key)) dailyFactors.set(activeFactor.key, activeFactor);
       }
     }
 
     if (hasActual && dailyPredicted > 0) {
-      const ratio = clamp(dailyActual / dailyPredicted, 0.25, 2);
-      const weight = Math.max(dailyActual, dailyPredicted, 1);
-      accumulateRatio(overall, ratio, weight);
+      accumulateTotals(overall, dailyActual, dailyPredicted);
       dailyObservations.push({
-        ratio,
-        weight,
+        actual: dailyActual,
+        predicted: dailyPredicted,
         activeFactors: [...dailyFactors.values()],
       });
     }
   }
 
-  const rawOverallRatio = overall.totalWeight > 0 ? overall.weightedRatio / overall.totalWeight : 1;
+  const rawOverallRatio = bucketRatio(overall);
   const overallMultiplier = overall.sampleSize >= MIN_OVERALL_CALIBRATION_SAMPLES
     ? calibratedMultiplier(rawOverallRatio, 0.5, 0.85, 1.15)
     : 1;
 
-  for (const observation of itemObservations) {
-    const residualRatio = rawOverallRatio > 0 ? observation.ratio / rawOverallRatio : observation.ratio;
-    if (observation.itemName) {
-      if (!itemBuckets.has(observation.itemName)) {
-        itemBuckets.set(observation.itemName, { weightedRatio: 0, totalWeight: 0, sampleSize: 0 });
-      }
-      accumulateRatio(itemBuckets.get(observation.itemName), residualRatio, observation.weight);
-    }
+  // Residual = how much this slice deviates AFTER the overall bias is removed,
+  // so the overall correction is not counted twice when the two are multiplied.
+  const residualise = (ratio) =>
+    (rawOverallRatio > 0 ? clamp(ratio / rawOverallRatio, 0.25, 2) : ratio);
 
+  for (const observation of itemObservations) {
+    if (!observation.itemName) continue;
+    if (!itemBuckets.has(observation.itemName)) {
+      itemBuckets.set(observation.itemName, newBucket());
+    }
+    accumulateTotals(itemBuckets.get(observation.itemName), observation.actual, observation.predicted);
   }
 
   // A factor receives at most one observation per trading day. Counting every
   // item as a separate sample would create false confidence from one outcome.
   for (const observation of dailyObservations) {
-    const residualRatio = rawOverallRatio > 0 ? observation.ratio / rawOverallRatio : observation.ratio;
     for (const activeFactor of observation.activeFactors) {
       if (!factorBuckets.has(activeFactor.key)) {
         factorBuckets.set(activeFactor.key, {
           key: activeFactor.key,
           label: activeFactor.label,
-          weightedRatio: 0,
-          totalWeight: 0,
-          sampleSize: 0,
+          ...newBucket(),
         });
       }
-      accumulateRatio(factorBuckets.get(activeFactor.key), residualRatio, observation.weight);
+      accumulateTotals(factorBuckets.get(activeFactor.key), observation.actual, observation.predicted);
     }
   }
 
   const factorMultipliers = [...factorBuckets.values()]
-    .filter((bucket) => bucket.sampleSize >= MIN_FACTOR_CALIBRATION_SAMPLES && bucket.totalWeight > 0)
+    .filter((bucket) => bucket.sampleSize >= MIN_FACTOR_CALIBRATION_SAMPLES && bucket.sumPredicted > 0)
     .map((bucket) => {
-      const averageRatio = bucket.weightedRatio / bucket.totalWeight;
+      const averageRatio = residualise(bucketRatio(bucket));
       return {
         key: bucket.key,
         label: bucket.label,
@@ -164,13 +217,20 @@ const computeForecastCalibration = async (cafeId, targetDate, timezone) => {
     });
 
   const itemMultipliers = [...itemBuckets.entries()]
-    .filter(([, bucket]) => bucket.sampleSize >= MIN_ITEM_CALIBRATION_SAMPLES && bucket.totalWeight > 0)
+    .filter(([, bucket]) => bucket.sampleSize >= MIN_ITEM_CALIBRATION_SAMPLES && bucket.sumPredicted > 0)
     .map(([itemName, bucket]) => {
-      const averageRatio = bucket.weightedRatio / bucket.totalWeight;
+      const averageRatio = residualise(bucketRatio(bucket));
+      // Trust an item's own correction in proportion to the volume behind it.
+      // A line selling ~1/day produces a ratio that is mostly noise, so pulling
+      // it hard toward 1 avoids importing that noise into tomorrow's forecast.
+      const shrink = ITEM_CALIBRATION_MAX_SHRINK
+        * (bucket.sumPredicted / (bucket.sumPredicted + ITEM_CALIBRATION_VOLUME_PRIOR));
       return {
         itemName,
-        multiplier: Number(calibratedMultiplier(averageRatio, 0.5, 0.8, 1.2).toFixed(4)),
+        multiplier: Number(calibratedMultiplier(averageRatio, shrink, 0.8, 1.2).toFixed(4)),
         sampleSize: bucket.sampleSize,
+        observedUnits: bucket.sumActual,
+        shrink: Number(shrink.toFixed(3)),
         averageRatio: Number(averageRatio.toFixed(4)),
       };
     });
@@ -631,6 +691,7 @@ const generateForecast = async (cafeId, targetDate, options = {}) => {
         itemName: name,
         baseQty: parseFloat(baseQty.toFixed(2)),
         predictedQty: finalQty,
+        confidence: forecastConfidence(baseQty),
         factors: storedItemFactors,
       });
       predictedQtyByItem.set(name, finalQty);
@@ -662,8 +723,18 @@ const generateForecast = async (cafeId, targetDate, options = {}) => {
     : observedWeeks < MIN_HISTORY_WEEKS
       ? 'insufficient_data'
       : 'ready';
+  // Configuration is never checked against reality anywhere else, and the two
+  // can disagree silently: a weekday marked closed still forecasts zero even
+  // when months of sales exist for it. That mis-set Sunday cost ~9 points of
+  // aggregate accuracy before anyone noticed, because a zero forecast on a
+  // trading day looks like a quiet day rather than a broken setting.
+  // `transactions` is already the matching-weekday window, so this is free.
+  const contradictsHistory =
+    availabilityStatus === 'closed' && observedWeeks > 0 && transactions.length > 0;
   const availabilityReason = availabilityStatus === 'closed'
-    ? trading.reason
+    ? (contradictsHistory
+      ? `${trading.reason}, but ${transactions.length} sales were recorded on this weekday in the last ${settings.history.maxWeeks} weeks. Check the trading hours in Settings — this day is forecasting zero.`
+      : trading.reason)
     : availabilityStatus === 'insufficient_data'
       ? `At least ${MIN_HISTORY_WEEKS} observed matching trading days are required; ${observedWeeks} available`
       : '';
@@ -681,6 +752,7 @@ const generateForecast = async (cafeId, targetDate, options = {}) => {
         availability: {
           status: availabilityStatus,
           reason: availabilityReason,
+          contradictsHistory,
         },
         items: forecastItems,
         signals: {

@@ -1,6 +1,16 @@
 const Cafe = require('../models/Cafe.model');
 const User = require('../models/User.model');
+const Forecast = require('../models/Forecast.model');
 const { normalizeTradingHours, defaultTradingHours } = require('../utils/tradingHours');
+const { clearApiCache } = require('../middleware/cache.middleware');
+const { safeTimezone, zonedDayStart } = require('../services/parser.service');
+
+const FORECAST_INPUT_PREFIXES = ['location.lat', 'location.lng', 'location.city', 'tradingHours'];
+
+const affectsForecastInputs = (setUpdates = {}, unsetUpdates = {}) =>
+  [...Object.keys(setUpdates), ...Object.keys(unsetUpdates)].some((key) =>
+    FORECAST_INPUT_PREFIXES.some((prefix) => key === prefix || key.startsWith(`${prefix}.`))
+  );
 
 const LOCATION_TEXT_FIELDS = [
   'address',
@@ -146,6 +156,17 @@ const updateMe = async (req, res, next) => {
 
     if (!cafe) {
       return res.status(404).json({ success: false, message: 'Cafe not found' });
+    }
+
+    // Location and trading hours are forecast inputs: coordinates drive the
+    // weather signal, trading hours decide whether a day is open at all.
+    // Stored forecasts are computed from them, so leaving them in place would
+    // keep serving predictions built from the old settings indefinitely.
+    if (affectsForecastInputs(setUpdates, unsetUpdates)) {
+      const timezone = safeTimezone(cafe.timezone);
+      const today = zonedDayStart(new Date(), timezone);
+      await Forecast.deleteMany({ cafeId: cafe._id, date: { $gte: today } });
+      clearApiCache();
     }
 
     return res.status(200).json({ success: true, cafe: cafeDto(cafe) });
