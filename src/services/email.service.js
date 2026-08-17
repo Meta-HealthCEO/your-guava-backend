@@ -59,9 +59,48 @@ const baseHtml = ({ title, intro, children, ctaLabel, ctaUrl }) => `
   </body>
 </html>`;
 
+/**
+ * Local-development transport.
+ *
+ * Without RESEND_API_KEY there is no way to complete a signup or accept a team
+ * invite, because both depend on a token that only ever leaves the system by
+ * email. That made the two flows every new customer touches first completely
+ * untestable on a developer machine.
+ *
+ * When email is unconfigured outside production, the message is written to the
+ * server log with its action link extracted, and reported as delivered so the
+ * calling flow proceeds exactly as it would in production. The token is still
+ * a real single-use token and still has to be redeemed through the normal
+ * endpoint -- nothing about the verification contract is bypassed.
+ *
+ * Hard-guarded: in production an unconfigured mailer still refuses, as before.
+ * Set EMAIL_DEV_CONSOLE=false to opt out locally.
+ */
+const deliverToConsole = ({ to, subject, text, html }) => {
+  const body = text || String(html || '').replace(/<[^>]+>/g, ' ');
+  const link = (body.match(/https?:\/\/\S+/) || [])[0];
+  console.warn(
+    [
+      '',
+      '  ┌─ email not configured — delivering to console (development only) ─',
+      `  │ to:      ${Array.isArray(to) ? to.join(', ') : to}`,
+      `  │ subject: ${subject}`,
+      link ? `  │ link:    ${link}` : '  │ (no action link found in this message)',
+      '  └───────────────────────────────────────────────────────────────────',
+      '',
+    ].join('\n')
+  );
+  return { sent: true, transport: 'console' };
+};
+
+const canUseConsoleTransport = () =>
+  process.env.NODE_ENV !== 'production' &&
+  String(process.env.EMAIL_DEV_CONSOLE || 'true').toLowerCase() !== 'false';
+
 const sendEmail = async ({ to, subject, html, text, tags }) => {
   const resend = getClient();
   if (!resend) {
+    if (canUseConsoleTransport()) return deliverToConsole({ to, subject, text, html });
     return { skipped: true, reason: 'resend_not_configured' };
   }
 

@@ -263,7 +263,9 @@ describe('Forecasts API', () => {
         total: 300,
       });
 
-      for (let i = 1; i <= 3; i++) {
+      // Learning needs MIN_OVERALL_CALIBRATION_SAMPLES (10) matched days before
+      // it corrects anything; a handful of outcomes is not enough evidence.
+      for (let i = 1; i <= 12; i++) {
         const forecastDate = new Date(target);
         forecastDate.setDate(target.getDate() - i);
         forecastDate.setHours(0, 0, 0, 0);
@@ -296,7 +298,7 @@ describe('Forecasts API', () => {
         .send({ date: target.toISOString() });
 
       expect(res.status).toBe(200);
-      expect(res.body.forecast.calibration.sampleSize).toBe(3);
+      expect(res.body.forecast.calibration.sampleSize).toBe(12);
       expect(res.body.forecast.calibration.overallMultiplier).toBe(1.15);
       expect(res.body.forecast.factors.find((f) => f.key === 'learning')).toEqual(
         expect.objectContaining({ active: true, multiplier: 1.15 })

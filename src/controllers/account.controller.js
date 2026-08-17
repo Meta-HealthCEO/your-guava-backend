@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const mongoose = require('mongoose');
 const User = require('../models/User.model');
 const Cafe = require('../models/Cafe.model');
@@ -26,6 +27,8 @@ const {
   usageSummary,
 } = require('../services/usage.service');
 const oneGate = require('../services/onegate.service');
+const paymentProvider = require('../services/paymentProvider.service');
+const paystack = require('../services/paystack.service');
 const { assertPlanChangeCapacity } = require('../services/planCapacity.service');
 const { clearApiCache } = require('../middleware/cache.middleware');
 
@@ -40,14 +43,14 @@ const billingNotConfigured = (res) =>
   res.status(503).json({
     success: false,
     code: 'BILLING_PROVIDER_NOT_CONFIGURED',
-    message: 'Card payments are not configured. Enable OneGate before accepting paid plan or credit purchases.',
+    message: 'Card payments are not configured. Set PAYMENT_PROVIDER and its credentials before accepting paid plan or credit purchases.',
   });
 
 const hostedPaymentResponse = ({ res, field, session, account, extra = {} }) => {
   const initializationStatus = session.initializationStatus || 'ready';
   const status = initializationStatus === 'initializing' ? 'initializing' : session.status;
   const payment = {
-    provider: 'onegate',
+    provider: paymentProvider.providerName() || 'mock',
     reference: session.reference,
     amount: session.amount,
     currency: session.currency,
@@ -346,7 +349,7 @@ const checkout = async (req, res, next) => {
     }
     await assertPlanChangeCapacity(org._id, org.plan, selectedPlan.id);
 
-    if (oneGate.isOneGateEnabled()) {
+    if (paymentProvider.isHostedCheckoutEnabled()) {
       const cycle = billingCycle === 'annual' ? 'annual' : 'monthly';
       const amount = cycle === 'annual' ? selectedPlan.priceAnnual : selectedPlan.priceMonthly;
       const session = await createHostedPaymentSession({
@@ -414,7 +417,7 @@ const buyAiCredits = async (req, res, next) => {
     const billingAccess = billingAccessForOrganization(org);
     if (!billingAccess.allowed) throw billingRequiredError(billingAccess);
 
-    if (oneGate.isOneGateEnabled()) {
+    if (paymentProvider.isHostedCheckoutEnabled()) {
       const session = await createHostedPaymentSession({
         org,
         userId: req.user.id,
@@ -463,6 +466,78 @@ const buyAiCredits = async (req, res, next) => {
 
 const oneGateReferenceFromRequest = (req) =>
   req.body?.merchant_reference || req.body?.reference || req.query?.reference;
+
+/**
+ * Paystack sends the customer back here after checkout.
+ *
+ * Unlike the OneGate return, this verifies the reference server-side before
+ * redirecting, so settlement never depends on an inbound webhook reaching this
+ * machine. That is what lets card payments be tested without a public URL.
+ * The browser's claim about the outcome is ignored entirely -- only the
+ * verify call decides.
+ */
+const handlePaystackReturn = async (req, res) => {
+  const reference = typeof req.query.reference === 'string' ? req.query.reference : '';
+  let status = 'pending';
+
+  if (reference) {
+    try {
+      const session = await reconcileOneGatePayment(reference);
+      if (session?.status) status = session.status;
+    } catch (error) {
+      // A 202 means "not settled yet", which is a legitimate pending outcome.
+      // Anything else still must not strand the customer on a blank page.
+      if (error?.statusCode !== 202) {
+        console.error('[billing] paystack return reconciliation failed:', error.message);
+      }
+      try {
+        const session = await PaymentSession.findOne({ reference }).select('status').lean();
+        if (session?.status) status = session.status;
+      } catch (_lookupError) {
+        status = 'pending';
+      }
+    }
+  }
+
+  return res.redirect(paystack.hostedCheckoutReturnUrl(status, reference));
+};
+
+/**
+ * Optional robustness path for when the customer closes the tab before the
+ * redirect. Paystack signs the raw body with HMAC-SHA512 using the secret key.
+ */
+const handlePaystackWebhook = async (req, res, next) => {
+  try {
+    const signature = req.get('x-paystack-signature');
+    const secret = (process.env.PAYSTACK_SECRET_KEY || '').trim();
+    if (!secret || !signature || !req.rawBody) {
+      return res.status(401).json({ success: false, message: 'Invalid signature' });
+    }
+
+    const expected = crypto.createHmac('sha512', secret).update(req.rawBody).digest('hex');
+    const provided = Buffer.from(signature, 'utf8');
+    const computed = Buffer.from(expected, 'utf8');
+    if (provided.length !== computed.length || !crypto.timingSafeEqual(provided, computed)) {
+      return res.status(401).json({ success: false, message: 'Invalid signature' });
+    }
+
+    const reference = req.body?.data?.reference;
+    if (!reference) return res.status(200).json({ success: true });
+
+    // Acknowledge regardless of outcome so Paystack does not retry a payment
+    // this server has already recorded.
+    try {
+      await reconcileOneGatePayment(reference, { reference, status: req.body?.event });
+    } catch (error) {
+      if (error?.statusCode !== 202) {
+        console.error('[billing] paystack webhook reconciliation failed:', error.message);
+      }
+    }
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return next(error);
+  }
+};
 
 const handleOneGateWebhook = async (req, res, next) => {
   try {
@@ -534,6 +609,8 @@ module.exports = {
   getPaymentStatus,
   handleOneGateReturn,
   handleOneGateWebhook,
+  handlePaystackReturn,
+  handlePaystackWebhook,
   mockCheckout: checkout,
   updateProfile,
 };
