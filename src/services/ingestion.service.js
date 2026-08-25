@@ -12,6 +12,8 @@ const {
   readWorkbookRows,
   assertSupportedFileBuffer,
   parserLimits,
+  zonedDateKey,
+  safeTimezone,
 } = require('./parser.service');
 const { computeDedupKey } = require('../utils/dedupKey');
 const {
@@ -155,8 +157,20 @@ const addPersistenceRowError = (rowErrors, row, reason) => {
   });
 };
 
+/**
+ * Identity used to recognise a transaction we already hold.
+ *
+ * A receipt number is only unique within a trading day on tills that restart
+ * their numbering each morning, which is common. Scoping the identity by the
+ * cafe-local day keeps re-uploads idempotent -- the same file yields the same
+ * receipt on the same day -- while letting "#0001" on Tuesday and "#0001" on
+ * Wednesday be recognised as the two different sales they are.
+ */
 const transactionIdentity = (row, sourceFingerprint) => {
-  if (row.receiptId) return { type: 'receiptId', value: row.receiptId };
+  if (row.receiptId) {
+    const dayKey = row.dateKey || row.date.toISOString().slice(0, 10);
+    return { type: 'receiptId', value: row.receiptId, dayKey };
+  }
   return {
     type: 'dedupKey',
     value: computeDedupKey({
@@ -195,8 +209,15 @@ const chunksOf = (values, size = 500) => {
   return chunks;
 };
 
-const findExistingIdentities = async (cafeId, candidates, session) => {
+/** Receipt identities compare on the receipt AND its trading day; others on value alone. */
+const identityComparisonKey = (identity) =>
+  identity.type === 'receiptId'
+    ? `receiptId:${identity.value}|${identity.dayKey}`
+    : `${identity.type}:${identity.value}`;
+
+const findExistingIdentities = async (cafeId, candidates, session, timezone) => {
   const existing = new Set();
+  const zone = safeTimezone(timezone);
   const receiptIds = [...new Set(
     candidates.filter((candidate) => candidate.identity.type === 'receiptId')
       .map((candidate) => candidate.identity.value)
@@ -211,11 +232,15 @@ const findExistingIdentities = async (cafeId, candidates, session) => {
     ...chunksOf(dedupKeys).map((chunk) => ({ dedupKey: { $in: chunk } })),
   ];
   for (const identityQuery of queries) {
-    let query = Transaction.find({ cafeId, ...identityQuery }).select('receiptId dedupKey');
+    let query = Transaction.find({ cafeId, ...identityQuery }).select('receiptId dedupKey date');
     if (session) query = query.session(session);
     const rows = await query.lean();
     for (const row of rows) {
-      if (row.receiptId) existing.add(`receiptId:${row.receiptId}`);
+      // Stored rows keep only the instant, so the trading day is recomputed in
+      // the cafe's timezone rather than read off a UTC date.
+      if (row.receiptId) {
+        existing.add(`receiptId:${row.receiptId}|${zonedDateKey(row.date, zone)}`);
+      }
       if (row.dedupKey) existing.add(`dedupKey:${row.dedupKey}`);
     }
   }
@@ -239,7 +264,7 @@ const reconcileParsedRows = async (parsed, { cafeId, session }) => {
 
 const persistParsedRowsBulk = async (
   parsed,
-  { cafeId, uploadId, session, itemsAlreadyReconciled = false, sourceFingerprint }
+  { cafeId, uploadId, session, itemsAlreadyReconciled = false, sourceFingerprint, timezone }
 ) => {
   let skipped = 0;
   let errors = parsed.errors;
@@ -263,7 +288,7 @@ const persistParsedRowsBulk = async (
         row.items = await reconcileTransactionItems(cafeId, row.items, { session });
       }
       const identity = transactionIdentity(row, sourceFingerprint);
-      const identityKey = `${identity.type}:${identity.value}`;
+      const identityKey = identityComparisonKey(identity);
       if (seen.has(identityKey)) {
         skipped++;
         duplicateRows++;
@@ -278,7 +303,7 @@ const persistParsedRowsBulk = async (
     }
   }
 
-  const existing = await findExistingIdentities(cafeId, candidates, session);
+  const existing = await findExistingIdentities(cafeId, candidates, session, timezone);
   const importable = candidates.filter((candidate) => {
     if (!existing.has(candidate.identityKey)) return true;
     skipped++;
@@ -328,6 +353,7 @@ const persistParsedRows = async (
     rebuildItems = true,
     failOnPersistenceError = false,
     sourceFingerprint,
+    timezone,
   }
 ) => {
   if (bulk) {
@@ -337,6 +363,7 @@ const persistParsedRows = async (
       session,
       itemsAlreadyReconciled,
       sourceFingerprint,
+      timezone,
     });
     if (rebuildItems) await rebuildItemsForCafe(cafeId, { session });
     return result;
@@ -458,7 +485,7 @@ const ingestParsedRows = async (
   }
 ) => {
   const parsed = await parseBuffer(buffer, { columnMapping, itemsMode, fileExt, timezone });
-  return persistParsedRows(parsed, { cafeId, uploadId, sourceFingerprint });
+  return persistParsedRows(parsed, { cafeId, uploadId, sourceFingerprint, timezone });
 };
 
 /**

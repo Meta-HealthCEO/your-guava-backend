@@ -467,11 +467,19 @@ describe('parser.service', () => {
       ]));
     });
 
+    // This case used two different DATES and expected rejection, on the model
+    // that a receipt ID identifies one sale globally. That holds for exports
+    // with globally unique references (Yoco numbers receipts year/month/
+    // sequence), but line-per-row exists for arbitrary tills and plenty restart
+    // their order numbers each morning -- rejecting those blocked the cafe from
+    // importing at all. A reused number on a different day is now read as a
+    // different sale. The protection this test exists for is unchanged, and is
+    // asserted here with a contradiction inside a single day.
     it('rejects rows that reuse a receipt ID with conflicting transaction metadata', async () => {
       const csv = [
         'Receipt,Date,Time,Item,Qty,Line Total',
         'R-reused,2026-04-01,08:30,Flat White,1,35.00',
-        'R-reused,2026-04-02,08:30,Muffin,1,25.00',
+        'R-reused,2026-04-01,14:45,Muffin,1,25.00',
       ].join('\n');
       const result = await parseBuffer(Buffer.from(csv), {
         columnMapping: {
@@ -659,5 +667,56 @@ describe('parsePackedItems fractional quantities', () => {
   it('ignores a zero quantity rather than importing it', () => {
     expect(parsePackedItems('0 x Refunded Item')).toEqual([]);
     expect(parsePackedItems('0.0 x Voided Item')).toEqual([]);
+  });
+});
+
+describe('line-per-row receipt grouping across days', () => {
+  const { groupLinePerRow } = require('../../src/services/parser.service');
+  const mapping = {
+    receiptId: 'Receipt', date: 'Date', time: 'Time',
+    items: 'Item', total: 'Total', quantity: 'Qty',
+  };
+  const row = (receipt, date, item) => ({
+    Receipt: receipt, Date: date, Time: '09:00:00', Item: item, Qty: '1', Total: '50.00',
+  });
+
+  it('keeps the same receipt number on different days as separate sales', () => {
+    // Most tills restart order numbers each morning, so "#0001" recurs daily.
+    // Keyed on the receipt alone those rows collided, the differing dates were
+    // reported as conflicting, and the whole import was rejected.
+    const { rows, errors } = groupLinePerRow(
+      [
+        row('#0001', '2026-08-22', 'Flat White'),
+        row('#0001', '2026-08-23', 'Flat White'),
+        row('#0001', '2026-08-24', 'Muffin'),
+      ],
+      mapping,
+      'Africa/Johannesburg'
+    );
+
+    expect(rows).toHaveLength(3);
+    expect(errors).toBe(0);
+  });
+
+  it('still groups the lines of one receipt within a single day', () => {
+    const { rows } = groupLinePerRow(
+      [row('#0007', '2026-08-22', 'Flat White'), row('#0007', '2026-08-22', 'Croissant')],
+      mapping,
+      'Africa/Johannesburg'
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].items).toHaveLength(2);
+  });
+
+  it('still rejects a receipt whose rows contradict each other within one day', () => {
+    // The protection that matters is preserved: genuinely contradictory rows
+    // for one sale are still refused rather than merged.
+    const conflicting = [
+      { ...row('#0009', '2026-08-22', 'Flat White'), Time: '09:00:00' },
+      { ...row('#0009', '2026-08-22', 'Croissant'), Time: '14:30:00' },
+    ];
+    const { errors, rowErrors } = groupLinePerRow(conflicting, mapping, 'Africa/Johannesburg');
+    expect(errors).toBeGreaterThan(0);
+    expect(rowErrors.some((e) => /conflicting/i.test(e.reason))).toBe(true);
   });
 });

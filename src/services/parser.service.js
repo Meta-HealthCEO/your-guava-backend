@@ -1033,6 +1033,9 @@ const temporalFields = (date, timezone) => {
   return {
     hour: parts.hour,
     dayOfWeek: new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay(),
+    // The cafe-local trading day. Receipt numbers are only unique within a day
+    // on tills that restart their numbering, so identity has to be scoped by it.
+    dateKey: zonedDateKey(date, timezone),
   };
 };
 
@@ -1128,7 +1131,12 @@ const groupLinePerRow = (rawRows, mapping, timezone) => {
         );
         continue;
       }
-      const groupKey = receiptId;
+      // Receipt numbers are only unique within a day on most tills -- plenty
+      // restart their order numbers each morning. Keyed on the receipt alone,
+      // the same number on two days collided, the date mismatch was flagged as
+      // conflicting rows, and the whole group was rejected: a till that
+      // restarts numbering could not import at all.
+      const groupKey = `${zonedDateKey(date, timezone)}::${receiptId}`;
       const itemName = String(raw[mapping.items] || '').trim();
       if (!itemName) {
         errors++;
@@ -1358,6 +1366,7 @@ const parseBuffer = async (
 };
 
 module.exports = {
+  groupLinePerRow,
   parseBuffer,
   parsePackedItems,
   normaliseHeader,

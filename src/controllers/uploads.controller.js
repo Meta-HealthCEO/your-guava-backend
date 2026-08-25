@@ -438,6 +438,7 @@ const commitParsedUpload = async ({
         rebuildItems: false,
         failOnPersistenceError: true,
         sourceFingerprint: upload.fileFingerprint || sha256(upload.r2Key),
+        timezone,
       });
       assertImportableResult(result);
       await ingestion.rebuildItemsForCafe(cafeId, { session });

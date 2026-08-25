@@ -56,8 +56,12 @@ const transactionSchema = new mongoose.Schema(
 );
 
 // Sparse-unique compound indexes — at most one of receiptId/dedupKey should be set per row.
+// Receipt numbers are unique per trading day, not globally: plenty of tills
+// restart their order numbers each morning, so "#0001" recurs daily. Keyed on
+// the receipt alone, the second day's sale collided with the first and the
+// import was refused. The date is part of the identity.
 transactionSchema.index(
-  { cafeId: 1, receiptId: 1 },
+  { cafeId: 1, receiptId: 1, date: 1 },
   { unique: true, partialFilterExpression: { receiptId: { $type: 'string' } } }
 );
 transactionSchema.index(
