@@ -644,12 +644,15 @@ const detectCsvSeparator = (buffer) => {
 const parsePackedItems = (str) => {
   if (!str) return [];
   const items = [];
-  const regex = /(\d+)\s+x\s+(.+?)(?:[,;](?=\s*\d+\s+x\s+)|$)/g;
+  // Quantities may be fractional: cafes selling by weight export rows like
+  // "0.35 x Cheese Wheel". Matching digits only made the engine skip past the
+  // "0." and read the decimal part as the whole quantity, turning 0.35 into 35.
+  const regex = /(\d+(?:\.\d+)?)\s+x\s+(.+?)(?:[,;](?=\s*\d+(?:\.\d+)?\s+x\s+)|$)/g;
   let match;
   while ((match = regex.exec(str)) !== null) {
-    const quantity = parseInt(match[1], 10);
+    const quantity = parseFloat(match[1]);
     const name = match[2].trim();
-    if (name && quantity > 0) items.push({ name, quantity });
+    if (name && Number.isFinite(quantity) && quantity > 0) items.push({ name, quantity });
   }
   if (items.length > 0) return items;
 
@@ -658,10 +661,13 @@ const parsePackedItems = (str) => {
     .map((part) => part.trim())
     .filter(Boolean)
     .map((part) => {
-      const loose = part.match(/^(\d+)\s*x?\s+(.+)$/i);
+      const loose = part.match(/^(\d+(?:\.\d+)?)\s*x?\s+(.+)$/i);
       if (loose) {
-        const quantity = parseInt(loose[1], 10);
-        return { name: loose[2].trim(), quantity: quantity > 0 ? quantity : null };
+        const quantity = parseFloat(loose[1]);
+        return {
+          name: loose[2].trim(),
+          quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : null,
+        };
       }
       return { name: part, quantity: 1 };
     })

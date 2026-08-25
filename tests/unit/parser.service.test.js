@@ -613,3 +613,51 @@ describe('parser.service', () => {
     });
   });
 });
+
+describe('parsePackedItems fractional quantities', () => {
+  const { parsePackedItems } = require('../../src/services/parser.service');
+
+  // Cafes that sell by weight -- deli counters, bakeries, beans by the kilo --
+  // export rows like "0.35 x Cheese Wheel". The quantity pattern used to match
+  // only digits, so the engine skipped past "0." and read the decimal part as
+  // the whole quantity: 0.35 became 35, a hundredfold overstatement that then
+  // flowed into forecasts, revenue and the learning calibration.
+  it('reads a sub-unit weight as a fraction, not as its decimal digits', () => {
+    expect(parsePackedItems('0.35 x Cheese Wheel')).toEqual([
+      { name: 'Cheese Wheel', quantity: 0.35 },
+    ]);
+  });
+
+  it('keeps the whole part of a quantity greater than one', () => {
+    expect(parsePackedItems('1.5 x Biltong')).toEqual([{ name: 'Biltong', quantity: 1.5 }]);
+    expect(parsePackedItems('2.25 x Coffee Beans')).toEqual([
+      { name: 'Coffee Beans', quantity: 2.25 },
+    ]);
+  });
+
+  it('still parses ordinary whole quantities', () => {
+    expect(parsePackedItems('1 x Flat White')).toEqual([{ name: 'Flat White', quantity: 1 }]);
+    expect(parsePackedItems('2 x Brownie,1 x Muffin')).toEqual([
+      { name: 'Brownie', quantity: 2 },
+      { name: 'Muffin', quantity: 1 },
+    ]);
+  });
+
+  it('splits a mixed row of whole and fractional lines', () => {
+    expect(parsePackedItems('2 x Flat White,0.5 x Carrot Cake')).toEqual([
+      { name: 'Flat White', quantity: 2 },
+      { name: 'Carrot Cake', quantity: 0.5 },
+    ]);
+  });
+
+  it('does not mistake a decimal point inside an item name for a quantity', () => {
+    expect(parsePackedItems('1 x Still Water 1.5L')).toEqual([
+      { name: 'Still Water 1.5L', quantity: 1 },
+    ]);
+  });
+
+  it('ignores a zero quantity rather than importing it', () => {
+    expect(parsePackedItems('0 x Refunded Item')).toEqual([]);
+    expect(parsePackedItems('0.0 x Voided Item')).toEqual([]);
+  });
+});
