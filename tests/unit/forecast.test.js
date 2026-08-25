@@ -373,3 +373,28 @@ describe('forecast confidence', () => {
     expect(forecastConfidence(NaN, 8)).toBe('low');
   });
 });
+
+describe('history lookback vs the minimum required weeks', () => {
+  const { requiredHistoryWeeks } = require('../../src/services/forecast.service')._test;
+
+  it('requires the usual three weeks on a default lookback', () => {
+    expect(requiredHistoryWeeks(8)).toBe(3);
+    expect(requiredHistoryWeeks(16)).toBe(3);
+    expect(requiredHistoryWeeks(3)).toBe(3);
+  });
+
+  it('never demands more weeks than the lookback can supply', () => {
+    // The Factors page lets a lookback be set as low as one week. Demanding
+    // three observed weeks from a two-week window is unsatisfiable, so every
+    // forecast stayed insufficient_data for ever, blaming the data rather than
+    // the setting.
+    expect(requiredHistoryWeeks(2)).toBe(2);
+    expect(requiredHistoryWeeks(1)).toBe(1);
+  });
+
+  it('falls back to the default for a missing or nonsensical lookback', () => {
+    expect(requiredHistoryWeeks(undefined)).toBe(3);
+    expect(requiredHistoryWeeks(0)).toBe(3);
+    expect(requiredHistoryWeeks(-4)).toBe(3);
+  });
+});

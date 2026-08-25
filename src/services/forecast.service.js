@@ -58,6 +58,22 @@ const CONFIDENCE_MEDIUM_MIN_QTY = 2;
  * least trust. Capping by observed weeks keeps the label honest while the
  * history fills in.
  */
+/**
+ * How many observed weeks a forecast needs before it is considered usable.
+ *
+ * Normally three. But the Factors page lets an operator narrow the history
+ * lookback to as little as one week, and observed weeks can never exceed the
+ * lookback -- so a fixed three made the requirement unsatisfiable and pinned
+ * every forecast at insufficient_data, with a message that blamed the data
+ * rather than the setting. Asking for two weeks and being told you need three
+ * is incoherent; the floor tracks what the operator asked us to look at.
+ */
+const requiredHistoryWeeks = (maxWeeks) => {
+  const weeks = Number(maxWeeks);
+  if (!Number.isFinite(weeks) || weeks < 1) return MIN_HISTORY_WEEKS;
+  return Math.min(MIN_HISTORY_WEEKS, Math.floor(weeks));
+};
+
 const forecastConfidence = (expectedQty, observedWeeks = Infinity) => {
   if (!Number.isFinite(expectedQty)) return 'low';
 
@@ -743,9 +759,10 @@ const generateForecast = async (cafeId, targetDate, options = {}) => {
   const origin = ['live', 'backfill', 'manual'].includes(options.origin)
     ? options.origin
     : 'live';
+  const weeksRequired = requiredHistoryWeeks(settings.history.maxWeeks);
   const availabilityStatus = trading.status === 'closed'
     ? 'closed'
-    : observedWeeks < MIN_HISTORY_WEEKS
+    : observedWeeks < weeksRequired
       ? 'insufficient_data'
       : 'ready';
   // Configuration is never checked against reality anywhere else, and the two
@@ -761,7 +778,7 @@ const generateForecast = async (cafeId, targetDate, options = {}) => {
       ? `${trading.reason}, but ${transactions.length} sales were recorded on this weekday in the last ${settings.history.maxWeeks} weeks. Check the trading hours in Settings — this day is forecasting zero.`
       : trading.reason)
     : availabilityStatus === 'insufficient_data'
-      ? `At least ${MIN_HISTORY_WEEKS} observed matching trading days are required; ${observedWeeks} available`
+      ? `At least ${weeksRequired} observed matching trading days are required; ${observedWeeks} available`
       : '';
   const forecast = await Forecast.findOneAndUpdate(
     existingForecast ? { _id: existingForecast._id } : { cafeId, date: target },
@@ -1034,5 +1051,6 @@ module.exports = {
     weightedAverage,
     getTradingAvailability,
     forecastConfidence,
+    requiredHistoryWeeks,
   },
 };
