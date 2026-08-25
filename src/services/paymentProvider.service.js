@@ -67,6 +67,9 @@ const isHostedCheckoutConfigured = () => {
 const providerForSession = (session) =>
   PROVIDERS[(session?.provider || '').toLowerCase()] || getProvider() || PROVIDERS.onegate;
 
+/** Names of every provider that settles remotely and therefore needs sweeping. */
+const hostedProviderNames = () => Object.keys(PROVIDERS);
+
 const requireProvider = () => {
   const provider = getProvider();
   if (!provider) {
@@ -85,4 +88,5 @@ module.exports = {
   isHostedCheckoutConfigured,
   requireProvider,
   providerForSession,
+  hostedProviderNames,
 };

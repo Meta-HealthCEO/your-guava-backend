@@ -15,7 +15,10 @@ const paymentSessionSchema = new mongoose.Schema(
     },
     provider: {
       type: String,
-      enum: ['mock', 'onegate'],
+      // Must stay in step with paymentProvider.service PROVIDERS: the session
+      // is written with providerName(), so a name the resolver can select but
+      // the schema rejects fails every checkout at creation.
+      enum: ['mock', 'onegate', 'paystack'],
       required: true,
       default: 'onegate',
     },

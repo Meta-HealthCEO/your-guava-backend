@@ -601,7 +601,9 @@ const reconcilePendingOneGatePayments = async ({
   const pendingBefore = new Date(now.getTime() - Math.max(30_000, Number(minAgeMs) || 0));
   const staleProcessingBefore = new Date(now.getTime() - PROCESSING_LEASE_MS);
   const sessions = await PaymentSession.find({
-    provider: 'onegate',
+    // Every hosted provider needs reconciling, not just the original one. A
+    // name hard-coded here silently strands the other provider's payments.
+    provider: { $in: paymentProvider.hostedProviderNames() },
     $and: [
       {
         $or: [
