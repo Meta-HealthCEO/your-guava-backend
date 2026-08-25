@@ -398,3 +398,42 @@ describe('history lookback vs the minimum required weeks', () => {
     expect(requiredHistoryWeeks(-4)).toBe(3);
   });
 });
+
+describe('suggested stock bias', () => {
+  const { computeSuggestedStockFromPairs } = require('../../src/services/forecast.service')._test;
+  const settings = { stock: { safetyMarginPct: 10, maxBiasPct: 50 } };
+
+  it('counts days the item sold nothing when measuring bias', () => {
+    // Predicted 10; sold 15 on three days and none on three, so the true mean
+    // is 7.5. Dropping the zero days left only the three overshoots, giving the
+    // maximum +50% bias and a suggestion of 17. Counting them, the clamped
+    // -50% observations cancel the overshoots exactly, leaving the safety
+    // margin alone: 11.
+    const pairs = [
+      { predicted: 10, actual: 15 }, { predicted: 10, actual: 15 }, { predicted: 10, actual: 15 },
+      { predicted: 10, actual: 0 }, { predicted: 10, actual: 0 }, { predicted: 10, actual: 0 },
+    ];
+    expect(computeSuggestedStockFromPairs(10, pairs, settings)).toBe(11);
+
+    const withoutZeroDays = pairs.filter((p) => p.actual > 0);
+    expect(computeSuggestedStockFromPairs(10, withoutZeroDays, settings)).toBe(17);
+  });
+
+  it('still buffers upward for an item that genuinely outsells its forecast', () => {
+    const pairs = [
+      { predicted: 10, actual: 14 }, { predicted: 10, actual: 13 }, { predicted: 10, actual: 15 },
+    ];
+    expect(computeSuggestedStockFromPairs(10, pairs, settings)).toBeGreaterThan(10);
+  });
+
+  it('never suggests less than the forecast itself', () => {
+    const pairs = [
+      { predicted: 10, actual: 0 }, { predicted: 10, actual: 0 }, { predicted: 10, actual: 1 },
+    ];
+    expect(computeSuggestedStockFromPairs(10, pairs, settings)).toBe(10);
+  });
+
+  it('applies only the safety margin before there is enough evidence', () => {
+    expect(computeSuggestedStockFromPairs(10, [{ predicted: 10, actual: 12 }], settings)).toBe(11);
+  });
+});
