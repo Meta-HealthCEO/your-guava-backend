@@ -893,6 +893,17 @@ const updateForecastActuals = async (cafeId, date, options = {}) => {
   }
   const nextDay = addZonedDays(target, 1, timezone);
 
+  // A day that has not finished cannot be scored. The upload path fills actuals
+  // across the uploaded file's own date range, and a POS export run at midday
+  // contains today -- so a partial morning was being compared against a
+  // full-day forecast. The resulting near-zero accuracy became both a permanent
+  // row in the customer's history and a calibration sample, teaching the model
+  // it had over-predicted by an order of magnitude when it had not.
+  const todayStart = zonedDayStart(new Date(), timezone);
+  if (todayStart && target >= todayStart) {
+    return Forecast.findOne({ cafeId, date: { $gte: target, $lt: nextDay } }).sort({ date: 1 });
+  }
+
   const forecast = await Forecast.findOne({
     cafeId,
     date: { $gte: target, $lt: nextDay },

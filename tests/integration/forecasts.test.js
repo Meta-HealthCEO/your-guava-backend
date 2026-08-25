@@ -613,6 +613,52 @@ describe('Forecasts API', () => {
   });
 
   describe('updateForecastActuals', () => {
+    it('refuses to score a day that is still trading', async () => {
+      const Forecast = require('../../src/models/Forecast.model');
+      const Cafe = require('../../src/models/Cafe.model');
+      const Transaction = require('../../src/models/Transaction.model');
+      const { updateForecastActuals } = require('../../src/services/forecast.service');
+      const cafe = await Cafe.findOne({});
+
+      // A POS export run at midday contains today, and the upload path fills
+      // actuals across the file's own date range. Scoring today against a
+      // full-day forecast produced a hard 0% that became both a permanent
+      // history row and a calibration sample, teaching the model that it had
+      // over-predicted by an order of magnitude.
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      await Forecast.create({
+        cafeId: cafe._id,
+        date: today,
+        origin: 'live',
+        generatedAt: new Date(),
+        items: [{ itemName: 'Flat White', predictedQty: 40 }],
+        signals: { weather: { temp: 20, condition: 'clear', humidity: 60 }, loadSheddingStage: 0, isPublicHoliday: false, isSchoolHoliday: false, isPayday: false, dayOfWeek: 0, events: [] },
+        totalPredictedRevenue: 920,
+      });
+
+      const morning = new Date();
+      morning.setHours(8, 5, 0, 0);
+      await Transaction.create({
+        cafeId: cafe._id,
+        date: morning,
+        hour: 8,
+        dayOfWeek: morning.getDay(),
+        status: 'approved',
+        items: [{ name: 'Flat White', quantity: 2, unitPrice: 50 }],
+        total: 100,
+        source: 'csv',
+      });
+
+      const updated = await updateForecastActuals(cafe._id, today);
+      const json = updated.toObject();
+
+      expect(json.accuracy).toBeUndefined();
+      expect(json.actualsUpdatedAt).toBeUndefined();
+      expect(json.actualRevenue).toBeUndefined();
+    });
+
     it('leaves actuals empty when there are no transactions for that date', async () => {
       const Forecast = require('../../src/models/Forecast.model');
       const Cafe = require('../../src/models/Cafe.model');
