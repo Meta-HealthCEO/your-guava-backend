@@ -43,17 +43,37 @@ const ITEM_CALIBRATION_VOLUME_PRIOR = 300;
 // data: >=5/day ~25-35%, 2-5/day ~61%, <2/day ~113%. A line selling one unit
 // some days and none on others cannot be forecast -- the honest thing is to
 // label it rather than print a confident-looking figure next to it.
+const MIN_HISTORY_WEEKS = 3;
 const CONFIDENCE_HIGH_MIN_QTY = 5;
 const CONFIDENCE_MEDIUM_MIN_QTY = 2;
 
-const forecastConfidence = (expectedQty) => {
+/**
+ * Confidence is the lesser of two things: how much of an item sells, and how
+ * much evidence stands behind the number.
+ *
+ * Volume alone is not confidence. A cafe that uploaded a fortnight ago has one
+ * matching trading day behind each forecast, and an item selling eight a day
+ * would otherwise be labelled "high" off a single observation -- which is the
+ * most confident-looking part of the screen on the very day it deserves the
+ * least trust. Capping by observed weeks keeps the label honest while the
+ * history fills in.
+ */
+const forecastConfidence = (expectedQty, observedWeeks = Infinity) => {
   if (!Number.isFinite(expectedQty)) return 'low';
-  if (expectedQty >= CONFIDENCE_HIGH_MIN_QTY) return 'high';
-  if (expectedQty >= CONFIDENCE_MEDIUM_MIN_QTY) return 'medium';
-  return 'low';
+
+  const byVolume = expectedQty >= CONFIDENCE_HIGH_MIN_QTY
+    ? 'high'
+    : expectedQty >= CONFIDENCE_MEDIUM_MIN_QTY
+      ? 'medium'
+      : 'low';
+
+  const weeks = Number.isFinite(observedWeeks) ? observedWeeks : MIN_HISTORY_WEEKS;
+  const byEvidence = weeks >= MIN_HISTORY_WEEKS ? 'high' : weeks >= 2 ? 'medium' : 'low';
+
+  const rank = { low: 0, medium: 1, high: 2 };
+  return rank[byVolume] <= rank[byEvidence] ? byVolume : byEvidence;
 };
 
-const MIN_HISTORY_WEEKS = 3;
 const FORECAST_MODEL_VERSION = '2026-07-30.1';
 const MAX_STORED_FORECAST_ITEMS = 25;
 
@@ -696,7 +716,7 @@ const generateForecast = async (cafeId, targetDate, options = {}) => {
         itemName: name,
         baseQty: parseFloat(baseQty.toFixed(2)),
         predictedQty: finalQty,
-        confidence: forecastConfidence(baseQty),
+        confidence: forecastConfidence(baseQty, observedWeeks),
         factors: storedItemFactors,
       });
       predictedQtyByItem.set(name, finalQty);
@@ -1002,5 +1022,6 @@ module.exports = {
     groupByWeekAndItem,
     weightedAverage,
     getTradingAvailability,
+    forecastConfidence,
   },
 };

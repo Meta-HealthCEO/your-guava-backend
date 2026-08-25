@@ -341,3 +341,35 @@ describe('weighted average rounding boundary', () => {
     expect(weightedAverage([10, 10, null, null, null, null, null, null], history)).toBe(10);
   });
 });
+
+describe('forecast confidence', () => {
+  const { forecastConfidence } = require('../../src/services/forecast.service')._test;
+
+  it('reports high only when volume and evidence both support it', () => {
+    expect(forecastConfidence(8, 8)).toBe('high');
+  });
+
+  it('caps a high-volume item at medium on two weeks of evidence', () => {
+    expect(forecastConfidence(8, 2)).toBe('medium');
+  });
+
+  it('caps a high-volume item at low on a single observed week', () => {
+    // The failure this guards: a cafe that uploaded a fortnight ago saw "high"
+    // against an item backed by one matching trading day.
+    expect(forecastConfidence(8, 1)).toBe('low');
+  });
+
+  it('never raises confidence above what the volume justifies', () => {
+    expect(forecastConfidence(1, 8)).toBe('low');
+    expect(forecastConfidence(3, 8)).toBe('medium');
+  });
+
+  it('treats an unknown evidence count as sufficient rather than punishing it', () => {
+    expect(forecastConfidence(8)).toBe('high');
+  });
+
+  it('returns low for a non-numeric quantity', () => {
+    expect(forecastConfidence(undefined, 8)).toBe('low');
+    expect(forecastConfidence(NaN, 8)).toBe('low');
+  });
+});
