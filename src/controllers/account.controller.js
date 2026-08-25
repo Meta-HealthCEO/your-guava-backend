@@ -17,6 +17,7 @@ const {
   getCreditPack,
   invalidateFutureForecastsForOrg,
   reconcileOneGatePayment,
+  normalizePaymentReference,
 } = require('../services/billingPayments.service');
 const {
   billingAccessForOrganization,
@@ -464,8 +465,13 @@ const buyAiCredits = async (req, res, next) => {
   }
 };
 
+// Webhook bodies are unauthenticated and attacker-controlled. Each candidate is
+// normalised to a string before use, so a query operator object can never reach
+// a database filter.
 const oneGateReferenceFromRequest = (req) =>
-  req.body?.merchant_reference || req.body?.reference || req.query?.reference;
+  normalizePaymentReference(req.body?.merchant_reference)
+  || normalizePaymentReference(req.body?.reference)
+  || normalizePaymentReference(req.query?.reference);
 
 /**
  * Paystack sends the customer back here after checkout.
@@ -521,7 +527,7 @@ const handlePaystackWebhook = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'Invalid signature' });
     }
 
-    const reference = req.body?.data?.reference;
+    const reference = normalizePaymentReference(req.body?.data?.reference);
     if (!reference) return res.status(200).json({ success: true });
 
     // Acknowledge regardless of outcome so Paystack does not retry a payment

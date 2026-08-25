@@ -294,8 +294,36 @@ const paymentSessionNotFound = () => {
   return err;
 };
 
+/**
+ * Coerces a payment reference from an untrusted source into a plain string.
+ *
+ * References arrive on unauthenticated webhook routes and are used to build a
+ * Mongoose filter. Mongoose reads an object containing $ operators as query
+ * syntax rather than a value to cast, so a body of {"merchant_reference":
+ * {"$ne": null}} selected an arbitrary PaymentSession belonging to any tenant.
+ * Anything that is not a sane non-empty string is refused outright.
+ */
+const MAX_REFERENCE_LENGTH = 128;
+
+const normalizePaymentReference = (value) => {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > MAX_REFERENCE_LENGTH) return null;
+  return trimmed;
+};
+
+const invalidPaymentReference = () => {
+  const err = new Error('A valid payment reference is required');
+  err.statusCode = 400;
+  return err;
+};
+
 const claimPaymentSession = async (reference, webhookPayload, { orgId } = {}) => {
-  const lookup = { reference, ...(orgId ? { orgId } : {}) };
+  // Defence in depth: even though callers normalise, this is the last point
+  // before an attacker-influenced value reaches a database filter.
+  const safeReference = normalizePaymentReference(reference);
+  if (!safeReference) throw invalidPaymentReference();
+  const lookup = { reference: safeReference, ...(orgId ? { orgId } : {}) };
   const existing = await PaymentSession.findOne(lookup);
   if (!existing) throw paymentSessionNotFound();
   if (existing.status === 'paid') return { session: existing, claimed: false };
@@ -666,6 +694,7 @@ module.exports = {
   getCreditPack,
   invalidateFutureForecastsForOrg,
   normalizePaymentIdempotencyKey,
+  normalizePaymentReference,
   paymentRequestFingerprint,
   reconcilePendingOneGatePayments,
   reconcileOneGatePayment,
