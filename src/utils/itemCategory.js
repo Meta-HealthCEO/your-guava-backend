@@ -29,7 +29,10 @@ const RETAIL = [
   't-shirt', 'tshirt', 'gift card', 'voucher', 'keep cup', 'reusable cup',
 ];
 
-const WATER = ['still water', 'sparkling water', 'mineral water', 'water', 'still 500', 'still 750'];
+// Bottled water is often named without the word "water" at all -- "Mountain
+// Falls Sparkling 500ml", "Valpre Still 500ml" -- so the bare brand markers
+// have to match, as the previous classifier's did.
+const WATER = ['still water', 'sparkling water', 'mineral water', 'water', 'sparkling', 'still'];
 
 const COLD_DRINK = [
   'iced', 'cold brew', 'frappe', 'frappé', 'lemonade', 'juice', 'smoothie',

@@ -38,7 +38,15 @@ describe('inferItemCategory', () => {
   });
 
   describe('water', () => {
-    expectCategory(['Still Water 500ml', 'Sparkling Water', 'Still 750ml'], 'water');
+    // Real menus abbreviate: "Mountain Falls Sparkling 500ml" never says
+    // "water" anywhere in the name, so the bare marker has to match.
+    expectCategory(
+      [
+        'Still Water 500ml', 'Sparkling Water', 'Still 750ml',
+        'Mountain Falls Sparkling 500ml', 'Valpre Still 500ml', 'Sparkling 750ml',
+      ],
+      'water'
+    );
   });
 
   describe('food', () => {
