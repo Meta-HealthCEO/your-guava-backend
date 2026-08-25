@@ -345,7 +345,12 @@ const weightedAverage = (buckets, historySettings) => {
     weightedTotal += qty * weights[index];
     observedWeight += weights[index];
   });
-  return observedWeight > 0 ? weightedTotal / observedWeight : 0;
+  if (observedWeight <= 0) return 0;
+  // Normalising the weights accumulates floating-point error -- 0.35 + 0.25 +
+  // 0.20 is 0.7999... in binary -- which can leave a value a hair below an exact
+  // .5 and cost a whole unit at Math.round. Settling it well below any
+  // meaningful quantity keeps the displayed base and the prediction agreeing.
+  return Number((weightedTotal / observedWeight).toFixed(6));
 };
 
 const buildHistoricalPriceMap = (transactions) => {

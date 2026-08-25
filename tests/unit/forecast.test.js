@@ -312,3 +312,32 @@ describe('forecast history math', () => {
     )).toEqual(expect.objectContaining({ status: 'ready', multiplier: 0.5 }));
   });
 });
+
+describe('weighted average rounding boundary', () => {
+  const { weightedAverage } = require('../../src/services/forecast.service')._test;
+  const history = {
+    maxWeeks: 8,
+    recentWeights: [0.35, 0.25, 0.2],
+    twoWeekWeights: [0.6, 0.4],
+  };
+
+  it('lands exactly on .5 rather than a hair below it', () => {
+    // 0.35 + 0.25 + 0.20 is 0.7999... in binary floating point, so the
+    // normalised weights accumulate error. Before this was settled, these
+    // buckets produced 22.499999999999986: displayed as 22.5 but rounded to 22,
+    // so the base quantity and the prediction visibly disagreed.
+    const value = weightedAverage([10, 20, 30, 40, 40, 40, 40, 40], history);
+    expect(value).toBe(22.5);
+    expect(Math.round(value)).toBe(23);
+  });
+
+  it('still returns 0 when no week has been observed', () => {
+    expect(weightedAverage([null, null, null, null, null, null, null, null], history)).toBe(0);
+  });
+
+  it('ignores missing weeks instead of treating them as zero sales', () => {
+    // Two observed weeks of 10 must average 10, not be dragged down by the six
+    // weeks where the cafe recorded no trading at all.
+    expect(weightedAverage([10, 10, null, null, null, null, null, null], history)).toBe(10);
+  });
+});
