@@ -779,4 +779,70 @@ describe('xlsx workbook reading', () => {
     ]));
     expect(rows.map((r) => r.Receipt)).toEqual(['R1', 'R2']);
   });
+
+  it('reports the header row even when the sheet has no data rows', async () => {
+    // CSV keeps its headers for an empty export, XLSX did not: previewWorkbook
+    // derived them from the first data row, so a cafe exporting a quiet period
+    // was told "Could not parse file headers" when the headers were fine and it
+    // was the sales that were missing.
+    const { readWorkbook } = require('../../src/services/parser.service');
+    const { headers, rows } = await readWorkbook(xlsxWith([['Receipt', 'Date', 'Total']]));
+
+    expect(headers).toEqual(['Receipt', 'Date', 'Total']);
+    expect(rows).toEqual([]);
+  });
+
+  it('reports headers alongside rows for a populated sheet', async () => {
+    const { readWorkbook } = require('../../src/services/parser.service');
+    const { headers, rows } = await readWorkbook(xlsxWith([
+      ['Receipt', 'Total'],
+      ['R1', '35.00'],
+    ]));
+    expect(headers).toEqual(['Receipt', 'Total']);
+    expect(rows).toHaveLength(1);
+  });
+});
+
+
+describe('fractional quantities survive validation', () => {
+  const mapping = {
+    receiptId: 'Receipt', date: 'Date', items: 'Items', total: 'Total',
+  };
+
+  // parsePackedItems was taught to read "0.35 x Cheese Wheel" as 0.35, but two
+  // downstream checks still assumed whole numbers: the packed validator required
+  // a safe integer (and blamed the 10000 limit for a quantity of 0.35), while
+  // parseQuantity truncated the Qty column to zero and called it invalid. A
+  // deli selling by weight could not import either way.
+  it('accepts a sub-unit packed quantity', async () => {
+    const csv = 'Receipt,Date,Items,Total\nF1,2026-04-01,0.35 x Cheese Wheel,52.50';
+    const result = await parseBuffer(Buffer.from(csv), { columnMapping: mapping, itemsMode: 'packed' });
+
+    expect(result.rowErrors).toEqual([]);
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0].items[0]).toMatchObject({ name: 'Cheese Wheel', quantity: 0.35 });
+  });
+
+  it('accepts a fractional Qty column', async () => {
+    const csv = 'Receipt,Date,Item,Qty,Total\nF2,2026-04-01,Gouda,0.75,60.00';
+    const result = await parseBuffer(Buffer.from(csv), {
+      columnMapping: { receiptId: 'Receipt', date: 'Date', items: 'Item', quantity: 'Qty', total: 'Total' },
+      itemsMode: 'line-per-row',
+    });
+
+    expect(result.rowErrors).toEqual([]);
+    expect(result.rows[0].items[0]).toMatchObject({ name: 'Gouda', quantity: 0.75 });
+  });
+
+  it('still refuses a quantity of zero or below', async () => {
+    const csv = 'Receipt,Date,Items,Total\nF3,2026-04-01,0 x Ghost,10';
+    const result = await parseBuffer(Buffer.from(csv), { columnMapping: mapping, itemsMode: 'packed' });
+    expect(result.rows).toHaveLength(0);
+  });
+
+  it('still refuses a quantity beyond the limit, and says so accurately', async () => {
+    const csv = 'Receipt,Date,Items,Total\nF4,2026-04-01,10001 x Foo,10';
+    const result = await parseBuffer(Buffer.from(csv), { columnMapping: mapping, itemsMode: 'packed' });
+    expect(result.rowErrors[0].reason).toMatch(/quantity exceeds/i);
+  });
 });

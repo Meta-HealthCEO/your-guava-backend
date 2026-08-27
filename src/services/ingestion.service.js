@@ -10,6 +10,7 @@ const {
   normaliseRow,
   detectCsvSeparator,
   readWorkbookRows,
+  readWorkbook,
   assertSupportedFileBuffer,
   parserLimits,
   zonedDateKey,
@@ -59,8 +60,10 @@ const yocoMapping = () => ({
  */
 const previewWorkbook = async (buffer) => {
   assertSupportedFileBuffer(buffer, 'xlsx');
-  const rows = await readWorkbookRows(buffer);
-  const headers = rows[0] ? Object.keys(rows[0]) : [];
+  // Take the sheet's own header row rather than the keys of the first data row,
+  // so an export covering a quiet period still reports its columns instead of
+  // looking like a file whose headers could not be read.
+  const { headers, rows } = await readWorkbook(buffer);
   return { headers, sampleRows: rows.slice(0, 5) };
 };
 

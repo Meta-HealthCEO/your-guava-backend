@@ -338,10 +338,18 @@ const excelSerialDateToDate = (serial, timezone = DEFAULT_TIMEZONE) => {
   }, timezone);
 };
 
-const readWorkbookRows = async (buffer) => {
+/**
+ * Reads a workbook into its header row and its data rows.
+ *
+ * Headers are taken from the sheet's own first row rather than inferred from a
+ * data row, so a spreadsheet exported over a quiet period still reports its
+ * columns. Deriving them from `rows[0]` made an empty export look like a file
+ * with unreadable headers, which is what the operator was then told.
+ */
+const readWorkbook = async (buffer) => {
   const limits = parserLimits();
   const matrix = await readSheet(buffer);
-  if (!matrix.length) return [];
+  if (!matrix.length) return { headers: [], rows: [] };
   if (matrix.length - 1 > limits.maxRows) {
     throw createClientInputError(`File exceeds the ${limits.maxRows} row limit`);
   }
@@ -352,7 +360,7 @@ const readWorkbookRows = async (buffer) => {
   }
   const headers = headerRow.map((header, index) => normaliseHeader(header, index));
 
-  return dataRows
+  const rows = dataRows
     .map((row, index) => ({ row, rowNumber: index + 2 }))
     .filter(({ row }) => row.some((value) => value != null && String(value).trim() !== ''))
     .map(({ row, rowNumber }) => {
@@ -367,7 +375,11 @@ const readWorkbookRows = async (buffer) => {
       });
       return mapped;
     });
+
+  return { headers, rows };
 };
+
+const readWorkbookRows = async (buffer) => (await readWorkbook(buffer)).rows;
 
 const ZIP_LOCAL_HEADER = 0x04034b50;
 const ZIP_CENTRAL_HEADER = 0x02014b50;
@@ -730,8 +742,10 @@ const parseBoundedAmount = (raw, limits = parserLimits()) => {
 
 const parseQuantity = (raw, limits = parserLimits()) => {
   const parsed = parseCleanNumber(raw);
-  const quantity = Math.trunc(parsed.value);
-  return parsed.valid && Number.isSafeInteger(quantity) &&
+  // Truncating discarded weight-based quantities entirely: 0.35 became 0 and the
+  // row was rejected as invalid. Keep the value the till actually recorded.
+  const quantity = parsed.value;
+  return parsed.valid && Number.isFinite(quantity) &&
     quantity > 0 && quantity <= limits.maxItemQuantity
     ? quantity
     : null;
@@ -1057,9 +1071,18 @@ const buildPackedRow = (raw, mapping, rowNumber, timezone) => {
   if (items.some((item) => item.name.length > limits.maxItemNameChars)) {
     return { error: `Item name exceeds the ${limits.maxItemNameChars} character limit` };
   }
-  if (items.some((item) => !Number.isSafeInteger(item.quantity) ||
-    item.quantity <= 0 || item.quantity > limits.maxItemQuantity)) {
-    return { error: `Item quantity exceeds the ${limits.maxItemQuantity} limit` };
+  // Quantities may legitimately be fractional -- a deli sells 0.35 of a cheese
+  // wheel -- so require a positive finite number rather than a whole one, and
+  // report the reason that actually applies instead of blaming the upper limit
+  // for a sub-unit weight.
+  const badQuantity = items.find((item) => !Number.isFinite(item.quantity) || item.quantity <= 0
+    || item.quantity > limits.maxItemQuantity);
+  if (badQuantity) {
+    return {
+      error: badQuantity.quantity > limits.maxItemQuantity
+        ? `Item quantity exceeds the ${limits.maxItemQuantity} limit`
+        : 'Item quantity must be a positive number',
+    };
   }
   const receiptId = mapping.receiptId ? String(raw[mapping.receiptId] || '').trim() : '';
   if (receiptId.length > limits.maxIdentifierChars) {
@@ -1380,6 +1403,7 @@ module.exports = {
   detectCsvSeparator,
   assertSupportedFileBuffer,
   readWorkbookRows,
+  readWorkbook,
   requiredFieldsForMode,
   parserLimits,
   safeTimezone,
