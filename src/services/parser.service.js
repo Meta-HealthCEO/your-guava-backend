@@ -1,7 +1,11 @@
 const csv = require('csv-parser');
 const { Readable } = require('stream');
 const zlib = require('zlib');
-const readXlsxFile = require('read-excel-file/node');
+// read-excel-file v8 renamed the matrix-returning function to `readSheet` and
+// repurposed the default export to return every sheet as [{ sheet, data }].
+// Importing the default and treating it as a matrix is what broke every .xlsx
+// upload, so take the named export deliberately.
+const { readSheet } = require('read-excel-file/node');
 
 const REQUIRED_FIELDS = ['date', 'items', 'total'];
 const UNNAMED_COLUMN_RE = /^_(\d+)$/;
@@ -336,7 +340,7 @@ const excelSerialDateToDate = (serial, timezone = DEFAULT_TIMEZONE) => {
 
 const readWorkbookRows = async (buffer) => {
   const limits = parserLimits();
-  const matrix = await readXlsxFile(buffer);
+  const matrix = await readSheet(buffer);
   if (!matrix.length) return [];
   if (matrix.length - 1 > limits.maxRows) {
     throw createClientInputError(`File exceeds the ${limits.maxRows} row limit`);

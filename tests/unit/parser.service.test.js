@@ -720,3 +720,63 @@ describe('line-per-row receipt grouping across days', () => {
     expect(rowErrors.some((e) => /conflicting/i.test(e.reason))).toBe(true);
   });
 });
+
+describe('xlsx workbook reading', () => {
+  const { readWorkbookRows } = require('../../src/services/parser.service');
+
+  // A minimal but genuinely valid .xlsx. read-excel-file is a hard dependency of
+  // every spreadsheet import, and its v8 release renamed the matrix-returning
+  // function to `readSheet` and repurposed the default export to return every
+  // sheet as [{ sheet, data }]. Nothing here parsed a real workbook, so the
+  // upgrade to ^9 broke every .xlsx import silently: the parser destructured a
+  // sheet object as a header row and threw "headerRow.map is not a function".
+  const xlsxWith = (rows) => {
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    const colName = (i) => {
+      let s = '';
+      let n = i;
+      do { s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26) - 1; } while (n >= 0);
+      return s;
+    };
+    const sheetRows = rows.map((row, r) => {
+      const cells = row.map((v, c) =>
+        `<c r="${colName(c)}${r + 1}" t="inlineStr"><is><t xml:space="preserve">${esc(v)}</t></is></c>`
+      ).join('');
+      return `<row r="${r + 1}">${cells}</row>`;
+    }).join('');
+
+    return buildStoredZip([
+      { name: '[Content_Types].xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>' },
+      { name: '_rels/.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>' },
+      { name: 'xl/workbook.xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sales" sheetId="1" r:id="rId1"/></sheets></workbook>' },
+      { name: 'xl/_rels/workbook.xml.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>' },
+      { name: 'xl/worksheets/sheet1.xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${sheetRows}</sheetData></worksheet>` },
+    ]);
+  };
+
+  it('reads a spreadsheet into header-keyed rows', async () => {
+    const rows = await readWorkbookRows(xlsxWith([
+      ['Receipt', 'Date', 'Items', 'Total'],
+      ['R1', '2026-04-01', '1 x Flat White', '35.00'],
+      ['R2', '2026-04-01', '2 x Muffin', '50.00'],
+    ]));
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ Receipt: 'R1', Date: '2026-04-01', Items: '1 x Flat White', Total: '35.00' });
+    expect(rows[1]).toMatchObject({ Receipt: 'R2', Total: '50.00' });
+  });
+
+  it('returns nothing for a workbook with only a header', async () => {
+    expect(await readWorkbookRows(xlsxWith([['Receipt', 'Date']]))).toEqual([]);
+  });
+
+  it('skips blank rows rather than importing them', async () => {
+    const rows = await readWorkbookRows(xlsxWith([
+      ['Receipt', 'Total'],
+      ['R1', '35.00'],
+      ['', ''],
+      ['R2', '50.00'],
+    ]));
+    expect(rows.map((r) => r.Receipt)).toEqual(['R1', 'R2']);
+  });
+});
