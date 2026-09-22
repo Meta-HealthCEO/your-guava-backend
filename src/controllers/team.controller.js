@@ -10,8 +10,8 @@ const AuthSession = require('../models/AuthSession.model');
 const AccessAuditEvent = require('../models/AccessAuditEvent.model');
 const { getPlan } = require('../services/billingPlans.service');
 const emailService = require('../services/email.service');
+const { isValidEmail } = require('../utils/email');
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_PASSWORD_BYTES = 72;
 const DEFAULT_INVITE_TTL_HOURS = 48;
 const MIN_INVITE_TTL_HOURS = 1;
@@ -143,7 +143,7 @@ const inviteManager = async (req, res, next) => {
     const normalizedName = typeof name === 'string' ? name.trim() : '';
     const submittedCafeIds = Array.isArray(cafeIds) ? cafeIds.map(String) : [];
     const requestedCafeIds = normalizeCafeIds(cafeIds);
-    if (!EMAIL_RE.test(normalizedEmail) || normalizedEmail.length > 254) {
+    if (!isValidEmail(normalizedEmail)) {
       return res.status(400).json({ success: false, message: 'Enter a valid email address' });
     }
     if (normalizedName.length < 2 || normalizedName.length > 120) {

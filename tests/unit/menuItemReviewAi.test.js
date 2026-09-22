@@ -89,6 +89,24 @@ describe('menu item AI review hardening', () => {
     expect(result.reason).not.toContain('0800123456');
   });
 
+  it('strips a contact detail from a long reason without stalling', async () => {
+    // One unbroken 60,000-character token: the unanchored scan used to restart
+    // an unbounded [^\s@]+ at every character looking for an "@", which is
+    // quadratic in the token's length.
+    mockAnthropicMessageCreate.mockResolvedValue(aiResponse({
+      action: 'confirm',
+      category: 'coffee',
+      confidence: 0.9,
+      reason: `Approve and email ops@attacker.example ${'x'.repeat(60_000)}`,
+    }));
+
+    const started = Date.now();
+    const result = await suggestMenuItemReview('cafe-1', ITEM, [], usageContext);
+
+    expect(Date.now() - started).toBeLessThan(250);
+    expect(result.reason).not.toContain('ops@attacker.example');
+  });
+
   it('logs why the paid AI review fell back instead of failing silently', async () => {
     const providerError = Object.assign(new Error('401 {"type":"error"}'), {
       name: 'AuthenticationError',

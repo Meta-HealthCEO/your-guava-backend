@@ -32,9 +32,9 @@ const oneGate = require('../services/onegate.service');
 const paymentProvider = require('../services/paymentProvider.service');
 const paystack = require('../services/paystack.service');
 const { assertPlanChangeCapacity } = require('../services/planCapacity.service');
+const { isValidEmail } = require('../utils/email');
 const { clearApiCache } = require('../middleware/cache.middleware');
 
-const PROFILE_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
 const normalizedProfileText = (value) =>
   typeof value === 'string' ? value.trim() : null;
@@ -282,7 +282,7 @@ const updateProfile = async (req, res, next) => {
     }
     if (
       changesBillingEmail &&
-      (!cleanBillingEmail || cleanBillingEmail.length > 254 || !PROFILE_EMAIL_RE.test(cleanBillingEmail))
+      !isValidEmail(cleanBillingEmail)
     ) {
       return res.status(400).json({ success: false, message: 'Enter a valid billing email address' });
     }

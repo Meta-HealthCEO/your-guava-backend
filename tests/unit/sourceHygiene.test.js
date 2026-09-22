@@ -63,4 +63,17 @@ describe('source hygiene', () => {
     expect([...intact.matchAll(CONTROL_BYTE)]).toHaveLength(0);
     expect(intact).toContain(String.fromCharCode(92) + 'b(cola');
   });
+
+  it('holds no copy of the email pattern that froze the server', () => {
+    // [^\s@]+@[^\s@]+\.[^\s@]+ lets the domain split at any dot, so a long
+    // dotted string backtracks quadratically: 1.4 s at 40,000 characters, on a
+    // login any stranger can send. Seven copies had drifted across src; email
+    // checks now go through utils/email.js, which never runs a regex on
+    // anything longer than an address can be.
+    const legacy = String.raw`[^\s@]+@[^\s@]+\.[^\s@]+`;
+    const copies = files
+      .filter((file) => fs.readFileSync(file, 'utf8').includes(legacy))
+      .map((file) => path.relative(SRC_ROOT, file));
+    expect(copies).toEqual([]);
+  });
 });

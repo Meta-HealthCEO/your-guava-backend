@@ -11,6 +11,7 @@ const PasswordResetToken = require('../models/PasswordResetToken.model');
 const AuthSession = require('../models/AuthSession.model');
 const AccessAuditEvent = require('../models/AccessAuditEvent.model');
 const emailService = require('../services/email.service');
+const { isValidEmail } = require('../utils/email');
 
 const COOKIE_OPTIONS = {
   httpOnly: true,
@@ -22,7 +23,6 @@ const COOKIE_OPTIONS = {
 
 // Max active refresh-token families per user (roughly one per device).
 const MAX_REFRESH_TOKENS = 10;
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_PASSWORD_BYTES = 72;
 const ACTION_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
@@ -153,7 +153,7 @@ const register = async (req, res, next) => {
     const normalizedCafeName = suppliedCafeName || 'My Cafe';
     const normalizedOrgName =
       suppliedOrgName || `${normalizedName}'s Organization`.slice(0, 120);
-    if (!EMAIL_RE.test(normalizedEmail) || normalizedEmail.length > 254) {
+    if (!isValidEmail(normalizedEmail)) {
       return res.status(400).json({ success: false, message: 'Enter a valid email address' });
     }
     if (normalizedName.length < 2 || normalizedName.length > 120) {
@@ -256,7 +256,7 @@ const resendVerification = async (req, res, next) => {
       success: true,
       message: 'If a pending registration exists, a new verification email has been sent.',
     };
-    if (!EMAIL_RE.test(normalizedEmail) || normalizedEmail.length > 254) {
+    if (!isValidEmail(normalizedEmail)) {
       return res.status(200).json(genericResponse);
     }
 
@@ -408,7 +408,7 @@ const login = async (req, res, next) => {
     }
 
     const normalizedEmail = String(email).toLowerCase().trim();
-    if (!EMAIL_RE.test(normalizedEmail) || passwordTooLong(password)) {
+    if (!isValidEmail(normalizedEmail) || passwordTooLong(password)) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
@@ -649,7 +649,7 @@ const forgotPassword = async (req, res, next) => {
       success: true,
       message: 'If an account exists for that email, a password reset link has been sent.',
     };
-    if (!EMAIL_RE.test(normalizedEmail) || normalizedEmail.length > 254) {
+    if (!isValidEmail(normalizedEmail)) {
       return res.status(200).json(response);
     }
 

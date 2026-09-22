@@ -12,6 +12,7 @@ const {
   withUsageDiagnostics,
 } = require('./usage.service');
 const { createAnthropicClient, withAnthropicErrors } = require('./anthropicClient.service');
+const { isValidEmail } = require('../utils/email');
 const {
   addZonedDays,
   getZonedDateParts,
@@ -1276,7 +1277,7 @@ const PII_HEADER_RE =
 const headerLooksLikeSensitiveValue = (header) => {
   const value = String(header || '').trim();
   return (
-    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) ||
+    isValidEmail(value) ||
     /(?:\+?\d[\s().-]*){10,}/.test(value) ||
     /\b(?:\d[ -]*?){13,19}\b/.test(value)
   );

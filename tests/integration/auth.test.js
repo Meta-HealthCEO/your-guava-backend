@@ -250,6 +250,40 @@ describe('Auth API', () => {
     });
   });
 
+  describe('a hostile email does not freeze the server', () => {
+    // "a@" + 99,000 dots + "@" fits the 100 KB JSON limit. The pattern these
+    // handlers used split the domain at every dot and took about 8 s per
+    // request, blocking the event loop for every cafe; login needs no account.
+    const hostile = `a@${'.'.repeat(99_000)}@`;
+
+    it.each([
+      ['/api/auth/login', { password: 'password123' }, 401],
+      ['/api/auth/register', { name: 'Test Owner', password: 'password123', cafeName: 'Test Cafe' }, 400],
+      ['/api/auth/resend-verification', {}, 200],
+      ['/api/auth/forgot-password', {}, 200],
+    ])('%s answers at once', async (path, body, status) => {
+      const started = Date.now();
+      const response = await request.post(path).send({ ...body, email: hostile });
+      const elapsedMs = Date.now() - started;
+
+      expect(response.status).toBe(status);
+      expect(elapsedMs).toBeLessThan(1000);
+    });
+
+    it('a team invite answers at once', async () => {
+      const owner = await createTestUser({ name: 'Invite Owner', email: 'invite-owner@yourguava.com' });
+      const started = Date.now();
+      const response = await request
+        .post('/api/team/invite')
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ email: hostile, name: 'New Manager', cafeIds: [owner.user.activeCafeId] });
+      const elapsedMs = Date.now() - started;
+
+      expect(response.status).toBe(400);
+      expect(elapsedMs).toBeLessThan(1000);
+    });
+  });
+
   describe('login, profile, and logout', () => {
     it('logs in with valid credentials and rejects invalid credentials', async () => {
       await createTestUser({
