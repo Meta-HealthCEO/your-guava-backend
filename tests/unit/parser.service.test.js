@@ -1381,7 +1381,14 @@ describe('one bad cell is a row problem, not a file problem', () => {
   it('tells an owner with a legacy .xls export what to do about it', async () => {
     await expect(parseBuffer(Buffer.from('Date,Items,Total\n2026-09-01,1 x Foo,10\n'), {
       columnMapping: mapping, itemsMode: 'packed', fileExt: 'xls',
-    })).rejects.toThrow(/export as CSV or XLSX/i);
+    })).rejects.toThrow(/CSV UTF-8/i);
+  });
+
+  it('names the format so the owner knows what they have', async () => {
+    const csv = ['Date,Items,Total', '2026-09-01,1 x Foo,10', ''].join(String.fromCharCode(10));
+    await expect(parseBuffer(Buffer.from(csv), {
+      columnMapping: mapping, itemsMode: 'packed', fileExt: 'xls',
+    })).rejects.toThrow(/legacy [.]xls/i);
   });
 });
 
@@ -1453,5 +1460,39 @@ describe('a discarded receipt is counted in full', () => {
 
     expect(result.rows).toHaveLength(5);
     expect(result.errors).toBe(2);
+  });
+});
+
+describe('legacy .xls detection', () => {
+  const parser = require('../../src/services/parser.service');
+  const OLE2 = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+  const ole2File = Buffer.concat([OLE2, Buffer.alloc(512)]);
+
+  it('names legacy .xls by its bytes, whatever the extension claims', () => {
+    // An owner whose till writes .xls often renames it to .xlsx and tries again.
+    // Before this, that produced "XLSX file signature is invalid" - true, and
+    // useless: it does not say what the file actually is or what to do.
+    expect(() => parser.assertSupportedFileBuffer(ole2File, 'xlsx')).toThrow(/legacy \.xls/i);
+    expect(() => parser.assertSupportedFileBuffer(ole2File, 'csv')).toThrow(/legacy \.xls/i);
+    expect(() => parser.assertSupportedFileBuffer(ole2File, 'xls')).toThrow(/legacy \.xls/i);
+  });
+
+  it('tells the owner what to export instead', () => {
+    expect(() => parser.assertSupportedFileBuffer(ole2File, 'xls')).toThrow(/CSV UTF-8/i);
+  });
+
+  it('is a client input error, not a 500', () => {
+    try {
+      parser.assertSupportedFileBuffer(ole2File, 'xls');
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err.statusCode).toBe(400);
+      expect(err.code).toBe('LEGACY_XLS');
+    }
+  });
+
+  it('still rejects a genuinely corrupt xlsx as a signature problem', () => {
+    const notZip = Buffer.concat([Buffer.from('not a zip at all'), Buffer.alloc(64)]);
+    expect(() => parser.assertSupportedFileBuffer(notZip, 'xlsx')).toThrow(/signature is invalid/i);
   });
 });

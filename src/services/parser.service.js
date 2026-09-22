@@ -643,12 +643,32 @@ const assertSafeXlsxArchive = (buffer) => {
   }
 };
 
+// OLE2/CFBF signature: every Excel 97-2003 .xls begins with these eight bytes.
+const OLE2_MAGIC = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+
+// Names the format and the way out. CSV UTF-8 is the instruction rather than XLSX
+// because it imports on every build, and the portal says the same thing (D-002).
+const LEGACY_XLS_MESSAGE =
+  'This is a legacy .xls file. In Excel choose File -> Save As -> "CSV UTF-8 (Comma delimited)" '
+  + 'and upload that .csv.';
+
 const assertSupportedFileBuffer = (buffer, fileExt = 'csv') => {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     throw createClientInputError('Uploaded file is empty');
   }
 
   const ext = String(fileExt || '').toLowerCase();
+
+  // Identify a legacy .xls by its bytes before trusting the extension. An owner
+  // whose till only writes .xls will often rename it to .xlsx and try again, and
+  // that produced 'XLSX file signature is invalid' - true, and useless: it does not
+  // say what the file is or what to do with it. OLE2/CFBF compound document.
+  if (buffer.length >= OLE2_MAGIC.length && buffer.subarray(0, OLE2_MAGIC.length).equals(OLE2_MAGIC)) {
+    const err = createClientInputError(LEGACY_XLS_MESSAGE);
+    err.code = 'LEGACY_XLS';
+    throw err;
+  }
+
   if (ext === 'xlsx') {
     const validZipSuffixes = new Set(['3:4', '5:6', '7:8']);
     const isZip = buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b &&
@@ -663,7 +683,9 @@ const assertSupportedFileBuffer = (buffer, fileExt = 'csv') => {
   // unsupported and nothing about what to export instead. Say it here and every
   // entry point says it.
   if (ext === 'xls') {
-    throw createClientInputError('Legacy XLS files are not supported. Please export as CSV or XLSX.');
+    const err = createClientInputError(LEGACY_XLS_MESSAGE);
+    err.code = 'LEGACY_XLS';
+    throw err;
   }
 
   if (ext !== 'csv') {
@@ -929,9 +951,6 @@ const readRows = (buffer, fileExt) => {
   assertSupportedFileBuffer(buffer, fileExt);
   if (fileExt === 'xlsx') {
     return readWorkbookRows(buffer);
-  }
-  if (fileExt === 'xls') {
-    return Promise.reject(new Error('Legacy XLS files are not supported. Please export as CSV or XLSX.'));
   }
   return new Promise((resolve, reject) => {
     const limits = parserLimits();
