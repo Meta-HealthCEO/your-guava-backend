@@ -945,8 +945,22 @@ const confirm = async (req, res, next) => {
     upload = await recoverStaleParsingUpload(upload, cafeId);
     if (upload.status === 'completed') {
       if (upload.confirmation?.mappingHash && upload.confirmation.mappingHash !== mappingHash) {
+        // The key was stored on the first confirm and never read, so a client that
+        // reused one key for two different mappings got the same advice as an owner
+        // deliberately changing their columns. They are different problems: one is a
+        // bug to fix, the other is a feature to use, and only the caller can tell
+        // them apart if we say which happened.
+        if (idempotencyKeyHash && upload.confirmation?.idempotencyKeyHash === idempotencyKeyHash) {
+          return res.status(409).json({
+            success: false,
+            code: 'IDEMPOTENCY_KEY_REUSED',
+            message: 'This Idempotency-Key was already used for a different mapping. '
+              + 'Use a new key, or remap the upload to change its columns.',
+          });
+        }
         return res.status(409).json({
           success: false,
+          code: 'MAPPING_ALREADY_COMMITTED',
           message: 'Upload already completed with a different mapping. Use remap to change it.',
         });
       }
@@ -1119,6 +1133,13 @@ const remap = async (req, res, next) => {
     const { id } = req.params;
     const { columnMapping, itemsMode = 'packed', allowPartialImport = false } = req.body;
     const cafeId = req.user.cafeId;
+    // Remap deliberately discarded its key, so a retried re-import looked like a
+    // fresh one. Record it like confirm does.
+    const remapKey = String(req.get?.('Idempotency-Key') || '').trim();
+    if (remapKey.length > CONFIRMATION_KEY_MAX_LENGTH) {
+      return res.status(400).json({ success: false, message: 'Idempotency-Key is too long' });
+    }
+    const remapKeyHash = remapKey ? sha256(remapKey) : undefined;
 
     let upload = await Upload.findOne({ _id: id, cafeId });
     if (!upload || upload.status === 'deleted') {
@@ -1177,7 +1198,7 @@ const remap = async (req, res, next) => {
         itemsMode,
         persistMapping: false,
         mappingHash: confirmationMappingHash(columnMapping, itemsMode),
-        idempotencyKeyHash: undefined,
+        idempotencyKeyHash: remapKeyHash,
         timezone,
       });
       upload = committed.upload;

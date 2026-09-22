@@ -1025,6 +1025,106 @@ describe('Uploads API', () => {
     });
   });
 
+  describe('Idempotency-Key on confirm and remap', () => {
+    const stageGeneric = async (name) => {
+      const csv = Buffer.from([
+        'Whenever,Whatever,Howmuch',
+        '2026/09/01,1 x Flat White,38.00',
+        '2026/09/02,2 x Latte,80.00',
+      ].join(String.fromCharCode(10)));
+      return request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', csv, name);
+    };
+    const MAP_A = { date: 'Whenever', items: 'Whatever', total: 'Howmuch' };
+
+    it('replays a confirm sent twice with the same key, importing once', async () => {
+      const stage = await stageGeneric('idem-a.csv');
+      const send = () => request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', 'key-alpha')
+        .send({ columnMapping: MAP_A, itemsMode: 'packed' });
+
+      const first = await send();
+      expect(first.status).toBe(200);
+      expect(first.body.stats.imported).toBe(2);
+
+      const before = await Transaction.countDocuments({ uploadId: stage.body.uploadId });
+      const second = await send();
+      expect(second.status).toBe(200);
+      expect(second.body.replayed).toBe(true);
+      expect(await Transaction.countDocuments({ uploadId: stage.body.uploadId })).toBe(before);
+    });
+
+    it('refuses the same key carrying a different mapping, and says which problem it is', async () => {
+      const stage = await stageGeneric('idem-b.csv');
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', 'key-beta')
+        .send({ columnMapping: MAP_A, itemsMode: 'packed' })
+        .expect(200);
+
+      const reused = await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', 'key-beta')
+        .send({
+          columnMapping: { date: 'Whenever', items: 'Whatever', total: 'Whatever' },
+          itemsMode: 'packed',
+        });
+
+      expect(reused.status).toBe(409);
+      // A reused key is a client bug, not an owner asking to change the mapping:
+      // the two need different codes so the portal can tell them apart.
+      expect(reused.body.code).toBe('IDEMPOTENCY_KEY_REUSED');
+    });
+
+    it('still treats a different key with a different mapping as a remap request', async () => {
+      const stage = await stageGeneric('idem-c.csv');
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', 'key-gamma')
+        .send({ columnMapping: MAP_A, itemsMode: 'packed' })
+        .expect(200);
+
+      const other = await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', 'key-delta')
+        .send({
+          columnMapping: { date: 'Whenever', items: 'Whatever', total: 'Whatever' },
+          itemsMode: 'packed',
+        });
+
+      expect(other.status).toBe(409);
+      expect(other.body.code).not.toBe('IDEMPOTENCY_KEY_REUSED');
+    });
+
+    it('records the key a remap was sent with, instead of discarding it', async () => {
+      const stage = await stageGeneric('idem-d.csv');
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', 'key-eps')
+        .send({ columnMapping: MAP_A, itemsMode: 'packed' })
+        .expect(200);
+
+      await request
+        .patch(`/api/uploads/${stage.body.uploadId}/mapping`)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', 'key-remap')
+        .send({ columnMapping: MAP_A, itemsMode: 'packed' })
+        .expect(200);
+
+      const after = await Upload.findById(stage.body.uploadId).lean();
+      expect(after.confirmation.idempotencyKeyHash).toBeTruthy();
+    });
+  });
+
   describe('Forecast invalidation', () => {
     it('preserves historical forecasts and refreshes planning forecasts on successful confirm', async () => {
       const Forecast = require('../../src/models/Forecast.model');
