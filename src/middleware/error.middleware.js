@@ -27,11 +27,25 @@ const errorMiddleware = (err, req, res, next) => {
       path: req.path,
       statusCode,
       message: err.message || message,
+      // Set by asUpstreamAiError: the client keeps the friendly 503 while the
+      // log keeps the provider's reason (e.g. a rejected API key).
+      ...(err.upstreamStatus != null ? { upstreamStatus: err.upstreamStatus } : {}),
+      ...(err.upstreamMessage
+        ? { upstreamMessage: String(err.upstreamMessage).slice(0, 200) }
+        : {}),
       stack: err.stack,
     }));
   }
 
-  if (statusCode >= 500 && process.env.NODE_ENV === 'production') {
+  // A 5xx message is redacted in production because it is usually a stack-level
+  // detail — a connection string, a provider body — that must never reach a
+  // browser. The exception is a message the product wrote deliberately FOR the
+  // customer: asUpstreamAiError explains that the AI provider is down and that
+  // no credits were charged. Redacting that to "Internal Server Error" left a
+  // cafe owner with no idea what had happened and a reasonable fear they had
+  // just paid for nothing. `exposeMessage` is opt-in, is set only on fixed
+  // product-authored strings, and never on a raw thrown error.
+  if (statusCode >= 500 && process.env.NODE_ENV === 'production' && !err.exposeMessage) {
     message = 'Internal Server Error';
   }
 

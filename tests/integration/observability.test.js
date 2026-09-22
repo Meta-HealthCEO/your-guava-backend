@@ -40,6 +40,35 @@ describe('Observability', () => {
     );
   });
 
+  it('logs the mounted request path without the query string', async () => {
+    // Request logs are off under NODE_ENV=test; flip it for one request so the
+    // logger runs, then read the structured line it wrote.
+    const previousNodeEnv = process.env.NODE_ENV;
+    const infoSpy = jest.spyOn(console, 'info').mockImplementation(() => {});
+    process.env.NODE_ENV = 'production';
+    let entries;
+    try {
+      await request.get('/api/auth/me').query({ token: 'should-not-be-logged' });
+      await new Promise((resolve) => setImmediate(resolve));
+      entries = infoSpy.mock.calls
+        .map(([line]) => {
+          try {
+            return JSON.parse(line);
+          } catch {
+            return null;
+          }
+        })
+        .filter((entry) => entry && entry.event === 'http_request');
+    } finally {
+      process.env.NODE_ENV = previousNodeEnv;
+      infoSpy.mockRestore();
+    }
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ method: 'GET', path: '/api/auth/me', statusCode: 401 });
+    expect(JSON.stringify(entries[0])).not.toContain('should-not-be-logged');
+  });
+
   it('returns JSON 404 responses with request IDs for unknown API routes', async () => {
     const requestId = 'unknown-route-req-001';
 

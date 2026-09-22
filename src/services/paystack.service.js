@@ -16,6 +16,7 @@ const axios = require('axios');
  */
 
 const PAYSTACK_API_URL = 'https://api.paystack.co';
+const OFFICIAL_PAYSTACK_HOST = 'api.paystack.co';
 const CHECKOUT_ORIGIN = 'https://checkout.paystack.com';
 const REQUEST_TIMEOUT_MS = 20_000;
 
@@ -37,7 +38,35 @@ const assertConfigured = () => {
   throw err;
 };
 
-const baseUrl = () => (process.env.PAYSTACK_API_URL || PAYSTACK_API_URL).replace(/\/$/, '');
+/**
+ * The API origin every authenticated request is built on.
+ *
+ * validateEnv refuses a non-official PAYSTACK_API_URL at boot; this is the
+ * second line for a value that is changed afterwards. The secret key rides on
+ * every one of these calls, so an override is only honoured where it cannot
+ * hand a live key to another host: never with embedded credentials, and never
+ * off the official origin in production. Mirrors onegate.service cleanBaseUrl.
+ */
+const baseUrl = () => {
+  const configured = (process.env.PAYSTACK_API_URL || '').trim();
+  if (!configured) return PAYSTACK_API_URL;
+
+  let url;
+  try {
+    url = new URL(configured);
+  } catch (_error) {
+    throw new Error('PAYSTACK_API_URL must be a valid URL');
+  }
+  if (url.username || url.password) {
+    throw new Error('PAYSTACK_API_URL must not contain credentials');
+  }
+  if (process.env.NODE_ENV === 'production') {
+    if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== OFFICIAL_PAYSTACK_HOST) {
+      throw new Error('PAYSTACK_API_URL must be the official Paystack API host in production');
+    }
+  }
+  return configured.replace(/\/$/, '');
+};
 
 const clientBaseUrl = () => (process.env.CLIENT_URL || 'http://localhost:5173').replace(/\/$/, '');
 

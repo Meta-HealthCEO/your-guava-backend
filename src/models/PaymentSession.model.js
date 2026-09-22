@@ -51,7 +51,11 @@ const paymentSessionSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['pending', 'processing', 'paid', 'failed', 'cancelled'],
+      // `needs_attention` is a captured payment that repeatedly could not be
+      // applied. It is terminal on purpose: retrying forever hides money that
+      // was taken with nothing delivered, so the session stops rotating through
+      // the sweeper and waits for a person instead.
+      enum: ['pending', 'processing', 'paid', 'failed', 'cancelled', 'needs_attention'],
       default: 'pending',
       index: true,
     },
@@ -115,6 +119,14 @@ const paymentSessionSchema = new mongoose.Schema(
     fulfillmentAttempts: {
       type: Number,
       default: 0,
+    },
+    // Counts only the attempts where the provider confirmed a capture and
+    // applying it still failed. Kept apart from fulfillmentAttempts, which also
+    // counts the ordinary "customer has not paid yet" verifications.
+    fulfillmentFailures: {
+      type: Number,
+      default: 0,
+      min: 0,
     },
   },
   { timestamps: true }

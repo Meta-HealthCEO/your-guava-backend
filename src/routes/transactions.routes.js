@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const authMiddleware = require('../middleware/auth.middleware');
+const { uploadLimiter } = require('../middleware/rateLimit.middleware');
 const { apiCache } = require('../middleware/cache.middleware');
 const r2 = require('../services/r2.service');
 const {
@@ -76,7 +77,15 @@ const handleMulterUpload = (req, res, next) => {
 // All routes are protected
 router.use(authMiddleware);
 
-router.post('/upload', handleMulterUpload, upload);
+// Uploads get their own budget, ahead of multer so a limited request never
+// touches disk. Deliberately NOT the AI limiter: a Yoco export or a cafe with a
+// saved mapping never calls Claude, so charging every upload against the AI
+// budget stopped an owner importing a backlog and blamed "AI requests" for it.
+// The AI mapper is bounded where it is actually used, by the daily-credit and
+// concurrency policy in aiUsage.service, and it costs credits.
+// requireCreditSpend is deliberately absent: members without credit permission
+// must still upload preset formats (allowPaidAi=false falls back to a free mapping).
+router.post('/upload', uploadLimiter, handleMulterUpload, upload);
 router.get('/status', getDataStatus);
 router.get('/stats', apiCache({ ttlMs: 30000, keyPrefix: 'transaction-stats' }), getStats);
 router.get('/', getTransactions);

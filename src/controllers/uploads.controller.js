@@ -269,8 +269,20 @@ const touchParsingLease = async (uploadId, cafeId, expectedUpdatedAt) => {
   return touched;
 };
 
-const duplicateFilterForRow = (cafeId, row, sourceFingerprint) => {
-  if (row.receiptId) return { cafeId, receiptId: row.receiptId };
+/**
+ * Identity a remapped row would be stored under. A receipt number is only
+ * unique within a cafe-local trading day (plenty of tills restart numbering
+ * each morning), so it is paired with the day exactly as the write path and
+ * the unique index do; keyed on the number alone, a reused "#0001" on another
+ * day was refused as a duplicate.
+ */
+const duplicateIdentityForRow = (row, sourceFingerprint, timezone) => {
+  if (row.receiptId) {
+    return {
+      receiptId: row.receiptId,
+      dayKey: row.dateKey || parser.zonedDateKey(row.date, timezone),
+    };
+  }
 
   const dedupKey = computeDedupKey({
     date: row.date.toISOString().slice(0, 10),
@@ -280,10 +292,12 @@ const duplicateFilterForRow = (cafeId, row, sourceFingerprint) => {
     sourceFingerprint,
     sourceRowNumbers: row.__sourceRowNumbers,
   });
-  return { cafeId, dedupKey };
+  return { dedupKey };
 };
 
-const assertRemapHasImportableRows = async (parsed, cafeId, uploadId, sourceFingerprint) => {
+const receiptIdentityKey = (receiptId, dayKey) => `receiptId:${receiptId}|${dayKey}`;
+
+const assertRemapHasImportableRows = async (parsed, cafeId, uploadId, sourceFingerprint, timezone) => {
   const approvedRows = parsed.rows.filter((row) => (row.status || 'approved').toLowerCase() === 'approved');
   if (approvedRows.length === 0) {
     const err = new Error('No approved transaction rows could be imported with this mapping');
@@ -291,7 +305,7 @@ const assertRemapHasImportableRows = async (parsed, cafeId, uploadId, sourceFing
     throw err;
   }
 
-  const identities = approvedRows.map((row) => duplicateFilterForRow(cafeId, row, sourceFingerprint));
+  const identities = approvedRows.map((row) => duplicateIdentityForRow(row, sourceFingerprint, timezone));
   const receiptIds = [...new Set(identities.map((identity) => identity.receiptId).filter(Boolean))];
   const dedupKeys = [...new Set(identities.map((identity) => identity.dedupKey).filter(Boolean))];
   const existingIdentities = new Set();
@@ -309,15 +323,21 @@ const assertRemapHasImportableRows = async (parsed, cafeId, uploadId, sourceFing
       cafeId,
       uploadId: { $ne: uploadId },
       ...identityQuery,
-    }).select('receiptId dedupKey').lean();
+    }).select('receiptId dedupKey date').lean();
     for (const existing of existingRows) {
-      if (existing.receiptId) existingIdentities.add(`receiptId:${existing.receiptId}`);
+      // Stored rows keep only the instant; the trading day is recomputed in
+      // the cafe's timezone, as the write path does.
+      if (existing.receiptId) {
+        existingIdentities.add(
+          receiptIdentityKey(existing.receiptId, parser.zonedDateKey(existing.date, timezone))
+        );
+      }
       if (existing.dedupKey) existingIdentities.add(`dedupKey:${existing.dedupKey}`);
     }
   }
   const duplicateRows = identities.filter((identity) => (
     identity.receiptId
-      ? existingIdentities.has(`receiptId:${identity.receiptId}`)
+      ? existingIdentities.has(receiptIdentityKey(identity.receiptId, identity.dayKey))
       : existingIdentities.has(`dedupKey:${identity.dedupKey}`)
   )).length;
 
@@ -1131,7 +1151,8 @@ const remap = async (req, res, next) => {
         parsed,
         cafeId,
         upload._id,
-        upload.fileFingerprint || sha256(upload.r2Key)
+        upload.fileFingerprint || sha256(upload.r2Key),
+        timezone
       );
 
       // 2. Parse succeeded — now safe to delete existing transactions

@@ -63,6 +63,80 @@ const buildStoredZip = (entries) => {
 };
 
 describe('parser.service', () => {
+  describe('refund and void lines', () => {
+    // A till exports a refund as a negative line. The quantity regex matched digits
+    // only, so the minus was stepped over and "-1 x Flat White" was read as a SALE of
+    // one. Demand then moved two units the wrong way per refund, and the stored row
+    // disagreed with itself: total -38 against quantity +1.
+    const { parsePackedItems } = require('../../src/services/parser.service');
+
+    it('reads a negative packed line as a refund, not a sale', () => {
+      expect(parsePackedItems('-1 x Flat White (Blend)')).toEqual([
+        { name: 'Flat White (Blend)', quantity: -1 },
+      ]);
+    });
+
+    it('reads a fractional refund', () => {
+      expect(parsePackedItems('-0.35 x Cheese Wheel')).toEqual([
+        { name: 'Cheese Wheel', quantity: -0.35 },
+      ]);
+    });
+
+    it('keeps sales and refunds apart in one receipt', () => {
+      expect(parsePackedItems('2 x Flat White,-1 x Muffin')).toEqual([
+        { name: 'Flat White', quantity: 2 },
+        { name: 'Muffin', quantity: -1 },
+      ]);
+    });
+
+    it('still rejects a zero quantity', () => {
+      expect(parsePackedItems('0 x Flat White')).toEqual([]);
+    });
+
+    it('does not treat a hyphen inside a name as a sign', () => {
+      expect(parsePackedItems('1 x Coca-Cola')).toEqual([{ name: 'Coca-Cola', quantity: 1 }]);
+    });
+
+    it('nets a refund against a sale in the same file', async () => {
+      const csv = [
+        'Receipt,Date,Items,Total',
+        'R1,2026/03/02,"3 x Flat White",114.00',
+        'R2,2026/03/02,"-1 x Flat White",-38.00',
+      ].join('\n');
+      const result = await parseBuffer(Buffer.from(csv), {
+        columnMapping: { receiptId: 'Receipt', date: 'Date', items: 'Items', total: 'Total' },
+        itemsMode: 'packed',
+      });
+      const net = result.rows.flatMap((r) => r.items).reduce((sum, i) => sum + i.quantity, 0);
+      expect(net).toBe(2);
+    });
+
+    it('prices a refund receipt as derived, never as a menu-price observation', async () => {
+      const csv = 'Receipt,Date,Items,Total\nR1,2026/03/02,"-1 x Flat White",-38.00';
+      const result = await parseBuffer(Buffer.from(csv), {
+        columnMapping: { receiptId: 'Receipt', date: 'Date', items: 'Items', total: 'Total' },
+        itemsMode: 'packed',
+      });
+      expect(result.rows[0].items[0]).toMatchObject({ quantity: -1, priceSource: 'derived' });
+      // The unit price stays the positive menu price; only the quantity carries the sign.
+      expect(result.rows[0].items[0].unitPrice).toBe(38);
+    });
+
+    it('keeps a voided receipt as two lines that net to zero', async () => {
+      // Before the fix the separator lookahead did not allow a sign, so the whole
+      // string collapsed into ONE item literally named "Flat White,-1 x Flat White".
+      const csv = 'Receipt,Date,Items,Total\nR1,2026/03/02,"1 x Flat White,-1 x Flat White",0.00';
+      const result = await parseBuffer(Buffer.from(csv), {
+        columnMapping: { receiptId: 'Receipt', date: 'Date', items: 'Items', total: 'Total' },
+        itemsMode: 'packed',
+      });
+      expect(result.rows[0].items).toEqual([
+        { name: 'Flat White', quantity: 1, unitPrice: 0, priceSource: 'derived' },
+        { name: 'Flat White', quantity: -1, unitPrice: 0, priceSource: 'derived' },
+      ]);
+    });
+  });
+
   describe('packed itemsMode', () => {
     const mapping = {
       receiptId: 'Txn Number',
@@ -149,7 +223,7 @@ describe('parser.service', () => {
 
       expect(result.rows).toHaveLength(1);
       expect(result.rows[0].items).toEqual([
-        { name: 'Flat White', quantity: 1, unitPrice: 35 },
+        { name: 'Flat White', quantity: 1, unitPrice: 35, priceSource: 'exact' },
       ]);
     });
 
@@ -170,10 +244,64 @@ describe('parser.service', () => {
 
       const receipt = result.rows.find((row) => row.receiptId === '2026/01/000005');
       expect(receipt.total).toBe(159);
+      // A packed receipt carries one total for the whole basket, so a
+      // multi-item receipt can only yield a basket average per line. That
+      // keeps per-item revenue summing to the receipt, but it is not a price:
+      // it is flagged as derived so nothing downstream learns it as one.
       expect(receipt.items).toEqual([
-        { name: 'Brownie', quantity: 3, unitPrice: 39.75 },
-        { name: 'Espresso (Blend)', quantity: 1, unitPrice: 39.75 },
+        { name: 'Brownie', quantity: 3, unitPrice: 39.75, priceSource: 'derived' },
+        { name: 'Espresso (Blend)', quantity: 1, unitPrice: 39.75, priceSource: 'derived' },
       ]);
+    });
+
+    it('marks a single-item packed receipt as an exact unit price', async () => {
+      const yocoMapping = {
+        receiptId: 'Receipt',
+        date: 'Date',
+        time: 'Time',
+        items: 'Items',
+        total: 'Total (incl. tax)',
+      };
+      const buf = fixture('test-transactions.csv');
+      const result = await parseBuffer(buf, { columnMapping: yocoMapping, itemsMode: 'packed' });
+
+      const receipt = result.rows.find((row) => row.receiptId === '2026/01/000001');
+      // The Tip column is not mapped here, so the parser cannot know this row's
+      // R48 includes a R5 tip and treats it as exact. With the tip mapped it is
+      // derived -- see the tipped-receipt cases below.
+      expect(receipt.items).toEqual([
+        { name: 'Flat White (Blend)', quantity: 1, unitPrice: 48, priceSource: 'exact' },
+      ]);
+    });
+
+    describe('tipped or discounted receipts are not exact price observations', () => {
+      const header = 'Receipt,Date,Time,Items,Total,Tip,Discount';
+      const mapping = {
+        receiptId: 'Receipt',
+        date: 'Date',
+        time: 'Time',
+        items: 'Items',
+        total: 'Total',
+        tip: 'Tip',
+        discount: 'Discount',
+      };
+      const parse = (line) =>
+        parseBuffer(Buffer.from(`${header}\n${line}\n`), { columnMapping: mapping, itemsMode: 'packed' });
+
+      it('keeps a clean single-item receipt exact', async () => {
+        const { rows } = await parse('R1,2026/03/02,09:00:00,1 x Flat White,38.0,0.0,0.0');
+        expect(rows[0].items[0]).toMatchObject({ unitPrice: 38, priceSource: 'exact' });
+      });
+
+      it('marks a tipped single-item receipt derived', async () => {
+        const { rows } = await parse('R2,2026/03/02,09:05:00,1 x Flat White,43.0,5.0,0.0');
+        expect(rows[0].items[0]).toMatchObject({ unitPrice: 43, priceSource: 'derived' });
+      });
+
+      it('marks a discounted single-item receipt derived', async () => {
+        const { rows } = await parse('R3,2026/03/02,09:10:00,2 x Flat White,66.0,0.0,10.0');
+        expect(rows[0].items[0]).toMatchObject({ unitPrice: 33, priceSource: 'derived' });
+      });
     });
 
     it('treats empty item descriptions as parse errors', async () => {
@@ -224,9 +352,11 @@ describe('parser.service', () => {
 
       expect(result.rows).toHaveLength(2);
       const r100 = result.rows.find((r) => r.receiptId === 'R100');
+      // Both rows repeat the receipt total, so the per-line price can only be
+      // a basket average and is flagged as derived.
       expect(r100.items).toEqual([
-        { name: 'Flat White', quantity: 2, unitPrice: 25 },
-        { name: 'Muffin', quantity: 1, unitPrice: 25 },
+        { name: 'Flat White', quantity: 2, unitPrice: 25, priceSource: 'derived' },
+        { name: 'Muffin', quantity: 1, unitPrice: 25, priceSource: 'derived' },
       ]);
       expect(r100.total).toBe(75);
     });
@@ -298,8 +428,8 @@ describe('parser.service', () => {
       expect(result.rows).toHaveLength(1);
       expect(result.rows[0].total).toBe(75);
       expect(result.rows[0].items).toEqual([
-        { name: 'Flat White', quantity: 2, unitPrice: 25 },
-        { name: 'Muffin', quantity: 1, unitPrice: 25 },
+        { name: 'Flat White', quantity: 2, unitPrice: 25, priceSource: 'exact' },
+        { name: 'Muffin', quantity: 1, unitPrice: 25, priceSource: 'exact' },
       ]);
     });
 
@@ -326,8 +456,8 @@ describe('parser.service', () => {
       expect(result.rows).toHaveLength(1);
       expect(result.rows[0].total).toBe(95);
       expect(result.rows[0].items).toEqual([
-        { name: 'Flat White', quantity: 2, unitPrice: 35 },
-        { name: 'Muffin', quantity: 1, unitPrice: 25 },
+        { name: 'Flat White', quantity: 2, unitPrice: 35, priceSource: 'exact' },
+        { name: 'Muffin', quantity: 1, unitPrice: 25, priceSource: 'exact' },
       ]);
     });
 
@@ -443,13 +573,18 @@ describe('parser.service', () => {
       ]);
     });
 
-    it('rejects conflicting receipt totals instead of guessing that they are line amounts', async () => {
-      const csv = [
-        'Receipt,Date,Time,Item,Qty,Total',
-        'R-conflict,2026-04-01,08:30,Flat White,1,35.00',
-        'R-conflict,2026-04-01,08:30,Muffin,1,25.00',
-      ].join('\n');
-      const result = await parseBuffer(Buffer.from(csv), {
+    it('still rejects a receipt whose rows disagree on the total when the file repeats receipt totals', async () => {
+      // Ten receipts repeat their total on every row, so the file reads in
+      // receipt-total mode; the one receipt whose rows disagree cannot be a
+      // pair of line amounts and is refused rather than guessed at.
+      const lines = ['Receipt,Date,Time,Item,Qty,Total'];
+      for (let index = 0; index < 10; index += 1) {
+        lines.push(`R-ok-${index},2026-04-01,08:30,Flat White,1,60.00`);
+        lines.push(`R-ok-${index},2026-04-01,08:30,Muffin,1,60.00`);
+      }
+      lines.push('R-conflict,2026-04-01,08:30,Flat White,1,35.00');
+      lines.push('R-conflict,2026-04-01,08:30,Muffin,1,25.00');
+      const result = await parseBuffer(Buffer.from(lines.join('\n')), {
         columnMapping: {
           receiptId: 'Receipt',
           date: 'Date',
@@ -461,7 +596,8 @@ describe('parser.service', () => {
         itemsMode: 'line-per-row',
       });
 
-      expect(result.rows).toHaveLength(0);
+      expect(result.rows).toHaveLength(10);
+      expect(result.rows.every((row) => row.total === 60)).toBe(true);
       expect(result.rowErrors).toEqual(expect.arrayContaining([
         expect.objectContaining({ reason: expect.stringMatching(/conflicting receipt totals/i) }),
       ]));
@@ -844,5 +980,478 @@ describe('fractional quantities survive validation', () => {
     const csv = 'Receipt,Date,Items,Total\nF4,2026-04-01,10001 x Foo,10';
     const result = await parseBuffer(Buffer.from(csv), { columnMapping: mapping, itemsMode: 'packed' });
     expect(result.rowErrors[0].reason).toMatch(/quantity exceeds/i);
+  });
+});
+
+describe('packed unit price provenance', () => {
+  const mapping = { receiptId: 'Receipt', date: 'Date', items: 'Items', total: 'Total' };
+  const parse = (line) => parseBuffer(
+    Buffer.from(`Receipt,Date,Items,Total\n${line}`),
+    { columnMapping: mapping, itemsMode: 'packed' }
+  );
+
+  // A packed row carries one total for the basket. Stamping total / quantity
+  // on every line made a Flat White and a Coca Cola on one receipt both cost
+  // 33.33, and the menu learned those averages as expected prices: nearly
+  // every item then showed a false "price differs" warning.
+  it('flags the basket average of a multi-item receipt as derived', async () => {
+    const result = await parse('P1,2026-04-01,"2 x Flat White,1 x Coca Cola 330ml",100.00');
+
+    expect(result.rows[0].items).toEqual([
+      { name: 'Flat White', quantity: 2, unitPrice: 33.33, priceSource: 'derived' },
+      { name: 'Coca Cola 330ml', quantity: 1, unitPrice: 33.33, priceSource: 'derived' },
+    ]);
+    const revenue = result.rows[0].items.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0);
+    expect(revenue).toBeCloseTo(100, 1);
+  });
+
+  it('divides a single-item receipt total by its quantity as an exact price', async () => {
+    const result = await parse('P2,2026-04-01,3 x Flat White,114.00');
+
+    expect(result.rows[0].items).toEqual([
+      { name: 'Flat White', quantity: 3, unitPrice: 38, priceSource: 'exact' },
+    ]);
+  });
+
+  it('treats a receipt that repeats one item name as a single-item receipt', async () => {
+    const result = await parse('P3,2026-04-01,"1 x Flat White,1 x Flat White",76.00');
+
+    expect(result.rows[0].items).toEqual([
+      { name: 'Flat White', quantity: 1, unitPrice: 38, priceSource: 'exact' },
+      { name: 'Flat White', quantity: 1, unitPrice: 38, priceSource: 'exact' },
+    ]);
+  });
+});
+
+describe('line-per-row totals mode is inferred from the data', () => {
+  const { groupLinePerRow } = require('../../src/services/parser.service');
+  const base = { receiptId: 'Receipt', date: 'Date', time: 'Time', items: 'Item', quantity: 'Qty' };
+  const parseWith = (totalHeader, lines) => parseBuffer(
+    Buffer.from([`Receipt,Date,Time,Item,Qty,${totalHeader}`, ...lines].join('\n')),
+    { columnMapping: { ...base, total: totalHeader }, itemsMode: 'line-per-row' }
+  );
+
+  // Receipts whose two rows both carry the receipt total (60, 61, 62, ...).
+  const repeatedTotalReceipts = (count) => Array.from({ length: count }, (_, index) => [
+    `R${index},2026-04-01,08:30,Flat White,2,${(60 + index).toFixed(2)}`,
+    `R${index},2026-04-01,08:30,Muffin,1,${(60 + index).toFixed(2)}`,
+  ]).flat();
+  // Receipts whose rows carry genuine line amounts (70 + 25, 70 + 26, ...).
+  const lineAmountReceipts = (count) => Array.from({ length: count }, (_, index) => [
+    `L${index},2026-04-01,09:00,Flat White,2,70.00`,
+    `L${index},2026-04-01,09:00,Muffin,1,${(25 + index).toFixed(2)}`,
+  ]).flat();
+
+  // Whether row totals were summed used to be decided by the mapped column's
+  // NAME: anything containing "line" or "item" was summed. A till that repeats
+  // the order total on every line under "Item Total" had every receipt
+  // multiplied by its line count, and revenue inflated silently.
+  it('does not sum an order total repeated per line just because the header says "Item Total"', async () => {
+    const result = await parseWith('Item Total', repeatedTotalReceipts(5));
+
+    expect(result.rowErrors).toEqual([]);
+    expect(result.rows.map((row) => row.total)).toEqual([60, 61, 62, 63, 64]);
+  });
+
+  it('sums genuine line amounts even when the header is just "Total"', async () => {
+    const result = await parseWith('Total', lineAmountReceipts(5));
+
+    expect(result.rowErrors).toEqual([]);
+    expect(result.rows.map((row) => row.total)).toEqual([95, 96, 97, 98, 99]);
+    expect(result.rows[0].items).toEqual([
+      { name: 'Flat White', quantity: 2, unitPrice: 35, priceSource: 'exact' },
+      { name: 'Muffin', quantity: 1, unitPrice: 25, priceSource: 'exact' },
+    ]);
+  });
+
+  it('keeps the header reading for a lone receipt whose line amounts happen to match', async () => {
+    // One receipt is no evidence: two items at the same price is an everyday
+    // coincidence, and reading it as a repeated receipt total would halve the
+    // sale and mark two exact line prices as derived.
+    const result = await parseWith('Line Total', [
+      'R1,2026-04-01,08:30,Flat White,1,35.00',
+      'R1,2026-04-01,08:30,Cappuccino,1,35.00',
+    ]);
+
+    expect(result.rowErrors).toEqual([]);
+    expect(result.rows[0].total).toBe(70);
+    expect(result.rows[0].items.map((item) => item.priceSource)).toEqual(['exact', 'exact']);
+  });
+
+  it('falls back to the header heuristic when no receipt has more than one row', () => {
+    const rowsUnder = (header) => [
+      { Receipt: 'S1', Date: '2026-04-01', Time: '08:30', Item: 'Flat White', Qty: '1', [header]: '35.00' },
+      { Receipt: 'S2', Date: '2026-04-01', Time: '09:00', Item: 'Muffin', Qty: '1', [header]: '25.00' },
+    ];
+
+    const plain = groupLinePerRow(rowsUnder('Total'), { ...base, total: 'Total' }, 'Africa/Johannesburg');
+    const line = groupLinePerRow(rowsUnder('Line Total'), { ...base, total: 'Line Total' }, 'Africa/Johannesburg');
+
+    expect(plain.rows).toHaveLength(2);
+    expect(plain.totalsAreLineAmounts).toBe(false);
+    expect(line.rows).toHaveLength(2);
+    expect(line.totalsAreLineAmounts).toBe(true);
+  });
+
+  it('falls back to the header heuristic when the data is ambiguous', async () => {
+    // Half the multi-row receipts repeat a total, half differ: neither
+    // reading reaches consensus, so the header decides as before.
+    const lines = [...repeatedTotalReceipts(3), ...lineAmountReceipts(3)];
+
+    const plain = await parseWith('Total', lines);
+    expect(plain.rows.map((row) => row.total)).toEqual([60, 61, 62]);
+    expect(plain.rowErrors).toHaveLength(3);
+    expect(plain.rowErrors.every((error) => /conflicting receipt totals/i.test(error.reason))).toBe(true);
+
+    const line = await parseWith('Line Total', lines);
+    expect(line.rowErrors).toEqual([]);
+    expect(line.rows.map((row) => row.total)).toEqual([120, 122, 124, 95, 96, 97]);
+  });
+});
+
+describe('optional tip and discount columns', () => {
+  const header = 'Receipt,Date,Time,Items,Total,Tip,Discount';
+  const mapping = {
+    receiptId: 'Receipt', date: 'Date', time: 'Time',
+    items: 'Items', total: 'Total', tip: 'Tip', discount: 'Discount',
+  };
+  const parse = (line) =>
+    parseBuffer(Buffer.from(`${header}\n${line}\n`), { columnMapping: mapping, itemsMode: 'packed' });
+
+  // Tills leave Tip and Discount empty on a cash sale rather than writing 0.0.
+  // A blank cell was read as an unparseable amount and the whole row was
+  // discarded -- so a till with that habit lost every cash transaction, and was
+  // told its amount had exceeded ten million.
+  it('reads a blank tip or discount as no tip, not as an unreadable amount', async () => {
+    const result = await parse('R1,2026-09-01,09:00,1 x Latte,35.00,,');
+
+    expect(result.rowErrors).toEqual([]);
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toMatchObject({ total: 35, tip: 0, discount: 0 });
+  });
+
+  it('still rejects a tip cell that genuinely cannot be read, and names it', async () => {
+    const result = await parse('R2,2026-09-01,09:00,1 x Latte,35.00,abc,0.0');
+
+    expect(result.rows).toHaveLength(0);
+    expect(result.rowErrors[0]).toMatchObject({ rowNumber: 2, reason: 'Tip is not a valid amount' });
+  });
+
+  it('names the discount when it is the column that exceeds the amount limit', async () => {
+    const result = await parse('R3,2026-09-01,09:00,1 x Latte,35.00,0.0,10000001');
+
+    expect(result.rows).toHaveLength(0);
+    expect(result.rowErrors[0].reason).toMatch(/^Discount exceeds the \d+ amount limit$/);
+  });
+
+  it('reads a blank tip in line-per-row mode too', async () => {
+    const csv = [
+      'Receipt,Date,Time,Item,Qty,Total,Tip,Discount',
+      'R4,2026-09-01,09:00,Latte,1,35.00,,',
+    ].join('\n');
+    const result = await parseBuffer(Buffer.from(csv), {
+      columnMapping: {
+        receiptId: 'Receipt', date: 'Date', time: 'Time',
+        items: 'Item', quantity: 'Qty', total: 'Total', tip: 'Tip', discount: 'Discount',
+      },
+      itemsMode: 'line-per-row',
+    });
+
+    expect(result.rowErrors).toEqual([]);
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toMatchObject({ tip: 0, discount: 0 });
+  });
+});
+
+describe('two-digit years are day-first, like every other date on an SA till', () => {
+  const mapping = { date: 'Date', items: 'Items', total: 'Total' };
+  const parse = (date) =>
+    parseBuffer(Buffer.from(`Date,Items,Total\n${date},1 x Latte,35.00\n`), {
+      columnMapping: mapping, itemsMode: 'packed', timezone: 'Africa/Johannesburg',
+    });
+
+  // Nothing matched a two-digit year, so the cell fell through to V8's
+  // month-first reading: 03/09/26 landed on 9 March instead of 3 September, and
+  // 13/09/26 was rejected outright. Days 1-12 moved month silently; days 13-31
+  // vanished.
+  it('reads 03/09/26 as 3 September, not 9 March', async () => {
+    const result = await parse('03/09/26');
+    expect(result.rows[0].dateKey).toBe('2026-09-03');
+  });
+
+  it('accepts a day above 12 instead of discarding the row', async () => {
+    const result = await parse('13/09/26');
+    expect(result.rowErrors).toEqual([]);
+    expect(result.rows[0].dateKey).toBe('2026-09-13');
+  });
+
+  it('accepts dot separators, which SA tills also print', async () => {
+    expect((await parse('26.09.2026')).rows[0].dateKey).toBe('2026-09-26');
+    expect((await parse('26.09.26')).rows[0].dateKey).toBe('2026-09-26');
+  });
+
+  it('puts 70-99 in the 1900s and 00-69 in the 2000s', async () => {
+    // Pins the pivot from both sides: a 1998 export is history the row bounds
+    // refuse, and a 2069 one has not happened yet.
+    expect((await parse('03/09/98')).rowErrors[0].reason).toMatch(/before 2000/i);
+    expect((await parse('03/09/69')).rowErrors[0].reason).toMatch(/in the future/i);
+  });
+});
+
+describe('a date cell carrying its own time is read in the cafe timezone', () => {
+  const mapping = { date: 'Date', items: 'Items', total: 'Total' };
+  const parseIn = (cell, timezone) =>
+    parseBuffer(Buffer.from(`Date,Items,Total\n"${cell}",1 x Latte,35.00\n`), {
+      columnMapping: mapping, itemsMode: 'packed', timezone,
+    });
+
+  // A combined cell reached `new Date`, which resolves a naive local string in
+  // the NODE process timezone and not the cafe's, and applyTimeParts then only
+  // re-read the resulting instant. On a UTC host every sale after 22:00 SAST
+  // was stamped with the next trading day and every hour shifted by two. The
+  // two zones below make that visible on any host: before the fix both gave the
+  // same instant, because both were really the process timezone.
+  it.each([
+    ['2026-09-03 23:30'],
+    ['2026-09-03T23:30:00'],
+  ])('resolves %s against the cafe zone, not the host zone', async (cell) => {
+    const za = await parseIn(cell, 'Africa/Johannesburg');
+    const nz = await parseIn(cell, 'Pacific/Auckland');
+
+    expect(za.rows[0].date.toISOString()).toBe('2026-09-03T21:30:00.000Z');
+    expect(za.rows[0]).toMatchObject({ dateKey: '2026-09-03', hour: 23 });
+    expect(nz.rows[0].date.toISOString()).toBe('2026-09-03T11:30:00.000Z');
+    expect(nz.rows[0]).toMatchObject({ dateKey: '2026-09-03', hour: 23 });
+  });
+
+  it('reads a day-first combined cell day-first', async () => {
+    const result = await parseIn('03/09/2026 14:30', 'Africa/Johannesburg');
+    expect(result.rows[0].date.toISOString()).toBe('2026-09-03T12:30:00.000Z');
+    expect(result.rows[0]).toMatchObject({ dateKey: '2026-09-03', hour: 14 });
+  });
+
+  it('leaves a timestamp that carries its own offset alone', async () => {
+    // An explicit Z is already unambiguous: 23:30 UTC really is 01:30 the next
+    // morning in Johannesburg, and re-reading it as wall-clock would move it.
+    const result = await parseIn('2026-09-03T23:30:00Z', 'Africa/Johannesburg');
+    expect(result.rows[0].date.toISOString()).toBe('2026-09-03T23:30:00.000Z');
+    expect(result.rows[0]).toMatchObject({ dateKey: '2026-09-04', hour: 1 });
+  });
+
+  it('still lets a mapped Time column win over a time inside the date cell', async () => {
+    const result = await parseBuffer(
+      Buffer.from('Date,Time,Items,Total\n"2026-09-03 23:30",08:15,1 x Latte,35.00\n'),
+      {
+        columnMapping: { date: 'Date', time: 'Time', items: 'Items', total: 'Total' },
+        itemsMode: 'packed',
+        timezone: 'Africa/Johannesburg',
+      }
+    );
+    expect(result.rows[0].hour).toBe(8);
+  });
+});
+
+describe('packed item strings a till actually prints', () => {
+  const { parsePackedItems } = require('../../src/services/parser.service');
+
+  // A till that separates basket lines with newlines inside a quoted cell only
+  // ever had its LAST line read: the pattern's `.` cannot cross a newline and
+  // its `$` is end-of-string. One item vanished from demand history with no
+  // error, and the survivor absorbed the whole basket total as an "exact" price.
+  it('splits basket lines separated by newlines', () => {
+    expect(parsePackedItems('1 x Flat White\n2 x Muffin')).toEqual([
+      { name: 'Flat White', quantity: 1 },
+      { name: 'Muffin', quantity: 2 },
+    ]);
+  });
+
+  // Plenty of tills print the multiplication sign rather than an ASCII x. The
+  // sign stayed glued to the name, so "Flat White" and "x Flat White" became
+  // two products and the history split in half.
+  it.each([['×'], ['x'], ['X']])('accepts %s as the multiplication marker', (marker) => {
+    expect(parsePackedItems(`2 ${marker} Flat White`)).toEqual([
+      { name: 'Flat White', quantity: 2 },
+    ]);
+  });
+
+  it('splits a cell that mixes the two markers', () => {
+    expect(parsePackedItems('2 x Flat White,1 × Muffin')).toEqual([
+      { name: 'Flat White', quantity: 2 },
+      { name: 'Muffin', quantity: 1 },
+    ]);
+  });
+
+  // South Africa writes one-and-a-half as 1,5. The quantity pattern took a dot
+  // only, so the engine stepped over "1," and read the fraction as a whole
+  // number: 1,5 kg of biltong was recorded as 5 units.
+  it('reads a comma-decimal quantity as a fraction', () => {
+    expect(parsePackedItems('1,5 x Biltong')).toEqual([{ name: 'Biltong', quantity: 1.5 }]);
+    expect(parsePackedItems('2 x Flat White,0,5 x Carrot Cake')).toEqual([
+      { name: 'Flat White', quantity: 2 },
+      { name: 'Carrot Cake', quantity: 0.5 },
+    ]);
+  });
+
+  // Real menu names start with numbers. With the marker optional, "500 Still
+  // Water" became 500 units of "Still Water" -- phantom demand for a product
+  // that no longer matched its own menu entry.
+  it.each([
+    ['330 Coke'],
+    ['500 Still Water'],
+    ['2 Minute Noodles'],
+    ['6 Pack Castle Lite'],
+  ])('treats %s as one product whose name begins with a number', (description) => {
+    expect(parsePackedItems(description)).toEqual([{ name: description, quantity: 1 }]);
+  });
+
+  it('drops a part that is only a number rather than inventing a product named "2"', () => {
+    expect(parsePackedItems('2')).toEqual([]);
+    expect(parsePackedItems('Latte,2')).toEqual([{ name: 'Latte', quantity: 1 }]);
+  });
+});
+
+describe('column and delimiter identification', () => {
+  const { detectCsvSeparator } = require('../../src/services/parser.service');
+
+  // "Text (Tab delimited)" is a standard Excel save-as and several tills use a
+  // .csv extension for it. Only ';' was ever weighed against ',', so the whole
+  // header row collapsed into one column and the mapping step was impossible.
+  it.each([
+    ['tab', 'a\tb\tc\n1\t2\t3', '\t'],
+    ['pipe', 'a|b|c\n1|2|3', '|'],
+    ['semicolon', 'a;b;c\n1;2;3', ';'],
+    ['comma', 'a,b,c\n1,2,3', ','],
+  ])('detects a %s-delimited export', (_label, content, expected) => {
+    expect(detectCsvSeparator(Buffer.from(content))).toBe(expected);
+  });
+
+  it('is not fooled by a comma inside one quoted cell of a semicolon file', () => {
+    expect(detectCsvSeparator(Buffer.from('a;b;c\n1;2;"R 1 234,56"'))).toBe(';');
+  });
+
+  // POS exports repeat column names -- "Amount" for gross and net, "Total" for
+  // the line and the receipt. Collapsed into one key the last column silently
+  // won, so the operator mapped a column they had never seen and the money came
+  // out wrong with no warning anywhere.
+  it('keeps a repeated column name addressable instead of letting the last one win', async () => {
+    const csv = 'Date,Items,Total,Total\n2026-09-03,1 x Foo,10,999\n';
+
+    const first = await parseBuffer(Buffer.from(csv), {
+      itemsMode: 'packed', columnMapping: { date: 'Date', items: 'Items', total: 'Total' },
+    });
+    const second = await parseBuffer(Buffer.from(csv), {
+      itemsMode: 'packed', columnMapping: { date: 'Date', items: 'Items', total: 'Total (2)' },
+    });
+
+    expect(first.rows[0].total).toBe(10);
+    expect(second.rows[0].total).toBe(999);
+  });
+});
+
+describe('one bad cell is a row problem, not a file problem', () => {
+  const mapping = { date: 'Date', items: 'Items', total: 'Total' };
+
+  // A single runaway cell -- a pasted note, an escaped-quote bug in the till's
+  // own export -- threw out of the parser and killed a 10,000-row import, with
+  // an error naming neither the row nor the column. The cell was not even in a
+  // mapped column.
+  it('keeps importing when an unmapped cell runs past the cell length limit', async () => {
+    const note = 'a'.repeat(10001);
+    const csv = `Date,Items,Total,Note\n2026-09-01,1 x Foo,10,"${note}"\n2026-09-02,1 x Bar,12,ok\n`;
+    const result = await parseBuffer(Buffer.from(csv), { columnMapping: mapping, itemsMode: 'packed' });
+
+    expect(result.rows).toHaveLength(2);
+    expect(result.errors).toBe(0);
+  });
+
+  // A numeric junk date reached `new Date('0')`, which V8 reads as the year
+  // 2000. That passed the minimum-year floor, widened the file's span to
+  // twenty-six years, and the whole upload was refused for a date range the
+  // operator's three-day file never had.
+  it('treats a bare number in the date column as a row error, not a date', async () => {
+    const csv = 'Date,Items,Total\n2026-09-01,1 x Foo,10\n2026-09-02,1 x Foo,10\n0,1 x Foo,10';
+    const result = await parseBuffer(Buffer.from(csv), { columnMapping: mapping, itemsMode: 'packed' });
+
+    expect(result.rows).toHaveLength(2);
+    expect(result.rowErrors).toEqual([
+      expect.objectContaining({ rowNumber: 4, reason: 'Could not parse date or time' }),
+    ]);
+  });
+
+  it('tells an owner with a legacy .xls export what to do about it', async () => {
+    await expect(parseBuffer(Buffer.from('Date,Items,Total\n2026-09-01,1 x Foo,10\n'), {
+      columnMapping: mapping, itemsMode: 'packed', fileExt: 'xls',
+    })).rejects.toThrow(/export as CSV or XLSX/i);
+  });
+});
+
+describe('signed money on accounting-style exports', () => {
+  const mapping = { date: 'Date', items: 'Items', total: 'Total' };
+  const totalOf = async (cell) => {
+    const result = await parseBuffer(
+      Buffer.from(`Date,Items,Total\n2026-09-01,1 x Foo,${JSON.stringify(cell)}\n`),
+      { columnMapping: mapping, itemsMode: 'packed' }
+    );
+    return result.rows[0]?.total;
+  };
+
+  // Every minus after the first character was stripped, so the trailing-minus
+  // convention lost its sign entirely, and the parenthesis test ran on the raw
+  // string so a currency symbol in front of it hid the brackets. Either way a
+  // refund was booked as revenue and the day's takings overstated by twice it.
+  it.each([
+    ['45.00-', -45],
+    ['R(150.00)', -150],
+    ['(150.00)', -150],
+    ['-45.00', -45],
+  ])('reads %s as %s', async (cell, expected) => {
+    expect(await totalOf(cell)).toBe(expected);
+  });
+
+  it('still reads South African comma decimals and spaced thousands', async () => {
+    expect(await totalOf('12,50')).toBe(12.5);
+    expect(await totalOf('R 1 234,56')).toBe(1234.56);
+    expect(await totalOf('R12.50')).toBe(12.5);
+    expect(await totalOf('1,234')).toBe(1234);
+  });
+});
+
+describe('a discarded receipt is counted in full', () => {
+  const { groupLinePerRow } = require('../../src/services/parser.service');
+  const mapping = {
+    receiptId: 'Receipt', date: 'Date', time: 'Time',
+    items: 'Item', quantity: 'Qty', total: 'Total',
+  };
+
+  // Invalidating a receipt threw away the rows already accepted into it while
+  // counting one error, so the summary under-reported the damage: the operator
+  // reconciled against the till report, found revenue missing, and the error
+  // list gave them no row number to look at.
+  it('counts every row it drops when a receipt contradicts itself', () => {
+    const result = groupLinePerRow([
+      { Receipt: 'R1', Date: '2026-09-01', Time: '08:00', Item: 'A', Qty: '1', Total: '10' },
+      { Receipt: 'R1', Date: '2026-09-01', Time: '08:00', Item: 'B', Qty: '1', Total: '10' },
+      { Receipt: 'R1', Date: '2026-09-01', Time: '09:00', Item: 'C', Qty: '1', Total: '10' },
+    ], mapping, 'Africa/Johannesburg');
+
+    expect(result.rows).toHaveLength(0);
+    expect(result.errors).toBe(3);
+    expect(result.rowErrors[0].reason).toMatch(/rows 2, 3/);
+  });
+
+  it('counts every row of a receipt whose totals cannot be reconciled', async () => {
+    const lines = ['Receipt,Date,Time,Item,Qty,Total'];
+    for (let index = 0; index < 5; index += 1) {
+      lines.push(`R-ok-${index},2026-04-01,08:30,Flat White,1,60.00`);
+      lines.push(`R-ok-${index},2026-04-01,08:30,Muffin,1,60.00`);
+    }
+    lines.push('R-conflict,2026-04-01,08:30,Flat White,1,35.00');
+    lines.push('R-conflict,2026-04-01,08:30,Muffin,1,25.00');
+    const result = await parseBuffer(Buffer.from(lines.join('\n')), {
+      columnMapping: mapping, itemsMode: 'line-per-row',
+    });
+
+    expect(result.rows).toHaveLength(5);
+    expect(result.errors).toBe(2);
   });
 });

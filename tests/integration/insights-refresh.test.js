@@ -15,10 +15,23 @@ const {
 const Organization = require('../../src/models/Organization.model');
 const GeneratedInsight = require('../../src/models/GeneratedInsight.model');
 const InsightChat = require('../../src/models/InsightChat.model');
+const Transaction = require('../../src/models/Transaction.model');
 const UsageLedger = require('../../src/models/UsageLedger.model');
 const { _resetInsightsCache } = require('../../src/services/anthropic.service');
 
 const request = supertest(app);
+
+// A paid insight refresh is only started when there is something to analyse, so
+// every test that expects the metered path to run has to have recent sales.
+const seedRecentSales = (cafeId) =>
+  Transaction.create({
+    cafeId,
+    receiptId: 'insight-refresh-seed',
+    date: new Date(),
+    status: 'approved',
+    total: 45,
+    items: [{ name: 'Flat White', quantity: 1, unitPrice: 45 }],
+  });
 
 beforeAll(setup);
 afterAll(teardown);
@@ -34,6 +47,7 @@ describe('explicit insight refresh', () => {
     process.env.ANTHROPIC_API_KEY = 'test-anthropic-key';
     const owner = await createTestUser();
     await UsageLedger.init();
+    await seedRecentSales(owner.user.activeCafeId);
     mockAnthropicMessageCreate.mockImplementation(async () => {
       await new Promise((resolve) => setTimeout(resolve, 30));
       return { content: [{ type: 'text', text: '["Prepare more flat whites tomorrow."]' }] };
@@ -108,6 +122,7 @@ describe('explicit insight refresh', () => {
     process.env.ANTHROPIC_API_KEY = 'test-anthropic-key';
     const owner = await createTestUser();
     await Promise.all([GeneratedInsight.init(), UsageLedger.init()]);
+    await seedRecentSales(owner.user.activeCafeId);
     await GeneratedInsight.create({
       cafeId: owner.user.activeCafeId,
       orgId: owner.user.orgId,

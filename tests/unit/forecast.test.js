@@ -437,3 +437,120 @@ describe('suggested stock bias', () => {
     expect(computeSuggestedStockFromPairs(10, [{ predicted: 10, actual: 12 }], settings)).toBe(11);
   });
 });
+
+describe('history window', () => {
+  const Cafe = require('../../src/models/Cafe.model');
+  const Organization = require('../../src/models/Organization.model');
+  const Transaction = require('../../src/models/Transaction.model');
+  const Event = require('../../src/models/Event.model');
+  const Item = require('../../src/models/Item.model');
+  const Forecast = require('../../src/models/Forecast.model');
+  const { generateForecast } = require('../../src/services/forecast.service');
+  const { addZonedDays, zonedDayStart } = require('../../src/services/parser.service');
+
+  const timezone = 'Africa/Johannesburg';
+  const target = new Date('2030-03-06T12:00:00+02:00');
+  const lean = (value) => ({ lean: () => Promise.resolve(value) });
+
+  // Drives generateForecast against stubbed models and captures the
+  // transaction query it issues. Learning is off so no calibration reads run,
+  // and there are no coordinates so no weather call is made.
+  const runWith = async ({ plan, maxWeeks }) => {
+    jest.restoreAllMocks();
+    const cafe = {
+      _id: 'cafe-1',
+      orgId: 'org-1',
+      timezone,
+      forecastSettings: { history: { maxWeeks }, learning: { enabled: false } },
+    };
+    jest.spyOn(Cafe, 'findById').mockReturnValue(lean(cafe));
+    jest.spyOn(Organization, 'findById').mockReturnValue(lean({ plan }));
+    const find = jest.spyOn(Transaction, 'find').mockReturnValue(lean([]));
+    jest.spyOn(Event, 'find').mockReturnValue(lean([]));
+    jest.spyOn(Item, 'find').mockReturnValue(lean([]));
+    jest.spyOn(Forecast, 'findOne').mockReturnValue({ select: () => lean(null) });
+    jest.spyOn(Forecast, 'findOneAndUpdate').mockImplementation(async (_filter, update) => update.$set);
+
+    const forecast = await generateForecast('cafe-1', target);
+    return { query: find.mock.calls[0][0], forecast };
+  };
+
+  const weeksBefore = (weeks) => addZonedDays(zonedDayStart(target, timezone), -weeks * 7, timezone);
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('queries exactly as many weeks of history as the lookback asks for', async () => {
+    // The window was a fixed 56 days while the lookback was settable to 16, so
+    // buckets 8-15 could never be populated and a longer lookback was inert.
+    const twelve = await runWith({ plan: 'pro', maxWeeks: 12 });
+    expect(twelve.query.date.$gte).toEqual(weeksBefore(12));
+    expect(twelve.forecast.factorSettings.history.maxWeeks).toBe(12);
+
+    const four = await runWith({ plan: 'pro', maxWeeks: 4 });
+    expect(four.query.date.$gte).toEqual(weeksBefore(4));
+    expect(four.query.date.$lt).toEqual(zonedDayStart(target, timezone));
+  });
+
+  it('sizes the window from the plan-clamped lookback, not the stored one', async () => {
+    const starter = await runWith({ plan: 'starter', maxWeeks: 12 });
+    expect(starter.query.date.$gte).toEqual(weeksBefore(8));
+    expect(starter.forecast.factorSettings.history.maxWeeks).toBe(8);
+  });
+});
+
+describe('closed-day explanation', () => {
+  const { getTradingAvailability, describeClosedDay } = require('../../src/services/forecast.service')._test;
+  const openAllWeek = {
+    tradingHours: Array.from({ length: 7 }, (_, dayOfWeek) => ({
+      dayOfWeek,
+      isOpen: true,
+      openTime: '08:00',
+      closeTime: '16:00',
+    })),
+  };
+  const closedThursday = {
+    tradingHours: openAllWeek.tradingHours.map((day) =>
+      (day.dayOfWeek === 4 ? { ...day, isOpen: false } : day)
+    ),
+  };
+  const stocktake = [{ name: 'Stocktake', type: 'closure' }];
+
+  it('attributes a closure to the schedule or to an event', () => {
+    expect(getTradingAvailability(closedThursday, [], 4)).toEqual(
+      expect.objectContaining({ status: 'closed', source: 'schedule' })
+    );
+    expect(getTradingAvailability(openAllWeek, stocktake, 4)).toEqual(
+      expect.objectContaining({ status: 'closed', source: 'event', eventName: 'Stocktake' })
+    );
+  });
+
+  it('points a schedule closure with sales history at the trading hours', () => {
+    const trading = getTradingAvailability(closedThursday, [], 4);
+    const result = describeClosedDay(trading, { salesCount: 919, observedWeeks: 8, maxWeeks: 8 });
+
+    expect(result.contradictsHistory).toBe(true);
+    expect(result.reason).toContain('919 sales were recorded on this weekday in the last 8 weeks');
+    expect(result.reason).toContain('Check the trading hours in Settings');
+  });
+
+  it('points an event closure at the event, never at the trading hours', () => {
+    // A closure event on a normal trading day used to read "Stocktake, but 919
+    // sales were recorded ... Check the trading hours in Settings", sending the
+    // operator to the wrong screen. The event is deliberate, so it is not a
+    // contradiction either.
+    const trading = getTradingAvailability(openAllWeek, stocktake, 4);
+    const result = describeClosedDay(trading, { salesCount: 919, observedWeeks: 8, maxWeeks: 8 });
+
+    expect(result.contradictsHistory).toBe(false);
+    expect(result.reason).toBe('Closed for Stocktake. Remove the event in Factors if the cafe is trading.');
+    expect(result.reason).not.toMatch(/trading hours/i);
+  });
+
+  it('keeps a schedule closure with no history as a plain closure', () => {
+    const trading = getTradingAvailability(closedThursday, [], 4);
+    expect(describeClosedDay(trading, { salesCount: 0, observedWeeks: 0, maxWeeks: 8 })).toEqual({
+      contradictsHistory: false,
+      reason: 'Cafe is closed in its trading hours',
+    });
+  });
+});

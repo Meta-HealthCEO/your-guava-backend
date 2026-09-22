@@ -4,6 +4,13 @@ const LeaveBalance = require('../models/LeaveBalance.model');
 
 const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 
+// Pay is owner-only information. Managers get the roster without hourlyRate.
+const staffDto = (staff, user) => {
+  if (user?.role === 'owner') return staff;
+  const { hourlyRate: _hourlyRate, ...withoutRate } = staff;
+  return withoutRate;
+};
+
 const parseDateOnly = (value) => {
   if (value == null || value === '') return undefined;
   const match = String(value).match(DATE_ONLY_RE);
@@ -72,10 +79,15 @@ const list = async (req, res, next) => {
       balanceMap[b.staffId.toString()] = b;
     }
 
-    const staffWithBalances = staff.map((s) => ({
-      ...s,
-      leaveBalance: balanceMap[s._id.toString()] || null,
-    }));
+    const staffWithBalances = staff.map((s) =>
+      staffDto(
+        {
+          ...s,
+          leaveBalance: balanceMap[s._id.toString()] || null,
+        },
+        req.user
+      )
+    );
 
     return res.status(200).json({ success: true, staff: staffWithBalances });
   } catch (error) {
@@ -97,7 +109,9 @@ const getOne = async (req, res, next) => {
 
     const leaveBalance = await LeaveBalance.findOne({ staffId: staff._id }).lean();
 
-    return res.status(200).json({ success: true, staff: { ...staff, leaveBalance } });
+    return res
+      .status(200)
+      .json({ success: true, staff: staffDto({ ...staff, leaveBalance }, req.user) });
   } catch (error) {
     next(error);
   }

@@ -1,5 +1,5 @@
 const supertest = require('supertest');
-const { setup, teardown, clearDB, createTestUser, app } = require('../setup');
+const { setup, teardown, clearDB, createTestUser, createTestManager, app } = require('../setup');
 
 const request = supertest(app);
 
@@ -147,6 +147,32 @@ describe('Cafe API', () => {
         .send({ tradingHours });
 
       expect(res.status).toBe(400);
+    });
+  });
+
+  describe('Manager access', () => {
+    it('blocks managers from updating the cafe but still lets them read it', async () => {
+      const manager = await createTestManager(token, [user.activeCafeId]);
+
+      const res = await request
+        .put('/api/cafe/me')
+        .set('Authorization', `Bearer ${manager.token}`)
+        .send({ name: 'Hijacked Cafe', location: { lat: -26.2, lng: 28.04 } });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual({ success: false, message: 'Insufficient permissions' });
+
+      const me = await request
+        .get('/api/cafe/me')
+        .set('Authorization', `Bearer ${manager.token}`);
+      expect(me.status).toBe(200);
+      expect(me.body.cafe.name).toBe('Test Cafe');
+
+      const list = await request
+        .get('/api/cafe/list')
+        .set('Authorization', `Bearer ${manager.token}`);
+      expect(list.status).toBe(200);
+      expect(list.body.cafes).toHaveLength(1);
     });
   });
 

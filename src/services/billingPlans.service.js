@@ -100,7 +100,35 @@ const addUtcMonthsClamped = (from, months) => {
 const addBillingCycle = (from, billingCycle = 'monthly') =>
   addUtcMonthsClamped(from, billingCycle === 'annual' ? 12 : 1);
 
-const nextCreditResetDate = (from = new Date()) => startOfNextUtcMonth(from);
+/**
+ * The first monthly anniversary of `anchor` strictly after `from`.
+ *
+ * Credit allowances belong to the subscription, so their boundary has to be the
+ * subscription's own anniversary rather than the calendar rollover. Each
+ * candidate is measured from the anchor and not from the previous anniversary,
+ * because a clamped month-end (31 January -> 28 February) would otherwise drag
+ * every later boundary forward to the 28th and quietly shorten the window.
+ */
+const nextMonthlyAnniversary = (anchor, from = new Date()) => {
+  const start = new Date(anchor);
+  const reference = new Date(from);
+  if (Number.isNaN(start.getTime())) return startOfNextUtcMonth(reference);
+  if (Number.isNaN(reference.getTime())) return start;
+
+  let months = Math.max(
+    0,
+    (reference.getUTCFullYear() - start.getUTCFullYear()) * 12
+      + (reference.getUTCMonth() - start.getUTCMonth())
+  );
+  let candidate = addUtcMonthsClamped(start, months);
+  // At most two extra steps: the month arithmetic above lands on the same
+  // calendar month, so only the day-of-month and the clamp can still be short.
+  while (candidate <= reference) {
+    months += 1;
+    candidate = addUtcMonthsClamped(start, months);
+  }
+  return candidate;
+};
 
 module.exports = {
   PLAN_CONFIG,
@@ -109,6 +137,6 @@ module.exports = {
   getPlan,
   getPlans,
   normalisePlanId,
-  nextCreditResetDate,
+  nextMonthlyAnniversary,
   startOfNextUtcMonth,
 };

@@ -1,6 +1,12 @@
 const InsightChat = require('../models/InsightChat.model');
 
 const MAX_MESSAGES = 80;
+// One chat can legitimately hold 80 messages of 20000 characters. Nothing here
+// is rate limited per user, and the portal calls createLocalChat on failure
+// paths, so a retry loop could grow this collection without bound on the same
+// Mongo instance the transaction data lives on. A cafe owner keeping 100 saved
+// conversations per location is generous; a runaway client stops at 100.
+const MAX_CHATS_PER_USER = 100;
 const DEFAULT_LIST_LIMIT = 20;
 const MAX_LIST_LIMIT = 30;
 const MAX_LIST_WITH_MESSAGES = 10;
@@ -106,6 +112,28 @@ const list = async (req, res, next) => {
 
 const create = async (req, res, next) => {
   try {
+    // `update` already guards this; `create` passed the raw body straight to
+    // .filter(), so a body of {"messages":"hi"} became a 500 with a stack trace
+    // instead of telling the caller their payload was wrong.
+    if (req.body.messages !== undefined && !Array.isArray(req.body.messages)) {
+      return res.status(400).json({
+        success: false,
+        message: 'messages must be an array of { role, content } objects',
+      });
+    }
+
+    const existingChats = await InsightChat.countDocuments({
+      userId: req.user.id,
+      cafeId: req.user.cafeId,
+    });
+    if (existingChats >= MAX_CHATS_PER_USER) {
+      return res.status(409).json({
+        success: false,
+        message: `You have reached the limit of ${MAX_CHATS_PER_USER} saved chats for this location. Delete a chat to start a new one.`,
+        details: { code: 'INSIGHT_CHAT_LIMIT_REACHED', limit: MAX_CHATS_PER_USER },
+      });
+    }
+
     const messages = sanitizeMessages(req.body.messages);
     const chat = await InsightChat.create({
       userId: req.user.id,
@@ -184,4 +212,4 @@ const remove = async (req, res, next) => {
   }
 };
 
-module.exports = { list, create, getOne, update, remove };
+module.exports = { MAX_CHATS_PER_USER, list, create, getOne, update, remove };

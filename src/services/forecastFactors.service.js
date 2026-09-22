@@ -265,6 +265,74 @@ const getSavedForecastSettings = (cafe) =>
 const getForecastSettings = (cafe, plan = 'starter') =>
   applyPlanEntitlements(getSavedForecastSettings(cafe), plan);
 
+const sameSettings = (left, right) => {
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => sameSettings(value, right[index]));
+  }
+  if (isPlainObject(left) || isPlainObject(right)) {
+    if (!isPlainObject(left) || !isPlainObject(right)) return false;
+    const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+    return [...keys].every((key) => sameSettings(left[key], right[key]));
+  }
+  return left === right;
+};
+
+const planLabel = (plan) => {
+  const id = normalisePlanId(plan);
+  return id.charAt(0).toUpperCase() + id.slice(1);
+};
+
+/**
+ * Applies a settings update against the org's plan.
+ *
+ * Locked factors used to be accepted, stored, echoed back by the API, and then
+ * clamped to their defaults the moment a forecast ran -- so a Starter customer
+ * could set a 12-week lookback, see it saved, and watch it do nothing. A change
+ * to a locked factor is now refused, naming the factor that needs the upgrade.
+ *
+ * Two things that look like changes are not. A locked value sent back exactly
+ * as stored is a no-op. And the Factors page loads the effective (clamped)
+ * view and sends the whole thing back, so locked sections always arrive at
+ * their clamped values -- stock at 0/0, events disabled. That is an echo, not
+ * an edit: it must not be refused, and it must not overwrite what is stored,
+ * because the stored value is what the customer gets back on upgrade.
+ *
+ * Returns { settings } to persist, or { lockedChange } naming the first locked
+ * factor the payload tried to change.
+ */
+const applyForecastSettingsUpdate = (cafe, input, plan = 'starter') => {
+  const saved = getSavedForecastSettings(cafe);
+  const effective = applyPlanEntitlements(saved, plan);
+  const next = normalizeForecastSettings(input, saved);
+  let settings = next;
+
+  for (const factorConfig of FACTOR_CATALOG) {
+    if (factorUnlocked(plan, factorConfig.key)) continue;
+    const { section } = factorConfig;
+    if (sameSettings(next[section], saved[section])) continue;
+    if (sameSettings(next[section], effective[section])) {
+      settings = { ...settings, [section]: clone(saved[section]) };
+      continue;
+    }
+    const requiredPlan = normalisePlanId(factorConfig.requiredPlan);
+    return {
+      settings: null,
+      lockedChange: {
+        key: factorConfig.key,
+        label: factorConfig.label,
+        requiredPlan,
+        message:
+          `${factorConfig.label} settings are available on the ${planLabel(requiredPlan)} plan. ` +
+          'Upgrade your plan to change them.',
+      },
+    };
+  }
+
+  return { settings, lockedChange: null };
+};
+
 const pctToMultiplier = (pct, minimumMultiplier = 0.1) =>
   Math.max(minimumMultiplier, 1 + (Number(pct) || 0) / 100);
 
@@ -486,6 +554,7 @@ module.exports = {
   normalizeForecastSettings,
   getSavedForecastSettings,
   getForecastSettings,
+  applyForecastSettingsUpdate,
   buildGlobalFactors,
   buildItemFactors,
   multiplyFactors,

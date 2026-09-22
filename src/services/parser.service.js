@@ -293,13 +293,37 @@ const normaliseHeader = (header, index = 0) => {
   return value || `Column ${index + 1}`;
 };
 
+/**
+ * POS exports do repeat column names -- "Amount" for gross and net, "Total" for
+ * the line and the receipt, "Date" for the sale and the settlement. Collapsed
+ * into one key the last column silently won, so the owner mapped a column they
+ * had never seen and the money came out wrong with no warning at any stage.
+ *
+ * Suffixing repeats keeps every column addressable, and because the preview and
+ * the parse run the same deterministic pass, the column the owner picks is the
+ * column that is read.
+ */
+const headerDeduper = () => {
+  const seen = new Map();
+  return (header, index) => {
+    const base = normaliseHeader(header, index);
+    const occurrence = (seen.get(base) || 0) + 1;
+    seen.set(base, occurrence);
+    return occurrence === 1 ? base : `${base} (${occurrence})`;
+  };
+};
+
+// One runaway cell -- a pasted note, an escaped-quote bug in the till's own
+// export that ran several lines together -- used to throw out of the parser and
+// abort a 10,000-row import, naming neither the row nor the column, and often
+// in a column the owner never intended to import. Clip it instead: the mapped
+// fields have their own length bounds, so a truncated item name or receipt ID
+// still becomes an honest row error while the rest of the file lands.
 const normaliseCell = (value) => {
   if (typeof value !== 'string') return value;
   const trimmed = value.trim();
-  if (trimmed.length > parserLimits().maxCellChars) {
-    throw createClientInputError(`A cell exceeds the ${parserLimits().maxCellChars} character limit`);
-  }
-  return trimmed;
+  const { maxCellChars } = parserLimits();
+  return trimmed.length > maxCellChars ? trimmed.slice(0, maxCellChars) : trimmed;
 };
 
 const normaliseRow = (row) => {
@@ -358,7 +382,8 @@ const readWorkbook = async (buffer) => {
   if (headerRow.length > limits.maxColumns) {
     throw createClientInputError(`File exceeds the ${limits.maxColumns} column limit`);
   }
-  const headers = headerRow.map((header, index) => normaliseHeader(header, index));
+  const dedupeHeader = headerDeduper();
+  const headers = headerRow.map((header, index) => dedupeHeader(header, index));
 
   const rows = dataRows
     .map((row, index) => ({ row, rowNumber: index + 2 }))
@@ -633,6 +658,14 @@ const assertSupportedFileBuffer = (buffer, fileExt = 'csv') => {
     return;
   }
 
+  // The legacy-XLS guidance lived downstream of this assert, so it was
+  // unreachable: an owner whose till only offers .xls was told the format was
+  // unsupported and nothing about what to export instead. Say it here and every
+  // entry point says it.
+  if (ext === 'xls') {
+    throw createClientInputError('Legacy XLS files are not supported. Please export as CSV or XLSX.');
+  }
+
   if (ext !== 'csv') {
     throw createClientInputError('Only CSV and XLSX files are supported');
   }
@@ -643,13 +676,78 @@ const assertSupportedFileBuffer = (buffer, fileExt = 'csv') => {
   }
 };
 
+// Ordered so ',' wins a tie, which is what an ambiguous file most often is.
+const CSV_SEPARATOR_CANDIDATES = [',', ';', '\t', '|'];
+const CSV_SEPARATOR_SAMPLE_LINES = 5;
+
+/**
+ * Picks the delimiter a CSV is really using.
+ *
+ * Only ';' was ever weighed against ',', so a tab- or pipe-delimited export --
+ * "Text (Tab delimited)" is a standard Excel save-as, and several tills write
+ * it with a .csv extension -- collapsed its entire header row into one column.
+ * The owner was shown one nonsensical column and had no way forward.
+ *
+ * The winner is the candidate that appears on EVERY sampled line, scored by its
+ * smallest per-line count: a real delimiter separates every row, while a comma
+ * inside one quoted item cell shows up on one line only.
+ */
 const detectCsvSeparator = (buffer) => {
-  const firstLine = Buffer.isBuffer(buffer)
-    ? buffer.toString('utf8', 0, Math.min(buffer.length, 4096)).split(/\r?\n/)[0] || ''
-    : '';
-  const semicolons = (firstLine.match(/;/g) || []).length;
-  const commas = (firstLine.match(/,/g) || []).length;
-  return semicolons > commas ? ';' : ',';
+  const lines = (Buffer.isBuffer(buffer)
+    ? buffer.toString('utf8', 0, Math.min(buffer.length, 4096))
+    : '')
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== '')
+    .slice(0, CSV_SEPARATOR_SAMPLE_LINES);
+  if (lines.length === 0) return ',';
+
+  let best = ',';
+  let bestScore = 0;
+  for (const candidate of CSV_SEPARATOR_CANDIDATES) {
+    const score = Math.min(...lines.map((line) => line.split(candidate).length - 1));
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return best;
+};
+
+// Quantities may be fractional: cafes selling by weight export rows like
+// "0.35 x Cheese Wheel". Matching digits only made the engine skip past the
+// "0." and read the decimal part as the whole quantity, turning 0.35 into 35.
+// A comma decimal is the same trap wearing South African clothes -- "1,5 x
+// Biltong" was read as five units, a 3.3x overstatement of the weight sold.
+//
+// The leading sign matters just as much. A till exports a refund as "-1 x Flat
+// White"; without the sign the engine stepped over the minus and recorded a
+// SALE of one, so a refund moved demand two units the wrong way and the stored
+// row contradicted itself -- total -38 against quantity +1. The sign also has to
+// appear in the separator lookahead, or "1 x Flat White,-1 x Flat White" is not
+// recognised as two lines at all and collapses into one item whose name is the
+// rest of the string.
+const PACKED_QUANTITY = String.raw`-?\d+(?:[.,]\d+)?`;
+// Plenty of tills print U+00D7 rather than an ASCII x, and some print a capital
+// X. The sign used to stay glued to the item name, so "Flat White" and
+// "× Flat White" were two different products splitting one history in half.
+const PACKED_MARKER = String.raw`\s+[x×]\s+`;
+// The name may not cross a newline, and a newline separates basket lines. A
+// till that wraps its basket inside one quoted cell had only its LAST line
+// read: `.` never matches a newline and `$` is end-of-string, so the earlier
+// items vanished with no error and the survivor absorbed the whole basket
+// total as an "exact" price.
+const PACKED_ITEM_RE = new RegExp(
+  `(${PACKED_QUANTITY})${PACKED_MARKER}([^\\n]+?)(?:[,;\\n](?=\\s*${PACKED_QUANTITY}${PACKED_MARKER})|$)`,
+  'gi'
+);
+// The marker is mandatory here. With `x` optional, any description starting
+// with a number was read as a quantity: "500 Still Water" became 500 units of
+// "Still Water", and "2 Minute Noodles" two units of "Minute Noodles".
+const LOOSE_PACKED_ITEM_RE = new RegExp(`^(${PACKED_QUANTITY})\\s*[x\\u00d7]\\s+(.+)$`, 'i');
+
+const packedQuantity = (raw) => {
+  const quantity = parseFloat(String(raw).replace(',', '.'));
+  return Number.isFinite(quantity) && quantity !== 0 ? quantity : null;
 };
 
 /**
@@ -660,15 +758,12 @@ const detectCsvSeparator = (buffer) => {
 const parsePackedItems = (str) => {
   if (!str) return [];
   const items = [];
-  // Quantities may be fractional: cafes selling by weight export rows like
-  // "0.35 x Cheese Wheel". Matching digits only made the engine skip past the
-  // "0." and read the decimal part as the whole quantity, turning 0.35 into 35.
-  const regex = /(\d+(?:\.\d+)?)\s+x\s+(.+?)(?:[,;](?=\s*\d+(?:\.\d+)?\s+x\s+)|$)/g;
+  const regex = new RegExp(PACKED_ITEM_RE.source, PACKED_ITEM_RE.flags);
   let match;
   while ((match = regex.exec(str)) !== null) {
-    const quantity = parseFloat(match[1]);
+    const quantity = packedQuantity(match[1]);
     const name = match[2].trim();
-    if (name && Number.isFinite(quantity) && quantity > 0) items.push({ name, quantity });
+    if (name && quantity != null) items.push({ name, quantity });
   }
   if (items.length > 0) return items;
 
@@ -677,17 +772,16 @@ const parsePackedItems = (str) => {
     .map((part) => part.trim())
     .filter(Boolean)
     .map((part) => {
-      const loose = part.match(/^(\d+(?:\.\d+)?)\s*x?\s+(.+)$/i);
+      const loose = part.match(LOOSE_PACKED_ITEM_RE);
       if (loose) {
-        const quantity = parseFloat(loose[1]);
-        return {
-          name: loose[2].trim(),
-          quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : null,
-        };
+        return { name: loose[2].trim(), quantity: packedQuantity(loose[1]) };
       }
+      // A part with no letters in it is a stray field the export left behind,
+      // not a product. Emitting it created menu entries literally named "2".
+      if (!/\p{L}/u.test(part)) return null;
       return { name: part, quantity: 1 };
     })
-    .filter((item) => item.name && item.quantity > 0);
+    .filter((item) => item && item.name && item.quantity != null && item.quantity !== 0);
 };
 
 const parseCleanNumber = (raw) => {
@@ -700,13 +794,19 @@ const parseCleanNumber = (raw) => {
 
   let value = String(raw).trim();
   if (/\d[eE][+-]?\d/.test(value)) return { valid: false, value: 0 };
-  const parenthesisedNegative = /^\(.*\)$/.test(value);
-  value = value
-    .replace(/[()]/g, '')
-    .replace(/\s+/g, '')
-    .replace(/[^\d,.-]/g, '');
 
-  if (!value || value === '-' || value === '.' || value === ',') {
+  // Judge the sign markers only after currency symbols and spacing are gone.
+  // The parenthesis test used to run on the raw string, so "R(150.00)" read as
+  // a positive 150 while "(150.00)" correctly read as -150; and every minus
+  // after the first character was stripped outright, so the trailing-minus
+  // convention older accounting exports use -- "45.00-" -- lost its sign
+  // entirely. Either way a refund was booked as revenue and the day's takings
+  // overstated by twice it.
+  value = value.replace(/\s+/g, '').replace(/[^\d(),.-]/g, '');
+  const negative = /^\(.+\)$/.test(value) || /^-/.test(value) || /-$/.test(value);
+  value = value.replace(/[()-]/g, '');
+
+  if (!value || value === '.' || value === ',') {
     return { valid: false, value: 0 };
   }
 
@@ -725,12 +825,11 @@ const parseCleanNumber = (raw) => {
       : value.replace(/,/g, '');
   }
 
-  value = value.replace(/(?!^)-/g, '');
   const parsed = parseFloat(value);
   if (!Number.isFinite(parsed)) return { valid: false, value: 0 };
   return {
     valid: true,
-    value: parenthesisedNegative ? -Math.abs(parsed) : parsed,
+    value: negative ? -Math.abs(parsed) : parsed,
   };
 };
 
@@ -740,13 +839,40 @@ const parseBoundedAmount = (raw, limits = parserLimits()) => {
   return parsed.value;
 };
 
+/**
+ * Reads an optional money column -- Tip, Discount -- where a blank cell means
+ * "none".
+ *
+ * Tills routinely leave these columns empty on a cash sale rather than writing
+ * 0.0. A blank cell was read as an unparseable amount and the whole row was
+ * discarded, so a till with that habit lost every cash transaction it ever
+ * exported, and the owner was told the amount had exceeded ten million. Absent
+ * is not malformed: only a cell with something in it can fail to parse.
+ *
+ * Returns `{ value }` or `{ error }`, where the error names which column failed
+ * and whether it was unreadable or simply too large -- an operator can act on
+ * "Tip is not a valid amount" and cannot act on the two fused together.
+ */
+const parseOptionalAmount = (raw, label, limits) => {
+  if (raw == null || String(raw).trim() === '') return { value: 0 };
+  const parsed = parseCleanNumber(raw);
+  if (!parsed.valid) return { error: `${label} is not a valid amount` };
+  if (Math.abs(parsed.value) > limits.maxAbsoluteAmount) {
+    return { error: `${label} exceeds the ${limits.maxAbsoluteAmount} amount limit` };
+  }
+  return { value: parsed.value };
+};
+
 const parseQuantity = (raw, limits = parserLimits()) => {
   const parsed = parseCleanNumber(raw);
   // Truncating discarded weight-based quantities entirely: 0.35 became 0 and the
   // row was rejected as invalid. Keep the value the till actually recorded.
   const quantity = parsed.value;
+  // Negative quantities are refunds and must survive parsing for the same reason
+  // they do in packed mode -- silently dropping the sign turns a return into a
+  // sale. Zero is still meaningless, and the bound applies to the magnitude.
   return parsed.valid && Number.isFinite(quantity) &&
-    quantity > 0 && quantity <= limits.maxItemQuantity
+    quantity !== 0 && Math.abs(quantity) <= limits.maxItemQuantity
     ? quantity
     : null;
 };
@@ -817,10 +943,11 @@ const readRows = (buffer, fileExt) => {
       settled = true;
       reject(error);
     };
+    const dedupeHeader = headerDeduper();
     const input = Readable.from(buffer);
     const parserStream = csv({
         separator: detectCsvSeparator(buffer),
-        mapHeaders: ({ header, index }) => normaliseHeader(header, index),
+        mapHeaders: ({ header, index }) => dedupeHeader(header, index),
         mapValues: ({ value }) => normaliseCell(value),
       });
     input
@@ -980,30 +1107,79 @@ const dateFromParts = (year, month, day, timeStr, timezone = DEFAULT_TIMEZONE) =
   }, timezone);
 };
 
+// A cell can carry its own time -- "2026-09-03 23:30", "03/09/2026T14:30:00".
+// The anchor after the time is what keeps an offset-qualified timestamp out:
+// "...T23:30:00Z" and "...+02:00" do not match, and go to `new Date`, which is
+// the right reader for a string that already states its zone.
+const COMBINED_DATE_TIME_RE =
+  /^(\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4})[T\s]+(\d{1,2}:\d{2}(?::\d{2})?)$/;
+// Two-digit years are day-first too, like every other date an SA till writes.
+// The pivot: 70-99 is the 1900s, 00-69 the 2000s, which covers every export
+// that could plausibly be trading history without reaching a year that has not
+// happened. Both ends are refused anyway by the min-year and future-day bounds.
+const TWO_DIGIT_YEAR_PIVOT = 70;
+
+const expandTwoDigitYear = (shortYear) =>
+  (shortYear >= TWO_DIGIT_YEAR_PIVOT ? 1900 : 2000) + shortYear;
+
 const parseDateString = (dateStr, timeStr, timezone = DEFAULT_TIMEZONE) => {
   const value = String(dateStr).trim();
 
-  let match = value.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  // A combined cell used to reach `new Date`, which resolves a naive local
+  // string in the NODE process timezone rather than the cafe's, and
+  // applyTimeParts then only re-read the resulting instant -- so the process
+  // reading was already baked in. On a UTC host that stamped every sale after
+  // 22:00 cafe-local with the next trading day and shifted every hour by two.
+  // Splitting the cell and building the instant from its parts puts it in the
+  // cafe zone, exactly as a separate Time column already does.
+  const combined = value.match(COMBINED_DATE_TIME_RE);
+  const datePart = combined ? combined[1] : value;
+  // A mapped Time column still wins: it is the operator's explicit choice.
+  const time = timeStr != null && String(timeStr).trim() !== '' ? timeStr : combined?.[2];
+
+  let match = datePart.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
   if (match) {
     return dateFromParts(
       parseInt(match[1], 10),
       parseInt(match[2], 10),
       parseInt(match[3], 10),
-      timeStr,
+      time,
       timezone
     );
   }
 
-  match = value.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
+  match = datePart.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$/);
   if (match) {
     return dateFromParts(
       parseInt(match[3], 10),
       parseInt(match[2], 10),
       parseInt(match[1], 10),
-      timeStr,
+      time,
       timezone
     );
   }
+
+  // Nothing matched a two-digit year, so "03/09/26" fell through to V8's
+  // month-first reading and landed on 9 March instead of 3 September, while
+  // "13/09/26" was discarded as unparseable. Days 1-12 moved month in silence
+  // and days 13-31 vanished, on a till doing nothing more exotic than using a
+  // short date format.
+  match = datePart.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2})$/);
+  if (match) {
+    return dateFromParts(
+      expandTwoDigitYear(parseInt(match[3], 10)),
+      parseInt(match[2], 10),
+      parseInt(match[1], 10),
+      time,
+      timezone
+    );
+  }
+
+  // A bare number is not a date, whatever `new Date` makes of it: it reads "0"
+  // as the year 2000 and "45900" as the year 45899. Both passed the minimum-year
+  // floor, and one junk cell then widened the file's span far enough to have the
+  // whole upload refused for a date range the owner's three-day file never had.
+  if (/^\d+$/.test(value)) return null;
 
   const parsed = new Date(value);
   if (isNaN(parsed.getTime())) return null;
@@ -1057,6 +1233,67 @@ const temporalFields = (date, timezone) => {
   };
 };
 
+/**
+ * A packed receipt carries one total for the whole basket. With a single
+ * distinct item the unit price is exact (total / quantity); with several it
+ * can only be a basket average. The average keeps per-item revenue summing to
+ * the receipt, which analytics relies on, but it is not a price -- the menu
+ * used to learn it as one, so nearly every item showed a false "price
+ * differs" warning. The flag lets price learning and mismatch checks skip it.
+ */
+const unitPriceSource = (items, { isExactPerLine = false, tip = 0, discount = 0, hasRefund = false } = {}) => {
+  if (isExactPerLine) return 'exact';
+  // A refund or a void is a correction, not a price observation. Its arithmetic
+  // can even divide to zero, which must never be learned as a menu price.
+  if (hasRefund) return 'derived';
+  // A tip or discount lands in the receipt total, so total / quantity is the
+  // menu price plus the tip (or minus the discount), not the price itself.
+  // One tipped single-item receipt was enough to seed an item 18% high and
+  // flag every later sale as a mismatch.
+  if (Number(tip) !== 0 || Number(discount) !== 0) return 'derived';
+  return new Set(items.map((item) => item.name)).size === 1 ? 'exact' : 'derived';
+};
+
+const LINE_AMOUNT_HEADER_RE = /(^|\s)(line|item)(\s|$)/i;
+const TOTALS_MODE_CONSENSUS = 0.9;
+// Below this many multi-row receipts the vote is trivially unanimous: a lone
+// receipt with two items at the same price is an everyday coincidence, not
+// evidence that the file repeats receipt totals.
+const MIN_MULTI_ROW_RECEIPTS_FOR_INFERENCE = 5;
+
+const headerSuggestsLineAmounts = (mapping) =>
+  LINE_AMOUNT_HEADER_RE.test(String(mapping.total || '').replace(/[_-]+/g, ' '));
+
+/**
+ * Decides, per file, whether each row's total is a line amount (summed into
+ * the receipt) or the receipt total repeated on every line (taken once).
+ *
+ * This used to be read off the mapped column's NAME: anything containing
+ * "line" or "item" was summed. A till that repeats the order total under a
+ * header like "Item Total" then had every receipt multiplied by its line
+ * count, and revenue inflated silently. The data settles it: across receipts
+ * with two or more rows, near-unanimous identical totals mean receipt totals
+ * and near-unanimous differing totals mean line amounts. Only when neither
+ * reading reaches consensus, or too few receipts have more than one row to
+ * be evidence, does the header decide as before.
+ */
+const inferTotalsAreLineAmounts = (groups, mapping) => {
+  let identical = 0;
+  let differing = 0;
+  for (const group of groups.values()) {
+    if (group.invalidReason || group.totals.length < 2) continue;
+    const uniqueTotals = new Set(group.totals.map((total) => Number(total.toFixed(2))));
+    if (uniqueTotals.size === 1) identical++;
+    else differing++;
+  }
+  const multiRowReceipts = identical + differing;
+  if (multiRowReceipts >= MIN_MULTI_ROW_RECEIPTS_FOR_INFERENCE) {
+    if (identical / multiRowReceipts >= TOTALS_MODE_CONSENSUS) return false;
+    if (differing / multiRowReceipts >= TOTALS_MODE_CONSENSUS) return true;
+  }
+  return headerSuggestsLineAmounts(mapping);
+};
+
 const buildPackedRow = (raw, mapping, rowNumber, timezone) => {
   const limits = parserLimits();
   const date = parseDate(raw[mapping.date], mapping.time && raw[mapping.time], timezone);
@@ -1072,16 +1309,17 @@ const buildPackedRow = (raw, mapping, rowNumber, timezone) => {
     return { error: `Item name exceeds the ${limits.maxItemNameChars} character limit` };
   }
   // Quantities may legitimately be fractional -- a deli sells 0.35 of a cheese
-  // wheel -- so require a positive finite number rather than a whole one, and
+  // wheel -- so require a finite non-zero number rather than a whole one, and
   // report the reason that actually applies instead of blaming the upper limit
-  // for a sub-unit weight.
-  const badQuantity = items.find((item) => !Number.isFinite(item.quantity) || item.quantity <= 0
-    || item.quantity > limits.maxItemQuantity);
+  // for a sub-unit weight. Negative is legitimate too: it is a refund, and the
+  // bound applies to how big the line is, not which way it points.
+  const badQuantity = items.find((item) => !Number.isFinite(item.quantity) || item.quantity === 0
+    || Math.abs(item.quantity) > limits.maxItemQuantity);
   if (badQuantity) {
     return {
-      error: badQuantity.quantity > limits.maxItemQuantity
+      error: Math.abs(badQuantity.quantity) > limits.maxItemQuantity
         ? `Item quantity exceeds the ${limits.maxItemQuantity} limit`
-        : 'Item quantity must be a positive number',
+        : 'Item quantity must be a non-zero number',
     };
   }
   const receiptId = mapping.receiptId ? String(raw[mapping.receiptId] || '').trim() : '';
@@ -1098,19 +1336,32 @@ const buildPackedRow = (raw, mapping, rowNumber, timezone) => {
   if (total === null) {
     return { error: `Invalid transaction total or amount exceeds ${limits.maxAbsoluteAmount}` };
   }
-  const tip = mapping.tip ? parseBoundedAmount(raw[mapping.tip], limits) : 0;
-  const discount = mapping.discount ? parseBoundedAmount(raw[mapping.discount], limits) : 0;
-  if (tip === null || discount === null) {
-    return { error: `Invalid tip or discount, or amount exceeds ${limits.maxAbsoluteAmount}` };
-  }
-  const totalQty = items.reduce((s, i) => s + i.quantity, 0);
-  if (totalQty <= 0) return { error: 'Invalid item quantity' };
-  const unitPrice = totalQty > 0 ? total / totalQty : 0;
+  const parsedTip = parseOptionalAmount(mapping.tip && raw[mapping.tip], 'Tip', limits);
+  if (parsedTip.error) return { error: parsedTip.error };
+  const parsedDiscount = parseOptionalAmount(
+    mapping.discount && raw[mapping.discount],
+    'Discount',
+    limits
+  );
+  if (parsedDiscount.error) return { error: parsedDiscount.error };
+  const tip = parsedTip.value;
+  const discount = parsedDiscount.value;
+  // Price is derived from magnitudes, not the signed sum. A refund receipt has a
+  // negative total AND a negative quantity, and dividing one by the other would
+  // give a positive price by accident; a receipt mixing a sale and a refund can
+  // sum to zero and divide by nothing at all. Absolute values keep the unit price
+  // the positive menu price it should be, and leave the sign where it belongs --
+  // on the quantity, which is what every downstream aggregate nets.
+  const absQty = items.reduce((sum, item) => sum + Math.abs(item.quantity), 0);
+  if (absQty <= 0) return { error: 'Invalid item quantity' };
+  const unitPrice = parseFloat((Math.abs(total) / absQty).toFixed(2));
+  const hasRefund = items.some((item) => item.quantity < 0);
+  const priceSource = unitPriceSource(items, { tip, discount, hasRefund });
   const row = {
     receiptId: receiptId || undefined,
     date,
     ...temporalFields(date, timezone),
-    items: items.map((i) => ({ ...i, unitPrice: parseFloat(unitPrice.toFixed(2)) })),
+    items: items.map((i) => ({ ...i, unitPrice, priceSource })),
     total,
     tip,
     discount,
@@ -1125,7 +1376,6 @@ const groupLinePerRow = (rawRows, mapping, timezone) => {
   const groups = new Map();
   const rowErrors = [];
   let errors = 0;
-  const totalsAreLineAmounts = /(^|\s)(line|item)(\s|$)/i.test(String(mapping.total || '').replace(/[_-]+/g, ' '));
 
   for (const [index, raw] of rawRows.entries()) {
     const rowNumber = sourceRowNumber(raw, index);
@@ -1197,18 +1447,19 @@ const groupLinePerRow = (rawRows, mapping, timezone) => {
         );
         continue;
       }
-      const tip = mapping.tip ? parseBoundedAmount(raw[mapping.tip], limits) : 0;
-      const discount = mapping.discount ? parseBoundedAmount(raw[mapping.discount], limits) : 0;
-      if (tip === null || discount === null) {
+      const parsedTip = parseOptionalAmount(mapping.tip && raw[mapping.tip], 'Tip', limits);
+      const parsedDiscount = parseOptionalAmount(
+        mapping.discount && raw[mapping.discount],
+        'Discount',
+        limits
+      );
+      if (parsedTip.error || parsedDiscount.error) {
         errors++;
-        addRowError(
-          rowErrors,
-          rowNumber,
-          `Invalid tip or discount, or amount exceeds ${limits.maxAbsoluteAmount}`,
-          raw
-        );
+        addRowError(rowErrors, rowNumber, parsedTip.error || parsedDiscount.error, raw);
         continue;
       }
+      const tip = parsedTip.value;
+      const discount = parsedDiscount.value;
       const paymentMethod = mapping.paymentMethod
         ? String(raw[mapping.paymentMethod] || '').trim()
         : '';
@@ -1247,10 +1498,23 @@ const groupLinePerRow = (rawRows, mapping, timezone) => {
         String(group.paymentMethod || '') !== String(paymentMethod || '') ||
         String(group.status || 'approved') !== status;
       if (inconsistent) {
-        errors++;
+        // The rows already accepted into this receipt are discarded with it, so
+        // count them and name them. Counting one error while dropping four rows
+        // under-reported the damage: the owner reconciled against the till
+        // report, found revenue missing, and the error list gave them no row
+        // number to look at.
+        const discarded = group.invalidReason ? [] : group[SOURCE_ROW_NUMBERS];
+        errors += 1 + discarded.length;
         group.invalidReason =
           'Rows sharing a receipt ID have conflicting date, time, payment, status, tip, or discount values';
-        addRowError(rowErrors, rowNumber, group.invalidReason, { receiptId });
+        addRowError(
+          rowErrors,
+          rowNumber,
+          discarded.length > 0
+            ? `${group.invalidReason}. Receipt ${receiptId} was dropped, including rows ${discarded.join(', ')}`
+            : group.invalidReason,
+          { receiptId }
+        );
         continue;
       }
       if (group.items.length >= limits.maxItemsPerTransaction) {
@@ -1271,17 +1535,19 @@ const groupLinePerRow = (rawRows, mapping, timezone) => {
       addRowError(rowErrors, rowNumber, 'Could not parse row', raw);
     }
   }
+  const totalsAreLineAmounts = inferTotalsAreLineAmounts(groups, mapping);
   const rows = [];
   for (const row of groups.values()) {
     if (row.invalidReason) continue;
     const totalQty = row.items.reduce((sum, item) => sum + item.quantity, 0);
     const uniqueTotals = [...new Set(row.totals.map((total) => Number(total.toFixed(2))))];
     if (!totalsAreLineAmounts && uniqueTotals.length !== 1) {
-      errors++;
+      // Every source row of this receipt is discarded, not just the first.
+      errors += row[SOURCE_ROW_NUMBERS]?.length || 1;
       addRowError(
         rowErrors,
         row[SOURCE_ROW_NUMBERS]?.[0] || 1,
-        'Rows sharing a receipt ID have conflicting receipt totals. Map a column labelled as a line/item amount when each row is a line amount.',
+        `Rows sharing a receipt ID have conflicting receipt totals. Map a column labelled as a line/item amount when each row is a line amount. Receipt ${row.receiptId} was dropped, including rows ${(row[SOURCE_ROW_NUMBERS] || []).join(', ')}`,
         { receiptId: row.receiptId }
       );
       continue;
@@ -1290,7 +1556,7 @@ const groupLinePerRow = (rawRows, mapping, timezone) => {
       ? row.totals.reduce((sum, value) => sum + value, 0)
       : uniqueTotals[0];
     if (!Number.isFinite(total) || Math.abs(total) > limits.maxAbsoluteAmount) {
-      errors++;
+      errors += row[SOURCE_ROW_NUMBERS]?.length || 1;
       addRowError(
         rowErrors,
         row[SOURCE_ROW_NUMBERS]?.[0] || 1,
@@ -1300,6 +1566,11 @@ const groupLinePerRow = (rawRows, mapping, timezone) => {
       continue;
     }
     const averageUnitPrice = totalQty > 0 ? parseFloat((total / totalQty).toFixed(2)) : 0;
+    const priceSource = unitPriceSource(row.items, {
+      isExactPerLine: totalsAreLineAmounts,
+      tip: row.tip,
+      discount: row.discount,
+    });
     const { totals, invalidReason, ...cleanRow } = row;
     rows.push(setSourceRowNumbers({
       ...cleanRow,
@@ -1309,10 +1580,11 @@ const groupLinePerRow = (rawRows, mapping, timezone) => {
         unitPrice: totalsAreLineAmounts && item.quantity > 0
           ? parseFloat((lineTotal / item.quantity).toFixed(2))
           : averageUnitPrice,
+        priceSource,
       })),
     }, row[SOURCE_ROW_NUMBERS] || []));
   }
-  return { rows, errors, rowErrors };
+  return { rows, errors, rowErrors, totalsAreLineAmounts };
 };
 
 /**
@@ -1405,6 +1677,7 @@ module.exports = {
   readWorkbookRows,
   readWorkbook,
   requiredFieldsForMode,
+  headerDeduper,
   parserLimits,
   safeTimezone,
   getZonedDateParts,

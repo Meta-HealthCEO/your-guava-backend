@@ -4,8 +4,10 @@ const Organization = require('../models/Organization.model');
 const {
   normalizeItemName,
   buildAliasKeys,
+  markManualFields,
   resolveMenuItem,
   findMatchCandidates,
+  loadMatchCandidatePool,
   updateTransactionMenuItemLinks,
   rebuildItemsForCafe,
 } = require('../services/menuItems.service');
@@ -37,12 +39,20 @@ const reconciliationFilter = (cafeId) => ({
   ],
 });
 
+const MANUAL_FIELDS = ['category', 'expectedPrice', 'aliases'];
+
 const enrichReviewItems = async (cafeId, items) => {
   const enriched = [];
   const suggestionInputs = [];
+  // One pool for the whole page. The candidate query is identical for every
+  // review item bar the self exclusion, and running it inside the loop meant
+  // up to 100 round trips returning 10,000 documents for one page load.
+  const pool = items.some((item) => item.reviewStatus === 'needs_review')
+    ? await loadMatchCandidatePool(cafeId)
+    : [];
   for (const item of items) {
     const candidates = item.reviewStatus === 'needs_review'
-      ? await findMatchCandidates(cafeId, item)
+      ? await findMatchCandidates(cafeId, item, { pool })
       : [];
     enriched.push({
       ...item,
@@ -231,6 +241,10 @@ const update = async (req, res, next) => {
     }
 
     Object.assign(item, payload);
+    // Whatever the owner just typed is theirs to keep. Without this the rebuild
+    // two lines below relearned it from sales and reverted the edit before the
+    // 200 was written -- the change looked saved and was gone on reload.
+    markManualFields(item, MANUAL_FIELDS.filter((field) => req.body[field] !== undefined));
     await item.save();
     await updateTransactionMenuItemLinks(req.user.cafeId, item, item);
     await rebuildItemsForCafe(req.user.cafeId);
@@ -247,10 +261,23 @@ const reconciliation = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
     const limit = Math.max(1, Math.min(Number.parseInt(req.query.limit, 10) || 50, MAX_RECONCILIATION_ITEMS));
-    const items = await Item.find(reconciliationFilter(cafeId))
-      .sort({ reviewStatus: -1, lastPriceMismatchAt: -1, totalSold: -1 })
-      .limit(limit)
-      .lean();
+    const filter = reconciliationFilter(cafeId);
+    // Counted against the collection, not against the page. Derived from the
+    // truncated page, "needs review: 50" was the limit rather than the backlog:
+    // an owner cleared all 50, reloaded, saw 50 again and had no way to tell
+    // whether they were making progress.
+    const [items, needsReview, priceMismatches] = await Promise.all([
+      Item.find(filter)
+        .sort({ reviewStatus: -1, lastPriceMismatchAt: -1, totalSold: -1 })
+        .limit(limit)
+        .lean(),
+      Item.countDocuments({ ...filter, reviewStatus: 'needs_review' }),
+      Item.countDocuments({
+        cafeId,
+        isActive: { $ne: false },
+        $or: [{ priceMismatchCount: { $gt: 0 } }, { lastPriceMismatchAt: { $ne: null } }],
+      }),
+    ]);
 
     const { enriched, suggestionInputs } = await enrichReviewItems(cafeId, items);
 
@@ -265,8 +292,9 @@ const reconciliation = async (req, res, next) => {
       success: true,
       items: enriched,
       meta: {
-        needsReview: enriched.filter((item) => item.reviewStatus === 'needs_review').length,
-        priceMismatches: enriched.filter((item) => item.priceMismatchCount > 0 || item.lastPriceMismatchAt).length,
+        needsReview,
+        priceMismatches,
+        returned: enriched.length,
         limit,
         paidAiUsed: false,
       },

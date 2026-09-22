@@ -553,4 +553,50 @@ describe('Account API', () => {
       expect.objectContaining({ featureKey: 'ask_guava_chat', credits: 3 })
     );
   });
+
+  it('does not report released credit reservations as recent activity', async () => {
+    const UsageLedger = require('../../src/models/UsageLedger.model');
+    const base = {
+      orgId: ownerUser.orgId,
+      cafeId: ownerUser.activeCafeId,
+      userId: ownerUser.id,
+      provider: 'anthropic',
+    };
+    await UsageLedger.create([
+      {
+        ...base,
+        featureKey: 'ask_guava_chat',
+        label: 'Ask Guava answer',
+        credits: 3,
+        status: 'refunded',
+        recoveryReason: 'operation_failed',
+      },
+      {
+        ...base,
+        featureKey: 'import_column_mapping',
+        label: 'AI import column mapping',
+        credits: 10,
+        status: 'refunded',
+        recoveryReason: 'operation_failed',
+      },
+      {
+        ...base,
+        featureKey: 'menu_item_ai_review',
+        label: 'Menu item AI review',
+        credits: 1,
+        status: 'committed',
+      },
+    ]);
+
+    const res = await request
+      .get('/api/account')
+      .set('Authorization', `Bearer ${ownerToken}`);
+
+    expect(res.status).toBe(200);
+    const { recent } = res.body.account.usage.creditLedger;
+    expect(recent).toHaveLength(1);
+    expect(recent[0]).toEqual(
+      expect.objectContaining({ featureKey: 'menu_item_ai_review', credits: 1, status: 'committed' })
+    );
+  });
 });

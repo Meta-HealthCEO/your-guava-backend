@@ -522,22 +522,45 @@ const computeSuggestedStockMap = async (
   );
 };
 
+/**
+ * Resolves whether the cafe trades on the target day and by how much.
+ *
+ * `source` records where a closure came from -- 'schedule' for the trading
+ * hours in Settings, 'event' for a closure or partial-closure event in Factors
+ * -- because the remedy the operator is shown has to match the cause.
+ */
 const getTradingAvailability = (cafe, events, dayOfWeek) => {
   const schedule = getCafeTradingHours(cafe).find((entry) => entry.dayOfWeek === dayOfWeek);
   if (!schedule?.isOpen) {
-    return { status: 'closed', multiplier: 0, reason: 'Cafe is closed in its trading hours' };
+    return {
+      status: 'closed',
+      multiplier: 0,
+      reason: 'Cafe is closed in its trading hours',
+      source: 'schedule',
+    };
   }
 
   const fullClosure = (events || []).find((event) => event.type === 'closure');
   if (fullClosure) {
-    return { status: 'closed', multiplier: 0, reason: fullClosure.name || 'Cafe closure' };
+    return {
+      status: 'closed',
+      multiplier: 0,
+      reason: fullClosure.name || 'Cafe closure',
+      source: 'event',
+      eventName: fullClosure.name || '',
+    };
   }
 
   const openMinutes = parseTime(schedule.openTime);
   const closeMinutes = parseTime(schedule.closeTime);
   const scheduledMinutes = closeMinutes != null && openMinutes != null ? closeMinutes - openMinutes : 0;
   if (scheduledMinutes <= 0) {
-    return { status: 'closed', multiplier: 0, reason: 'Cafe has no valid trading window' };
+    return {
+      status: 'closed',
+      multiplier: 0,
+      reason: 'Cafe has no valid trading window',
+      source: 'schedule',
+    };
   }
 
   const closureIntervals = (events || [])
@@ -575,9 +598,46 @@ const getTradingAvailability = (cafe, events, dayOfWeek) => {
       status: multiplier === 0 ? 'closed' : 'ready',
       multiplier,
       reason: multiplier === 0 ? 'Partial closures cover the full trading day' : 'Reduced trading hours',
+      source: 'event',
     };
   }
   return { status: 'ready', multiplier: 1, reason: '' };
+};
+
+/**
+ * Words the explanation for a day that is forecasting zero, and says whether
+ * that zero contradicts the sales record.
+ *
+ * Configuration is never checked against reality anywhere else, and the two
+ * can disagree silently: a weekday marked closed still forecasts zero even
+ * when months of sales exist for it. That mis-set Sunday cost ~9 points of
+ * aggregate accuracy before anyone noticed, because a zero forecast on a
+ * trading day looks like a quiet day rather than a broken setting.
+ *
+ * The remedy has to match the cause. A closure that comes from the trading
+ * hours schedule is fixed in Settings. One that comes from a closure event is
+ * deliberate -- the operator recorded it precisely because the cafe normally
+ * trades that day -- so it is fixed in Factors and is not a contradiction.
+ * Sending an event closure to the trading hours pointed people at the wrong
+ * screen.
+ */
+const describeClosedDay = (trading, { salesCount = 0, observedWeeks = 0, maxWeeks } = {}) => {
+  if (trading.source === 'event') {
+    const closure = trading.eventName ? `Closed for ${trading.eventName}` : trading.reason;
+    return {
+      contradictsHistory: false,
+      reason: `${closure}. Remove the event in Factors if the cafe is trading.`,
+    };
+  }
+  if (observedWeeks > 0 && salesCount > 0) {
+    return {
+      contradictsHistory: true,
+      reason:
+        `${trading.reason}, but ${salesCount} sales were recorded on this weekday in the last ` +
+        `${maxWeeks} weeks. Check the trading hours in Settings — this day is forecasting zero.`,
+    };
+  }
+  return { contradictsHistory: false, reason: trading.reason };
 };
 
 /**
@@ -604,14 +664,28 @@ const generateForecast = async (cafeId, targetDate, options = {}) => {
   const nextTarget = addZonedDays(target, 1, timezone);
   const targetDayOfWeek = zonedDayOfWeek(target, timezone);
 
-  // Fetch last 8 weeks of same-day-of-week transactions
-  const eightWeeksAgo = addZonedDays(target, -56, timezone);
+  // Settings first: the history window depends on them. The plan is resolved
+  // here too, because the lookback is a Pro factor and the window has to follow
+  // the plan-clamped value, not whatever is stored on the cafe.
+  const org = cafe?.orgId ? await Organization.findById(cafe.orgId).lean() : null;
+  const plan = org?.plan || 'starter';
+  const settings = getForecastSettings(cafe, plan);
+  const entitlements = getFactorEntitlements(plan);
+  const learningEnabled = factorUnlocked(plan, 'learning') && settings.learning.enabled;
+
+  // Fetch the lookback's worth of same-day-of-week transactions. This was a
+  // fixed 56 days while the Factors page let a Pro lookback go to 16 weeks, so
+  // week buckets 8-15 could never be populated and a longer lookback was
+  // inert; a shorter one merely fetched rows that groupByWeekAndItem then
+  // discarded. Bucket k holds days k*7+1 to (k+1)*7 before the target, so a
+  // window of exactly maxWeeks*7 days feeds every bucket and nothing else.
+  const historyWindowStart = addZonedDays(target, -settings.history.maxWeeks * 7, timezone);
 
   const transactions = await Transaction.find({
     cafeId,
     dayOfWeek: targetDayOfWeek,
     status: 'approved',
-    date: { $gte: eightWeeksAgo, $lt: target },
+    date: { $gte: historyWindowStart, $lt: target },
   }).lean();
 
   const historyDates = transactions.map((tx) => new Date(tx.date));
@@ -625,11 +699,6 @@ const generateForecast = async (cafeId, targetDate, options = {}) => {
       : undefined;
 
   // Get cafe location for weather
-  const org = cafe?.orgId ? await Organization.findById(cafe.orgId).lean() : null;
-  const plan = org?.plan || 'starter';
-  const settings = getForecastSettings(cafe, plan);
-  const entitlements = getFactorEntitlements(plan);
-  const learningEnabled = factorUnlocked(plan, 'learning') && settings.learning.enabled;
   const lat = cafe.location?.lat;
   const lng = cafe.location?.lng;
   const hasCoordinates = Number.isFinite(lat) && Number.isFinite(lng) &&
@@ -771,18 +840,18 @@ const generateForecast = async (cafeId, targetDate, options = {}) => {
     : observedWeeks < weeksRequired
       ? 'insufficient_data'
       : 'ready';
-  // Configuration is never checked against reality anywhere else, and the two
-  // can disagree silently: a weekday marked closed still forecasts zero even
-  // when months of sales exist for it. That mis-set Sunday cost ~9 points of
-  // aggregate accuracy before anyone noticed, because a zero forecast on a
-  // trading day looks like a quiet day rather than a broken setting.
-  // `transactions` is already the matching-weekday window, so this is free.
-  const contradictsHistory =
-    availabilityStatus === 'closed' && observedWeeks > 0 && transactions.length > 0;
+  // `transactions` is already the matching-weekday window, so the
+  // contradiction check in describeClosedDay is free.
+  const closedDay = availabilityStatus === 'closed'
+    ? describeClosedDay(trading, {
+        salesCount: transactions.length,
+        observedWeeks,
+        maxWeeks: settings.history.maxWeeks,
+      })
+    : { contradictsHistory: false, reason: '' };
+  const contradictsHistory = closedDay.contradictsHistory;
   const availabilityReason = availabilityStatus === 'closed'
-    ? (contradictsHistory
-      ? `${trading.reason}, but ${transactions.length} sales were recorded on this weekday in the last ${settings.history.maxWeeks} weeks. Check the trading hours in Settings — this day is forecasting zero.`
-      : trading.reason)
+    ? closedDay.reason
     : availabilityStatus === 'insufficient_data'
       ? `At least ${weeksRequired} observed matching trading days are required; ${observedWeeks} available`
       : '';
@@ -1056,6 +1125,7 @@ module.exports = {
     groupByWeekAndItem,
     weightedAverage,
     getTradingAvailability,
+    describeClosedDay,
     forecastConfidence,
     computeSuggestedStockFromPairs,
     requiredHistoryWeeks,

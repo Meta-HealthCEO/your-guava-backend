@@ -6,6 +6,7 @@ const Cafe = require('../../src/models/Cafe.model');
 const Organization = require('../../src/models/Organization.model');
 const AuthSession = require('../../src/models/AuthSession.model');
 const { createOAuthState, verifyOAuthState } = require('../../src/services/yoco.service');
+const { globalLimiter } = require('../../src/middleware/rateLimit.middleware');
 
 const request = supertest(app);
 
@@ -164,6 +165,21 @@ describe('Refresh token rotation', () => {
     const secondRefresh = await request.post('/api/auth/refresh').set('Cookie', secondCookie);
     expect(firstRefresh.status).toBe(401);
     expect(secondRefresh.status).toBe(200);
+  });
+});
+
+describe('Rate limiter CORS ordering', () => {
+  it('applies CORS before the global rate limiter so 429 responses carry CORS headers', () => {
+    // The limiter skips itself under NODE_ENV=test, so ordering is asserted
+    // structurally: a 429 short-circuits the stack, and only middleware mounted
+    // before the limiter gets to set Access-Control-Allow-Origin on it.
+    const stack = app.router.stack;
+    const corsIndex = stack.findIndex((layer) => layer.handle.name === 'corsMiddleware');
+    const limiterIndex = stack.findIndex((layer) => layer.handle === globalLimiter);
+
+    expect(corsIndex).toBeGreaterThan(-1);
+    expect(limiterIndex).toBeGreaterThan(-1);
+    expect(corsIndex).toBeLessThan(limiterIndex);
   });
 });
 

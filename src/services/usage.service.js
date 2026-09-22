@@ -2,7 +2,12 @@ const crypto = require('crypto');
 const mongoose = require('mongoose');
 const Organization = require('../models/Organization.model');
 const UsageLedger = require('../models/UsageLedger.model');
-const { addBillingCycle, getPlan, nextCreditResetDate } = require('./billingPlans.service');
+const {
+  addBillingCycle,
+  addUtcMonthsClamped,
+  getPlan,
+  nextMonthlyAnniversary,
+} = require('./billingPlans.service');
 
 const FEATURE_COSTS = {
   ask_guava_chat: { credits: 3, label: 'Ask Guava answer', provider: 'anthropic' },
@@ -62,12 +67,6 @@ const asDate = (value) => {
   if (!value) return null;
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
-};
-
-const minDate = (...values) => {
-  const dates = values.map(asDate).filter(Boolean);
-  if (dates.length === 0) return null;
-  return new Date(Math.min(...dates.map((date) => date.getTime())));
 };
 
 const inferredTrialEnd = (org) => {
@@ -139,13 +138,39 @@ const billingRequiredError = (access) => {
   return err;
 };
 
+/**
+ * The instant the paid credit window is anchored on: the start of the billing
+ * period, which is the only value that says when this organisation's month
+ * begins.
+ */
+const creditWindowAnchor = (org, access, now) => {
+  const explicitStart = asDate(org?.currentPeriodStart) || asDate(org?.subscriptionStartedAt);
+  if (explicitStart) return explicitStart;
+
+  // A legacy document may carry only a period end. Stepping it back by the
+  // billing cycle recovers the start, so an annual subscriber keeps refreshing
+  // monthly instead of waiting a year for the end date itself to come round.
+  const periodEnd = asDate(access?.periodEnd);
+  if (periodEnd) {
+    return addUtcMonthsClamped(periodEnd, org?.billingCycle === 'annual' ? -12 : -1);
+  }
+  return asDate(org?.aiCredits?.resetAt) || now;
+};
+
 const creditResetDateForOrganization = (
   org,
   access = billingAccessForOrganization(org),
   now = new Date()
 ) => {
+  // A trial is a single window: one allowance for the whole trial.
   if (access.status === 'trialing' && access.periodEnd) return new Date(access.periodEnd);
-  return minDate(nextCreditResetDate(now), access.periodEnd) || nextCreditResetDate(now);
+
+  // A paid allowance renews on the subscription's own monthly anniversary.
+  // Taking the earlier of the calendar rollover and the period end used to hand
+  // every organisation whose renewal day was not the 1st two full allowances a
+  // month -- one at the rollover and a second at its own renewal -- so the
+  // period end now caps access only and never grants credits.
+  return nextMonthlyAnniversary(creditWindowAnchor(org, access, now), now);
 };
 
 const nonNegativeNumber = (value) => Math.max(0, Number(value) || 0);
@@ -567,9 +592,15 @@ const enforceAiUsagePolicy = async ({ orgId, userId, featureKey, credits }, sess
           userId: policyUserId,
           featureKey: { $in: [...AI_FEATURE_KEYS] },
           status: { $in: ['reserved', 'recovering', 'committed'] },
-          $expr: {
-            $gte: [{ $ifNull: ['$reservedAt', '$createdAt'] }, since],
-          },
+          // An $expr over a computed field cannot use an index, so this used to
+          // scan every ledger row the organisation had ever written -- inside
+          // the reservation transaction, on every paid AI request. The $or is
+          // the same 24-hour window as an indexable range plus a legacy branch
+          // for rows written before reservedAt existed.
+          $or: [
+            { reservedAt: { $gte: since } },
+            { reservedAt: null, createdAt: { $gte: since } },
+          ],
         },
       },
       { $group: { _id: null, credits: { $sum: '$credits' } } },
@@ -580,9 +611,15 @@ const enforceAiUsagePolicy = async ({ orgId, userId, featureKey, credits }, sess
           orgId: policyOrgId,
           featureKey: { $in: [...AI_FEATURE_KEYS] },
           status: { $in: ['reserved', 'recovering', 'committed'] },
-          $expr: {
-            $gte: [{ $ifNull: ['$reservedAt', '$createdAt'] }, since],
-          },
+          // An $expr over a computed field cannot use an index, so this used to
+          // scan every ledger row the organisation had ever written -- inside
+          // the reservation transaction, on every paid AI request. The $or is
+          // the same 24-hour window as an indexable range plus a legacy branch
+          // for rows written before reservedAt existed.
+          $or: [
+            { reservedAt: { $gte: since } },
+            { reservedAt: null, createdAt: { $gte: since } },
+          ],
         },
       },
       { $group: { _id: null, credits: { $sum: '$credits' } } },
@@ -783,6 +820,58 @@ const finishUsage = (ledger, status, { resultPayload, providerDiagnostics } = {}
     { new: true }
   );
 
+/**
+ * Commits a reservation the stale-reservation reconciler already refunded.
+ *
+ * A run that outlives its lease still cost real provider money, and on the SSE
+ * path its answer is already on the customer's screen, so discarding it is the
+ * worst available outcome -- the reserved-only commit filter used to throw the
+ * answer away and leave the idempotency key pointing at a refunded row, making
+ * the client's retry pay for the whole generation again. The row is claimed
+ * first and the credits taken back afterwards, so the charge can never be
+ * applied to a row this worker does not own.
+ */
+const commitAfterLeaseBreach = async (ledger, orgId, { resultPayload, providerDiagnostics }) => {
+  const claimed = await UsageLedger.findOneAndUpdate(
+    { _id: ledger._id, status: 'refunded', recoveryReason: 'stale_reservation' },
+    {
+      $set: {
+        status: 'committed',
+        completedAt: new Date(),
+        recoveryReason: 'lease_breach_recommitted',
+        ...(resultPayload !== undefined ? { resultPayload } : {}),
+        ...(providerDiagnostics !== undefined ? { providerDiagnostics } : {}),
+      },
+    },
+    { new: true }
+  );
+  if (!claimed) return null;
+
+  console.warn(
+    `[usage] reservation ${claimed._id} outlived its lease and was recommitted for org ${orgId}`
+  );
+  const recharge = await reserveCreditsAtomic(orgId, claimed.credits, new Date());
+  if (!recharge) {
+    // The answer was delivered, so the row stays committed. Recording that the
+    // credits could not be taken again keeps the ledger honest.
+    return UsageLedger.findOneAndUpdate(
+      { _id: claimed._id, status: 'committed' },
+      { $set: { recoveryReason: 'lease_breach_uncharged' } },
+      { new: true }
+    );
+  }
+  return UsageLedger.findOneAndUpdate(
+    { _id: claimed._id, status: 'committed' },
+    {
+      $set: {
+        creditAllocation: recharge.allocation,
+        creditWindowResetAt: asDate(recharge.org.aiCredits?.resetAt),
+      },
+    },
+    { new: true }
+  );
+};
+
 const refundAndFinishUsage = async ({
   ledger,
   orgId,
@@ -942,9 +1031,25 @@ const meterGuavaCredits = async ({
   run,
 }) => {
   const config = FEATURE_COSTS[featureKey] || {};
-  const amount = normalizeCreditAmount(credits ?? config.credits ?? 1);
+  const requested = credits ?? config.credits ?? 1;
+  // normalizeCreditAmount maps anything unparseable to 0, and 0 takes the
+  // unmetered path below: no billing check, no reservation and no ledger row.
+  // A bad amount must fail loudly rather than quietly give the paid product away.
+  const requestedNumber = Number(requested);
+  if (!Number.isFinite(requestedNumber) || requestedNumber < 0) {
+    const err = new Error('A non-negative Guava Credit amount is required');
+    err.statusCode = 400;
+    err.code = 'INVALID_CREDIT_AMOUNT';
+    throw err;
+  }
+  const amount = normalizeCreditAmount(requestedNumber);
 
   if (amount === 0) {
+    // A zero-cost feature is still part of the paid product, so it stays behind
+    // the same paywall even though there is nothing to charge for it.
+    const current = await refreshCreditWindow(orgId);
+    const access = billingAccessForOrganization(current);
+    if (!access.allowed) throw billingRequiredError(access);
     const result = await run();
     const org = await Organization.findById(orgId);
     return { result, guavaCredits: org ? creditSnapshot(org) : null, usage: null };
@@ -998,6 +1103,9 @@ const meterGuavaCredits = async ({
     const committed = await finishUsage(ledger, 'committed', {
       resultPayload: result,
       providerDiagnostics,
+    }) || await commitAfterLeaseBreach(ledger, orgId, {
+      resultPayload: result,
+      providerDiagnostics,
     });
     if (!committed) throw new Error('Could not commit Guava Credit usage');
     const org = await Organization.findById(orgId);
@@ -1023,7 +1131,12 @@ const meterGuavaCredits = async ({
       await finishUsage(ledger, 'committed', {
         resultPayload: completedResult,
         providerDiagnostics: completedProviderDiagnostics,
-      }).catch(() => null);
+      })
+        .then((settled) => settled || commitAfterLeaseBreach(ledger, orgId, {
+          resultPayload: completedResult,
+          providerDiagnostics: completedProviderDiagnostics,
+        }))
+        .catch(() => null);
     }
     throw error;
   }
@@ -1047,8 +1160,10 @@ const consumeGuavaCredits = async (orgId, amount = 1, options = {}) => {
 };
 
 const usageSummary = async (orgId, { limit = 12 } = {}) => {
-  const since = new Date();
-  since.setMonth(since.getMonth() - 1);
+  // setMonth overflows on a long month -- 31 March minus one month lands on 3
+  // March -- which silently dropped the first days of the window it claims to
+  // cover. The clamped helper is the same arithmetic the billing periods use.
+  const since = addUtcMonthsClamped(new Date(), -1);
 
   const [byFeature, recent] = await Promise.all([
     UsageLedger.aggregate([
@@ -1069,7 +1184,10 @@ const usageSummary = async (orgId, { limit = 12 } = {}) => {
       },
       { $sort: { credits: -1 } },
     ]),
-    UsageLedger.find({ orgId })
+    // Only settled charges are activity. Reserved/refunded rows are credit
+    // holds that were (or will be) released, and the portal renders whatever
+    // is returned here as spend.
+    UsageLedger.find({ orgId, status: 'committed' })
       .sort({ createdAt: -1 })
       .limit(limit)
       .lean(),

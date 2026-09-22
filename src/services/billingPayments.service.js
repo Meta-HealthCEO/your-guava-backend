@@ -3,10 +3,10 @@ const Cafe = require('../models/Cafe.model');
 const Forecast = require('../models/Forecast.model');
 const Organization = require('../models/Organization.model');
 const PaymentSession = require('../models/PaymentSession.model');
-const { addBillingCycle, getPlan, nextCreditResetDate } = require('./billingPlans.service');
+const { addBillingCycle, getPlan, nextMonthlyAnniversary } = require('./billingPlans.service');
 const paymentProvider = require('./paymentProvider.service');
 const User = require('../models/User.model');
-const { assertPlanChangeCapacity } = require('./planCapacity.service');
+const { getPlanCapacity } = require('./planCapacity.service');
 const { bonusUsedForCredits } = require('./usage.service');
 const { safeTimezone, zonedDayStart } = require('./parser.service');
 
@@ -15,6 +15,13 @@ const INITIALIZATION_LEASE_MS = 60 * 1000;
 const DEFAULT_RECONCILIATION_AGE_MS = 2 * 60 * 1000;
 const DEFAULT_RECONCILIATION_BATCH_SIZE = 20;
 const MAX_IDEMPOTENCY_KEY_LENGTH = 160;
+// A handful of retries absorbs a transient database or concurrency failure;
+// beyond that the failure is structural and hiding it in a retry loop is worse
+// than surfacing it.
+const MAX_FULFILLMENT_FAILURES = 3;
+// A checkout the customer never completed must stop consuming sweep slots, or
+// a genuinely paid session queued behind them waits minutes to be reconciled.
+const PENDING_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 const paymentInitiationError = (message, code, statusCode = 400, details = {}) => {
   const err = new Error(message);
@@ -126,6 +133,34 @@ const billingPeriodForPayment = (org, billingCycle = 'monthly', now = new Date()
 
 const appliedReferences = (org) => (org?.fulfilledPaymentReferences || []).map(String);
 
+/**
+ * Reports a plan that the organisation has already outgrown.
+ *
+ * Capacity is enforced before the customer is sent to checkout. Re-checking it
+ * after the card has been captured could only ever refuse money that is already
+ * taken, so an organisation that outgrew the plan while the checkout page was
+ * open gets the plan it paid for and an operational warning instead. The
+ * account payload already reports used-versus-included seats and locations, so
+ * the owner sees the same overage and the ordinary limits stop it growing.
+ */
+const warnOnOverCapacityPlan = async (orgId, previousPlanId, nextPlanId) => {
+  const previousPlan = getPlan(previousPlanId);
+  const nextPlan = getPlan(nextPlanId);
+  if (
+    nextPlan.includedSeats >= previousPlan.includedSeats &&
+    nextPlan.includedLocations >= previousPlan.includedLocations
+  ) {
+    return;
+  }
+  const capacity = await getPlanCapacity(orgId, nextPlan.id);
+  if (!capacity.seats.exceeded && !capacity.locations.exceeded) return;
+  console.warn(
+    `[billing] org ${orgId} is over capacity on the paid ${nextPlan.id} plan:`,
+    `${capacity.seats.used}/${capacity.seats.included} seats,`,
+    `${capacity.locations.used}/${capacity.locations.included} locations`
+  );
+};
+
 const applyPlanPayment = async (paymentSession, transaction) => {
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const org = await Organization.findById(paymentSession.orgId).select('+fulfilledPaymentReferences');
@@ -139,14 +174,13 @@ const applyPlanPayment = async (paymentSession, transaction) => {
     }
 
     const selectedPlan = getPlan(paymentSession.plan);
-    await assertPlanChangeCapacity(org._id, org.plan, selectedPlan.id);
     const planChanged = org.plan !== selectedPlan.id;
     const now = new Date();
     const period = billingPeriodForPayment(org, paymentSession.billingCycle, now);
-    const resetAt = new Date(Math.min(
-      nextCreditResetDate(now).getTime(),
-      period.currentPeriodEnd.getTime()
-    ));
+    // The allowance window runs from the subscription anniversary, so a new
+    // paid period starts a full window rather than a stub that expires at the
+    // next calendar rollover and then grants a second allowance.
+    const resetAt = nextMonthlyAnniversary(period.currentPeriodStart, now);
     const existingPeriodEnd = org.currentPeriodEnd ? new Date(org.currentPeriodEnd) : null;
     const existingResetAt = org.aiCredits?.resetAt ? new Date(org.aiCredits.resetAt) : null;
     const hasLivePaidPeriod =
@@ -190,7 +224,10 @@ const applyPlanPayment = async (paymentSession, transaction) => {
       { new: true, runValidators: true }
     ).select('+fulfilledPaymentReferences');
 
-    if (updated) return { org: updated, applied: true, planChanged };
+    if (updated) {
+      await warnOnOverCapacityPlan(org._id, org.plan, selectedPlan.id).catch(() => null);
+      return { org: updated, applied: true, planChanged };
+    }
   }
 
   throw new Error('Could not apply plan payment after concurrent billing updates');
@@ -355,6 +392,60 @@ const claimPaymentSession = async (reference, webhookPayload, { orgId } = {}) =>
 
   if (claimed) return { session: claimed, claimed: true };
   return { session: await PaymentSession.findById(existing._id), claimed: false };
+};
+
+/**
+ * Records a capture that could not be applied.
+ *
+ * A confirmed capture with no plan or credits delivered is money taken for
+ * nothing, and releasing it back to `pending` makes the 60-second sweeper retry
+ * the same failure forever with no dead-letter state and no alert. After a
+ * bounded number of genuine fulfilment failures the session becomes terminal
+ * and visible instead, so a person can refund or fix it.
+ */
+const recordFulfillmentFailure = async (paymentSession, transaction, error) => {
+  const reason = String(error?.message || 'Fulfillment failed').slice(0, 500);
+  const failed = await PaymentSession.findOneAndUpdate(
+    {
+      _id: paymentSession._id,
+      status: 'processing',
+      processingStartedAt: paymentSession.processingStartedAt,
+    },
+    {
+      $inc: { fulfillmentFailures: 1 },
+      $set: { ...sessionFieldsFromTransaction(transaction), providerReason: reason },
+    },
+    { new: true, runValidators: true }
+  );
+  // A newer worker owns the lease; it will record its own outcome.
+  if (!failed) return null;
+
+  if ((failed.fulfillmentFailures || 0) < MAX_FULFILLMENT_FAILURES) {
+    return releaseProcessingSession(
+      failed._id,
+      paymentSession.processingStartedAt,
+      'pending',
+      reason
+    );
+  }
+
+  console.error(
+    `[billing] captured payment ${failed.reference} could not be fulfilled after`,
+    `${failed.fulfillmentFailures} attempts and needs manual attention:`,
+    reason
+  );
+  return PaymentSession.findOneAndUpdate(
+    {
+      _id: failed._id,
+      status: 'processing',
+      processingStartedAt: paymentSession.processingStartedAt,
+    },
+    {
+      $set: { status: 'needs_attention', failedAt: new Date(), providerReason: reason },
+      $unset: { processingStartedAt: 1 },
+    },
+    { new: true, runValidators: true }
+  );
 };
 
 const releaseProcessingSession = (sessionId, processingStartedAt, status = 'pending', reason) =>
@@ -547,9 +638,16 @@ const reconcileOneGatePayment = async (reference, webhookPayload = null, options
     }
 
     if (isPaidTransaction(transaction)) {
-      const result = paymentSession.kind === 'plan'
-        ? await applyPlanPayment(paymentSession, transaction)
-        : await applyCreditPayment(paymentSession);
+      let result;
+      try {
+        result = paymentSession.kind === 'plan'
+          ? await applyPlanPayment(paymentSession, transaction)
+          : await applyCreditPayment(paymentSession);
+      } catch (fulfillmentError) {
+        await recordFulfillmentFailure(paymentSession, transaction, fulfillmentError)
+          .catch(() => null);
+        throw fulfillmentError;
+      }
       financialEffectApplied = true;
 
       const paid = await PaymentSession.findOneAndUpdate(
@@ -628,10 +726,32 @@ const reconcilePendingOneGatePayments = async ({
   const boundedConcurrency = Math.max(1, Math.min(Number(concurrency) || 4, 10));
   const pendingBefore = new Date(now.getTime() - Math.max(30_000, Number(minAgeMs) || 0));
   const staleProcessingBefore = new Date(now.getTime() - PROCESSING_LEASE_MS);
+  const expiredBefore = new Date(now.getTime() - PENDING_SESSION_TTL_MS);
+  const hostedProviders = paymentProvider.hostedProviderNames();
+
+  // Retire checkouts the customer abandoned. Nothing is lost by doing so: the
+  // provider never recorded a transaction against them, and if one ever settles
+  // late the return or webhook can still claim a cancelled session.
+  await PaymentSession.updateMany(
+    {
+      provider: { $in: hostedProviders },
+      status: 'pending',
+      providerTransactionId: { $exists: false },
+      createdAt: { $lt: expiredBefore },
+    },
+    {
+      $set: {
+        status: 'cancelled',
+        failedAt: now,
+        providerReason: 'Checkout expired without payment',
+      },
+    }
+  );
+
   const sessions = await PaymentSession.find({
     // Every hosted provider needs reconciling, not just the original one. A
     // name hard-coded here silently strands the other provider's payments.
-    provider: { $in: paymentProvider.hostedProviderNames() },
+    provider: { $in: hostedProviders },
     $and: [
       {
         $or: [
@@ -641,7 +761,11 @@ const reconcilePendingOneGatePayments = async ({
       },
       {
         $or: [
-          { status: 'pending', updatedAt: { $lte: pendingBefore } },
+          {
+            status: 'pending',
+            updatedAt: { $lte: pendingBefore },
+            createdAt: { $gte: expiredBefore },
+          },
           { status: 'processing', processingStartedAt: { $lt: staleProcessingBefore } },
         ],
       },

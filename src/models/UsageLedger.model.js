@@ -102,6 +102,11 @@ const usageLedgerSchema = new mongoose.Schema(
 
 usageLedgerSchema.index({ orgId: 1, createdAt: -1 });
 usageLedgerSchema.index({ status: 1, reservedAt: 1 });
+// The AI safety-budget check runs inside the reservation transaction on every
+// paid request. Both of its rolling 24-hour windows are served from here, so
+// latency stays flat instead of growing with an organisation's lifetime usage.
+usageLedgerSchema.index({ orgId: 1, status: 1, reservedAt: -1 });
+usageLedgerSchema.index({ orgId: 1, userId: 1, status: 1, reservedAt: -1 });
 usageLedgerSchema.index(
   { orgId: 1, idempotencyKey: 1 },
   {

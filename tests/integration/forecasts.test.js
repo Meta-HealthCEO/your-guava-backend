@@ -144,12 +144,33 @@ describe('Forecasts API', () => {
       expect(res.body.settings.events.enabled).toBe(false);
       expect(res.body.settings.events.highPct).toBe(35);
       expect(res.body.savedSettings.events.enabled).toBe(true);
+      expect(res.body.effective).toEqual(res.body.settings);
       expect(res.body.entitlements.lockedKeys).toEqual(
         expect.arrayContaining(['events', 'payday', 'loadShedding', 'stock', 'history', 'learning'])
       );
     });
 
+    it('shows what actually applies next to what is stored', async () => {
+      // A locked value can be on file from before the plan gate refused it, or
+      // from before a downgrade. The stored view keeps it; the effective view
+      // is what the forecast will actually use.
+      const Cafe = require('../../src/models/Cafe.model');
+      const cafe = await Cafe.findOne({});
+      await Cafe.updateOne({ _id: cafe._id }, { $set: { forecastSettings: { history: { maxWeeks: 12 } } } });
+
+      const res = await request
+        .get('/api/forecasts/factors')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.savedSettings.history.maxWeeks).toBe(12);
+      expect(res.body.effective.history.maxWeeks).toBe(8);
+    });
+
     it('updates factor settings and clears future forecasts for regeneration', async () => {
+      // Payday and events unlock on Growth; on Starter this request is refused (below).
+      const Organization = require('../../src/models/Organization.model');
+      await Organization.findByIdAndUpdate(user.orgId, { plan: 'growth' });
       await request.get('/api/forecasts/week').set('Authorization', `Bearer ${token}`);
 
       const Forecast = require('../../src/models/Forecast.model');
@@ -162,9 +183,93 @@ describe('Forecasts API', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.savedSettings.payday.pct).toBe(12);
-      expect(res.body.settings.payday.enabled).toBe(false);
-      expect(res.body.settings.events.highPct).toBe(48);
+      expect(res.body.effective.payday.pct).toBe(12);
+      expect(res.body.effective.events.highPct).toBe(48);
       expect(await Forecast.countDocuments({})).toBe(0);
+    });
+
+    it('refuses to change a factor the plan has not unlocked', async () => {
+      // This request used to be accepted, echoed back as 12, and then clamped
+      // to 8 when the forecast ran: a setting that visibly did nothing.
+      const res = await request
+        .put('/api/forecasts/factors')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ settings: { history: { maxWeeks: 12 } } });
+
+      expect(res.status).toBe(402);
+      expect(res.body).toEqual(expect.objectContaining({
+        success: false,
+        code: 'PLAN_UPGRADE_REQUIRED',
+        factor: 'history',
+        requiredPlan: 'pro',
+      }));
+      expect(res.body.message).toMatch(/Pro plan/);
+
+      const after = await request
+        .get('/api/forecasts/factors')
+        .set('Authorization', `Bearer ${token}`);
+      expect(after.body.savedSettings.history.maxWeeks).toBe(8);
+    });
+
+    it('does not refuse a locked factor sent back unchanged', async () => {
+      const res = await request
+        .put('/api/forecasts/factors')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ settings: { history: { maxWeeks: 8 }, weather: { hotTemp: 29 } } });
+
+      expect(res.status).toBe(200);
+      expect(res.body.savedSettings.weather.hotTemp).toBe(29);
+      expect(res.body.savedSettings.history.maxWeeks).toBe(8);
+    });
+
+    it('accepts locked factors echoed back at their effective values', async () => {
+      // The Factors page loads the effective view and sends the whole thing
+      // back, so locked sections always arrive at their clamped values. That is
+      // not an attempt to change them, and must neither be refused nor
+      // overwrite what is stored.
+      const current = await request
+        .get('/api/forecasts/factors')
+        .set('Authorization', `Bearer ${token}`);
+      const settings = {
+        ...current.body.settings,
+        weather: { ...current.body.settings.weather, hotTemp: 29 },
+      };
+
+      const res = await request
+        .put('/api/forecasts/factors')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ settings });
+
+      expect(res.status).toBe(200);
+      expect(res.body.savedSettings.weather.hotTemp).toBe(29);
+      expect(res.body.savedSettings.stock).toEqual({ safetyMarginPct: 10, maxBiasPct: 50 });
+      expect(res.body.savedSettings.events.enabled).toBe(true);
+      expect(res.body.effective.stock).toEqual({ safetyMarginPct: 0, maxBiasPct: 0 });
+    });
+
+    it('honours a history lookback change on the Pro plan', async () => {
+      const Organization = require('../../src/models/Organization.model');
+      await Organization.findByIdAndUpdate(user.orgId, { plan: 'pro' });
+
+      const res = await request
+        .put('/api/forecasts/factors')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ settings: { history: { maxWeeks: 12 } } });
+
+      expect(res.status).toBe(200);
+      expect(res.body.savedSettings.history.maxWeeks).toBe(12);
+      expect(res.body.effective.history.maxWeeks).toBe(12);
+
+      const target = new Date();
+      target.setDate(target.getDate() + 3);
+      target.setHours(12, 0, 0, 0);
+      const generated = await request
+        .post('/api/forecasts/generate')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ date: target.toISOString() });
+
+      expect(generated.status).toBe(200);
+      expect(generated.body.forecast.factorSettings.history.maxWeeks).toBe(12);
     });
   });
 

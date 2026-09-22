@@ -628,6 +628,53 @@ describe('Uploads API', () => {
       expect(upload.columnMapping.receiptId).toBeUndefined();
     });
 
+    it('counts a receipt number reused on other days as importable when remapping', async () => {
+      // Tills that restart numbering each morning reuse "#0001" daily. The
+      // write path scopes a receipt by its cafe-local trading day, but the
+      // remap pre-check keyed on the number alone and refused the remap as
+      // if every row were already held by the earlier upload.
+      const mapping = { receiptId: 'Receipt', date: 'Date', time: 'Time', items: 'Items', total: 'Total' };
+      const earlier = Buffer.from([
+        'Receipt,Date,Time,Items,Total',
+        '#0001,2026-04-03,08:30,1 x Flat White,35.00',
+      ].join('\n'));
+      const firstStage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', earlier, 'day-three.csv');
+      const firstConfirm = await request
+        .post(`/api/uploads/${firstStage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: mapping, itemsMode: 'packed' });
+      expect(firstConfirm.status).toBe(200);
+
+      const reused = Buffer.from([
+        'Receipt,Date,Time,Items,Total',
+        '#0001,2026-04-01,08:30,1 x Flat White,35.00',
+        '#0001,2026-04-02,08:30,1 x Muffin,25.00',
+      ].join('\n'));
+      const secondStage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', reused, 'reused-numbers.csv');
+      const secondConfirm = await request
+        .post(`/api/uploads/${secondStage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: mapping, itemsMode: 'packed' });
+      expect(secondConfirm.status).toBe(200);
+      expect(secondConfirm.body.stats.imported).toBe(2);
+
+      const res = await request
+        .patch(`/api/uploads/${secondStage.body.uploadId}/mapping`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: mapping, itemsMode: 'packed' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.stats.imported).toBe(2);
+      expect(await Transaction.countDocuments({ uploadId: secondStage.body.uploadId })).toBe(2);
+      expect(await Transaction.countDocuments({ receiptId: '#0001' })).toBe(3);
+    });
+
     it('returns 409 when status is parsing', async () => {
       const stage = await request
         .post('/api/transactions/upload')

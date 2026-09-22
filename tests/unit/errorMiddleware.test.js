@@ -40,6 +40,116 @@ describe('error middleware', () => {
     });
   });
 
+  it('keeps a deliberately safe 5xx message in production when the thrower opts in', () => {
+    // The blanket redaction is right for an unexpected 500 — a stack trace or a
+    // provider body must never reach a browser. But asUpstreamAiError writes a
+    // sentence specifically for the customer ("the AI service is temporarily
+    // unavailable, no credits were charged"), and redacting it to "Internal
+    // Server Error" left a cafe owner with no idea what happened and a
+    // reasonable fear they had just been billed for nothing. Opt-in only, and
+    // only ever set on a fixed string the product authored.
+    process.env.NODE_ENV = 'production';
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    const response = createResponse();
+    const friendly = 'The AI service is temporarily unavailable. No credits were charged — please try again shortly.';
+
+    errorMiddleware(
+      Object.assign(new Error(friendly), {
+        statusCode: 503,
+        exposeMessage: true,
+        upstreamStatus: 401,
+        upstreamMessage: 'authentication_error',
+      }),
+      { id: 'request-9', method: 'POST', path: '/api/forecasts/insights/chat' },
+      response,
+      jest.fn()
+    );
+
+    expect(response.status).toHaveBeenCalledWith(503);
+    expect(response.json).toHaveBeenCalledWith({
+      success: false,
+      message: friendly,
+      requestId: 'request-9',
+    });
+  });
+
+  it('still redacts a 5xx that did not opt in, even alongside upstream detail', () => {
+    process.env.NODE_ENV = 'production';
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    const response = createResponse();
+
+    errorMiddleware(
+      Object.assign(new Error('connect ECONNREFUSED 10.0.0.5:27017'), {
+        statusCode: 500,
+        upstreamStatus: 500,
+      }),
+      { id: 'request-10', method: 'GET', path: '/api/example' },
+      response,
+      jest.fn()
+    );
+
+    expect(response.json).toHaveBeenCalledWith({
+      success: false,
+      message: 'Internal Server Error',
+      requestId: 'request-10',
+    });
+  });
+
+  it('logs upstream provider detail for wrapped AI failures without exposing it to the client', () => {
+    process.env.NODE_ENV = 'development';
+    const logSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const response = createResponse();
+    const rawBody = '{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}';
+    const cause = Object.assign(new Error(`401 ${rawBody}`), {
+      name: 'AuthenticationError',
+      status: 401,
+      error: JSON.parse(rawBody),
+    });
+
+    errorMiddleware(
+      Object.assign(new Error('The AI service is temporarily unavailable.'), {
+        statusCode: 503,
+        upstreamStatus: 401,
+        upstreamMessage: 'authentication_error: invalid x-api-key',
+        cause,
+      }),
+      { id: 'request-2', method: 'POST', path: '/api/forecasts/insights/chat' },
+      response,
+      jest.fn()
+    );
+
+    expect(logSpy).toHaveBeenCalledTimes(1);
+    const entry = JSON.parse(logSpy.mock.calls[0][0]);
+    expect(entry).toEqual(expect.objectContaining({
+      event: 'request_error',
+      statusCode: 503,
+      upstreamStatus: 401,
+      upstreamMessage: 'authentication_error: invalid x-api-key',
+    }));
+    expect(Object.values(entry).join('\n')).not.toContain(rawBody);
+    expect(response.status).toHaveBeenCalledWith(503);
+    expect(response.json).toHaveBeenCalledWith({
+      success: false,
+      message: 'The AI service is temporarily unavailable.',
+      requestId: 'request-2',
+    });
+  });
+
+  it('omits upstream fields from the log when an error carries none', () => {
+    const logSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    errorMiddleware(
+      new Error('boom'),
+      { method: 'GET', path: '/api/example' },
+      createResponse(),
+      jest.fn()
+    );
+
+    const entry = JSON.parse(logSpy.mock.calls[0][0]);
+    expect(entry).not.toHaveProperty('upstreamStatus');
+    expect(entry).not.toHaveProperty('upstreamMessage');
+  });
+
   it('preserves structured details for expected client errors', () => {
     process.env.NODE_ENV = 'production';
     const response = createResponse();

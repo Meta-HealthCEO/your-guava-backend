@@ -12,6 +12,11 @@ const generateRequestId = () => {
   return crypto.randomBytes(16).toString('hex');
 };
 
+// Routers strip their mount prefix from req.path, so by the time the response
+// finishes "/api/auth/me" reads as "/me". originalUrl keeps the full path; the
+// query string is dropped because it can carry tokens.
+const requestPath = (req) => String(req.originalUrl || req.url || '').split('?')[0];
+
 const requestContext = (req, res, next) => {
   const incomingId = String(req.get(REQUEST_ID_HEADER) || '').trim();
   const requestId = REQUEST_ID_PATTERN.test(incomingId) ? incomingId : generateRequestId();
@@ -35,7 +40,7 @@ const requestLogger = (req, res, next) => {
       event: 'http_request',
       requestId: req.id,
       method: req.method,
-      path: req.path,
+      path: requestPath(req),
       statusCode: res.statusCode,
       durationMs: Number(durationMs.toFixed(1)),
       contentLength: Number(res.getHeader('content-length') || 0),

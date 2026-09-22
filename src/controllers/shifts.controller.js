@@ -63,6 +63,45 @@ async function staffBelongsToCafe(staffId, cafeId) {
   return Boolean(staff);
 }
 
+const toMinutes = (time) => {
+  const [hours, minutes] = String(time).split(':').map(Number);
+  return hours * 60 + minutes;
+};
+
+/**
+ * Finds a non-cancelled shift for the same staff member on the same day whose
+ * time range overlaps [startTime, endTime). Touching ranges (one ends exactly
+ * when the other starts) are not an overlap. excludeShiftId skips the shift
+ * being updated so a shift never conflicts with itself.
+ */
+async function findOverlappingShift(cafeId, staffId, date, startTime, endTime, excludeShiftId = null) {
+  const dayStart = new Date(date);
+  dayStart.setUTCHours(0, 0, 0, 0);
+  const dayEnd = new Date(dayStart);
+  dayEnd.setUTCDate(dayStart.getUTCDate() + 1);
+
+  const filter = {
+    cafeId,
+    staffId,
+    date: { $gte: dayStart, $lt: dayEnd },
+    status: { $ne: 'cancelled' },
+  };
+  if (excludeShiftId) {
+    filter._id = { $ne: excludeShiftId };
+  }
+  const sameDay = await Shift.find(filter).select('startTime endTime').lean();
+  const start = toMinutes(startTime);
+  const end = toMinutes(endTime);
+  return sameDay.find((s) => toMinutes(s.startTime) < end && start < toMinutes(s.endTime)) || null;
+}
+
+const shiftOverlapResponse = (res, overlap, date) =>
+  res.status(409).json({
+    success: false,
+    code: 'SHIFT_OVERLAP',
+    message: `This staff member already has a shift from ${overlap.startTime} to ${overlap.endTime} on ${formatDateOnly(date)}`,
+  });
+
 async function getWeeklyHours(cafeId, staffId, date, excludeShiftId = null) {
   const { monday, sunday } = getWeekBounds(date);
   const filter = {
@@ -105,6 +144,11 @@ const create = async (req, res, next) => {
 
     if (!(await staffBelongsToCafe(staffId, cafeId))) {
       return res.status(404).json({ success: false, message: 'Staff member not found' });
+    }
+
+    const overlap = await findOverlappingShift(cafeId, staffId, shiftDate, startTime, endTime);
+    if (overlap) {
+      return shiftOverlapResponse(res, overlap, shiftDate);
     }
 
     // Check if weekly total exceeds 45hrs — auto-flag overtime
@@ -187,7 +231,9 @@ const getWeek = async (req, res, next) => {
       date: { $gte: monday, $lte: sunday },
       status: { $ne: 'cancelled' },
     })
-      .populate('staffId', 'name role hourlyRate')
+      // Pay data is owner-only; staff reads already hide it from managers, and
+      // populating it here reopened the same leak through the roster.
+      .populate('staffId', req.user.role === 'owner' ? 'name role hourlyRate' : 'name role')
       .sort({ date: 1, startTime: 1 })
       .lean();
 
@@ -278,15 +324,23 @@ const getSummary = async (req, res, next) => {
       staffMap[sid].overtimeHours += overtimeHours;
     }
 
-    const summary = Object.values(staffMap).map((s) => ({
+    // estimatedPay is the rate multiplied out, so it is as sensitive as the
+    // rate itself: both leave the payload for anyone who is not the owner.
+    const canSeePay = req.user.role === 'owner';
+    const summary = Object.values(staffMap).map(({ hourlyRate, ...s }) => ({
       ...s,
+      ...(canSeePay ? { hourlyRate } : {}),
       totalHours: Math.round(s.totalHours * 100) / 100,
       regularHours: Math.round(s.regularHours * 100) / 100,
       overtimeHours: Math.round(s.overtimeHours * 100) / 100,
-      estimatedPay:
-        Math.round(
-          (s.regularHours * s.hourlyRate + s.overtimeHours * s.hourlyRate * 1.5) * 100
-        ) / 100,
+      ...(canSeePay
+        ? {
+          estimatedPay:
+            Math.round(
+              (s.regularHours * hourlyRate + s.overtimeHours * hourlyRate * 1.5) * 100
+            ) / 100,
+        }
+        : {}),
       overThreshold: s.totalHours > WEEKLY_HOUR_THRESHOLD,
     }));
 
@@ -326,6 +380,18 @@ const update = async (req, res, next) => {
 
     if (staffId && !(await staffBelongsToCafe(staffId, cafeId))) {
       return res.status(404).json({ success: false, message: 'Staff member not found' });
+    }
+
+    const overlap = await findOverlappingShift(
+      cafeId,
+      newStaffId,
+      newDate,
+      newStartTime,
+      newEndTime,
+      existing._id
+    );
+    if (overlap) {
+      return shiftOverlapResponse(res, overlap, newDate);
     }
 
     // Re-check overtime threshold

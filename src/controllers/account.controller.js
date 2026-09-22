@@ -9,7 +9,7 @@ const {
   getPlan,
   getPlans,
   normalisePlanId,
-  nextCreditResetDate,
+  nextMonthlyAnniversary,
 } = require('../services/billingPlans.service');
 const {
   billingPeriodForPayment,
@@ -115,6 +115,7 @@ const buildAccountPayload = async (userId) => {
   const plan = getPlan(org.plan);
   const isOwner = user.role === 'owner';
   const credits = creditSnapshot(org);
+  const access = billingAccessForOrganization(org);
   const usageLedger = await usageSummary(org._id);
 
   return {
@@ -137,6 +138,17 @@ const buildAccountPayload = async (userId) => {
       ownerId: org.ownerId,
       plan: normalisePlanId(org.plan),
       billingStatus: org.billingStatus,
+      // billingStatus is what the customer bought; billingAccess is whether it
+      // still grants access today. An elapsed trial or paid period leaves the
+      // stored status reading "active" while every metered feature returns 402,
+      // so the portal needs both to explain a lockout instead of showing a
+      // green badge next to zero credits.
+      billingAccess: {
+        allowed: access.allowed,
+        status: access.status,
+        reason: access.reason || null,
+        periodEnd: access.periodEnd || null,
+      },
       billingCycle: org.billingCycle,
       ...(isOwner ? { billingEmail: org.billingEmail, paymentMethod: org.paymentMethod } : {}),
       trialStartedAt: org.trialStartedAt,
@@ -192,12 +204,21 @@ const getCreditBalance = async (req, res, next) => {
     }
 
     const plan = getPlan(org.plan);
+    const access = billingAccessForOrganization(org);
     return res.status(200).json({
       success: true,
       credits: creditSnapshot(org),
       organization: {
         plan: normalisePlanId(org.plan),
         billingStatus: org.billingStatus,
+        // See buildAccountPayload: the stored status alone cannot explain a
+        // zero balance caused by an elapsed period.
+        billingAccess: {
+          allowed: access.allowed,
+          status: access.status,
+          reason: access.reason || null,
+          periodEnd: access.periodEnd || null,
+        },
         billingCycle: org.billingCycle,
         trialEndsAt: org.trialEndsAt,
         currentPeriodEnd: org.currentPeriodEnd,
@@ -310,7 +331,8 @@ const mockCheckout = async ({ req, org, selectedPlan, billingCycle, paymentMetho
     bonus: org.aiCredits?.bonus || 0,
     bonusUsed,
     used: bonusUsed,
-    resetAt: new Date(Math.min(nextCreditResetDate(now), period.currentPeriodEnd)),
+    // Same window rule as a real payment: one allowance per subscription month.
+    resetAt: nextMonthlyAnniversary(period.currentPeriodStart, now),
   };
   await org.save();
 
@@ -483,13 +505,17 @@ const oneGateReferenceFromRequest = (req) =>
  * verify call decides.
  */
 const handlePaystackReturn = async (req, res) => {
-  const reference = typeof req.query.reference === 'string' ? req.query.reference : '';
+  const reference = normalizePaymentReference(req.query.reference);
   let status = 'pending';
 
   if (reference) {
     try {
       const session = await reconcileOneGatePayment(reference);
       if (session?.status) status = session.status;
+      // A plan change deletes the org's future forecasts, and the customer is
+      // redirected straight back into the portal. Without this they land on the
+      // pre-payment cached forecast and analytics bodies.
+      if (status === 'paid') clearApiCache();
     } catch (error) {
       // A 202 means "not settled yet", which is a legitimate pending outcome.
       // Anything else still must not strand the customer on a blank page.
@@ -533,7 +559,11 @@ const handlePaystackWebhook = async (req, res, next) => {
     // Acknowledge regardless of outcome so Paystack does not retry a payment
     // this server has already recorded.
     try {
-      await reconcileOneGatePayment(reference, { reference, status: req.body?.event });
+      const session = await reconcileOneGatePayment(reference, {
+        reference,
+        status: req.body?.event,
+      });
+      if (session?.status === 'paid') clearApiCache();
     } catch (error) {
       if (error?.statusCode !== 202) {
         console.error('[billing] paystack webhook reconciliation failed:', error.message);
@@ -552,19 +582,29 @@ const handleOneGateWebhook = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Missing payment reference' });
     }
 
-    await reconcileOneGatePayment(reference, req.body);
-    clearApiCache();
+    // The route is unauthenticated and the callback carries no signature, so a
+    // forged notification must not be able to tell its sender whether a
+    // reference exists. Fulfilment itself is safe -- the amount and status come
+    // from the outbound provider lookup, never from this body -- so every
+    // outcome, including an unknown reference, is acknowledged identically.
+    try {
+      await reconcileOneGatePayment(reference, req.body);
+      clearApiCache();
+    } catch (error) {
+      if (![202, 404, 400].includes(error?.statusCode)) {
+        console.error('[billing] onegate webhook reconciliation failed:', error.message);
+      }
+    }
     return res.status(200).json({ success: true });
   } catch (error) {
-    if (error.statusCode === 202) {
-      return res.status(202).json({ success: false, message: error.message });
-    }
     next(error);
   }
 };
 
 const handleOneGateReturn = async (req, res) => {
-  const reference = req.query.reference;
+  // Defence in depth, matching every other reference entry point: an array or
+  // an object from the query string must never reach a database filter.
+  const reference = normalizePaymentReference(req.query.reference);
   const requestedResult = req.query.result;
   let status = requestedResult === 'cancel' ? 'cancelled' : 'pending';
 

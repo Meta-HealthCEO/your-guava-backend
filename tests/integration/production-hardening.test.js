@@ -535,6 +535,40 @@ describe('production hardening regressions', () => {
     expect(await UsageLedger.countDocuments({})).toBe(0);
   });
 
+  it('rate limits the upload route with an upload budget, not the much tighter AI budget', () => {
+    const { aiLimiter, uploadLimiter } = require('../../src/middleware/rateLimit.middleware');
+    const { requireCreditSpend } = require('../../src/middleware/rbac.middleware');
+    const router = require('../../src/routes/transactions.routes');
+
+    const layer = router.stack.find(
+      (entry) => entry.route?.path === '/upload' && entry.route.methods.post
+    );
+    const handlers = layer.route.stack.map((entry) => entry.handle);
+
+    // A limiter runs first so a rate-limited request never writes a file to disk.
+    expect(handlers[0]).toBe(uploadLimiter);
+    // But NOT the AI limiter. Only an unrecognised POS format with no saved mapping
+    // reaches Claude; a Yoco export or a cafe with a saved mapping never does. Gating
+    // every upload on the AI budget meant an owner importing a backlog of monthly
+    // exports was cut off after a handful, and told it was "too many AI requests".
+    // The AI call is separately bounded by the daily-credit and concurrency policy in
+    // aiUsage.service, and it costs credits, which is its own natural brake.
+    expect(handlers).not.toContain(aiLimiter);
+    // Members without credit permission must still upload preset formats: the
+    // controller downgrades to a free mapping rather than rejecting with 403.
+    expect(handlers).not.toContain(requireCreditSpend);
+  });
+
+  it('gives uploads a materially larger budget than paid AI calls', () => {
+    const { getLimiterOptions } = require('../../src/middleware/rateLimit.middleware');
+    const upload = getLimiterOptions('upload');
+    const ai = getLimiterOptions('ai');
+
+    expect(upload.limit).toBeGreaterThan(ai.limit);
+    // An owner catching up on a year of monthly exports uploads 12 files in a burst.
+    expect(upload.limit).toBeGreaterThanOrEqual(30);
+  });
+
   it('requires a bounded Idempotency-Key for configured paid chat endpoints', async () => {
     const owner = await createTestUser();
     process.env.ANTHROPIC_API_KEY = 'configured-test-key';

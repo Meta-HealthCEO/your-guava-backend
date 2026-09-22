@@ -28,4 +28,23 @@ jobs:
       - run: npm test -- --runInBand
       - name: Validate JavaScript syntax
         run: find src -name '*.js' -print0 | xargs -0 -n1 node --check
+      - name: Reject raw control characters in source
+        # A regex escape that passes through a JSON-decoding layer can collapse
+        # into the control character it names: backslash-b becomes a literal
+        # U+0008 BACKSPACE. The result is still valid JavaScript, so `node
+        # --check` above passes, and JSON.stringify and every editor render it
+        # back as an innocent-looking escape. Only the raw bytes give it away.
+        # This happened once already -- see itemCategory.js WORD_MATCH, commit
+        # 4376b43 -- and tests/unit/sourceHygiene.test.js guards src/ the same
+        # way. Everything below 0x20 except tab, LF and CR is rejected.
+        env:
+          LC_ALL: C.UTF-8
+        run: |
+          matches=$(git ls-files -z -- '*.js' '*.jsx' '*.ts' '*.tsx' '*.mjs' '*.cjs' '*.json' '*.css' '*.md' '*.yml' '*.yaml' '*.html' \
+            | xargs -0 -r grep -lP '[\x00-\x08\x0b\x0c\x0e-\x1f]' -- || true)
+          if [ -n "$matches" ]; then
+            echo "::error::Raw control characters found in: $matches"
+            echo "A regex or string escape was probably collapsed into a literal control character."
+            exit 1
+          fi
       - run: git diff --check

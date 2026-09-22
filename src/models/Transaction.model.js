@@ -34,6 +34,13 @@ const transactionSchema = new mongoose.Schema(
         rawName: { type: String },
         quantity: { type: Number, required: true },
         unitPrice: { type: Number },
+        // Where unitPrice came from. 'exact' is a price the till actually
+        // recorded for this line; 'derived' is a basket average spread over a
+        // multi-item packed receipt, kept so revenue sums but never learned as
+        // a price. Rows written before the flag existed default to exact: the
+        // API sync and manual writers only ever store real line prices, and a
+        // 'derived' default would have discarded those from price learning.
+        priceSource: { type: String, enum: ['exact', 'derived'], default: 'exact' },
         expectedPrice: { type: Number },
         priceVariancePct: { type: Number },
         menuItemStatus: {

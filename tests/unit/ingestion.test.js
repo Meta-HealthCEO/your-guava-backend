@@ -8,7 +8,12 @@ afterEach(clearDB);
 
 const Transaction = require('../../src/models/Transaction.model');
 const Item = require('../../src/models/Item.model');
-const { ingestParsedRows, parseYocoCSV } = require('../../src/services/ingestion.service');
+const {
+  ingestParsedRows,
+  parseYocoCSV,
+  persistParsedRows,
+} = require('../../src/services/ingestion.service');
+const { parseBuffer } = require('../../src/services/parser.service');
 
 describe('ingestion service', () => {
   describe('parseYocoCSV', () => {
@@ -121,5 +126,144 @@ describe('ingestion service', () => {
       expect(brownie.quantity).toBe(1);
       expect(tx.total).toBe(143);
     });
+  });
+
+  describe('unit price provenance', () => {
+    const mapping = { receiptId: 'Receipt', date: 'Date', time: 'Time', items: 'Items', total: 'Total' };
+    const ingest = (cafeId, lines) => ingestParsedRows(
+      Buffer.from(['Receipt,Date,Time,Items,Total', ...lines].join('\n')),
+      { cafeId, uploadId: null, columnMapping: mapping, itemsMode: 'packed', fileExt: 'csv' }
+    );
+    const menuItem = (cafeId, name, expectedPrice) => Item.create({
+      cafeId, name, expectedPrice, priceTolerancePct: 10, reviewStatus: 'matched',
+    });
+
+    // A packed multi-item receipt only carries the basket total, so each line
+    // gets a basket average: 2 x Flat White (38) + 1 x Coca Cola (24) = 100
+    // averages to 33.33 per unit. That is not a price change on either item.
+    it('does not raise a price mismatch from a multi-item receipt', async () => {
+      const cafeId = new mongoose.Types.ObjectId();
+      await menuItem(cafeId, 'Flat White', 38);
+      await menuItem(cafeId, 'Coca Cola 330ml', 24);
+
+      const result = await ingest(cafeId, ['R1,2026-04-01,08:30,"2 x Flat White,1 x Coca Cola 330ml",100.00']);
+
+      expect(result.imported).toBe(1);
+      const tx = await Transaction.findOne({ cafeId, receiptId: 'R1' }).lean();
+      expect(tx.items.map((item) => item.priceSource)).toEqual(['derived', 'derived']);
+      expect(tx.items.map((item) => item.menuItemStatus)).toEqual(['matched', 'matched']);
+      expect(tx.items.every((item) => item.priceVariancePct === undefined)).toBe(true);
+      const flatWhite = await Item.findOne({ cafeId, name: 'Flat White' }).lean();
+      expect(flatWhite.priceMismatchCount).toBe(0);
+      expect(flatWhite.expectedPrice).toBe(38);
+    });
+
+    it('raises a price mismatch from a single-item receipt whose price moved', async () => {
+      const cafeId = new mongoose.Types.ObjectId();
+      await menuItem(cafeId, 'Flat White', 38);
+
+      await ingest(cafeId, ['R2,2026-04-01,08:30,1 x Flat White,50.00']);
+
+      const tx = await Transaction.findOne({ cafeId, receiptId: 'R2' }).lean();
+      expect(tx.items[0]).toMatchObject({
+        priceSource: 'exact',
+        unitPrice: 50,
+        menuItemStatus: 'price_mismatch',
+      });
+      expect(tx.items[0].priceVariancePct).toBeCloseTo(31.58, 2);
+      const flatWhite = await Item.findOne({ cafeId, name: 'Flat White' }).lean();
+      expect(flatWhite.priceMismatchCount).toBe(1);
+    });
+
+    it('learns the expected price from exact lines only', async () => {
+      const cafeId = new mongoose.Types.ObjectId();
+
+      await ingest(cafeId, [
+        'R3,2026-04-01,08:30,"2 x Flat White,1 x Coca Cola 330ml",100.00',
+        'R4,2026-04-01,09:00,1 x Flat White,38.00',
+      ]);
+
+      const flatWhite = await Item.findOne({ cafeId, name: 'Flat White' }).lean();
+      expect(flatWhite.expectedPrice).toBe(38);
+      expect(flatWhite.lastObservedPrice).toBe(38);
+      const cocaCola = await Item.findOne({ cafeId, name: 'Coca Cola 330ml' }).lean();
+      expect(cocaCola.expectedPrice).toBeUndefined();
+      expect(cocaCola.lastObservedPrice ?? null).toBeNull();
+    });
+
+    it('takes the latest exact price by date rather than by insertion order', async () => {
+      const cafeId = new mongoose.Types.ObjectId();
+
+      await ingest(cafeId, [
+        'R-later,2026-04-02,08:30,1 x Flat White,40.00',
+        'R-earlier,2026-04-01,08:30,1 x Flat White,38.00',
+      ]);
+
+      const flatWhite = await Item.findOne({ cafeId, name: 'Flat White' }).lean();
+      expect(flatWhite.lastObservedPrice).toBe(40);
+      expect(flatWhite.expectedPrice).toBe(40);
+    });
+
+    it('breaks a same-instant tie by insertion order so rebuilds are repeatable', async () => {
+      // Date-only exports put every sale of a day at midnight, so a date sort
+      // alone leaves "last" to chance and a rebuild could flip the price.
+      const cafeId = new mongoose.Types.ObjectId();
+
+      await ingest(cafeId, [
+        'R-first,2026-04-01,08:30,1 x Flat White,38.00',
+        'R-second,2026-04-01,08:30,1 x Flat White,40.00',
+      ]);
+
+      const flatWhite = await Item.findOne({ cafeId, name: 'Flat White' }).lean();
+      expect(flatWhite.lastObservedPrice).toBe(40);
+    });
+  });
+});
+
+describe('receipt identity is scoped to the trading day on both persistence paths', () => {
+  const mapping = { receiptId: 'Receipt', date: 'Date', time: 'Time', items: 'Items', total: 'Total' };
+  // A till that restarts its order numbers each morning writes "#0001" every
+  // day. The bulk path scopes a receipt to its trading day; the row-by-row path
+  // filtered on the receipt alone, so day two's "#0001" was recognised as day
+  // one's and silently counted a duplicate. A month of history collapsed to the
+  // first day's receipts, and seed.js takes exactly that path.
+  const twoDays = Buffer.from([
+    'Receipt,Date,Time,Items,Total',
+    '#0001,2026-04-01,08:30,1 x Flat White,38.00',
+    '#0001,2026-04-02,08:30,1 x Flat White,38.00',
+  ].join('\n'));
+
+  const ingestBoth = async (bulk) => {
+    const cafeId = new mongoose.Types.ObjectId();
+    const parsed = await parseBuffer(twoDays, {
+      columnMapping: mapping, itemsMode: 'packed', timezone: 'Africa/Johannesburg',
+    });
+    const result = await persistParsedRows(parsed, {
+      cafeId, uploadId: null, bulk, timezone: 'Africa/Johannesburg',
+    });
+    return { cafeId, result };
+  };
+
+  it.each([[true], [false]])('imports both days with bulk=%s', async (bulk) => {
+    const { cafeId, result } = await ingestBoth(bulk);
+
+    expect(result.imported).toBe(2);
+    expect(result.duplicateRows).toBe(0);
+    expect(await Transaction.countDocuments({ cafeId })).toBe(2);
+  });
+
+  it('still recognises a genuine re-import of the same day as a duplicate', async () => {
+    const cafeId = new mongoose.Types.ObjectId();
+    const opts = { cafeId, uploadId: null, bulk: false, timezone: 'Africa/Johannesburg' };
+    const parseOnce = () => parseBuffer(twoDays, {
+      columnMapping: mapping, itemsMode: 'packed', timezone: 'Africa/Johannesburg',
+    });
+
+    expect((await persistParsedRows(await parseOnce(), opts)).imported).toBe(2);
+    const second = await persistParsedRows(await parseOnce(), opts);
+
+    expect(second.imported).toBe(0);
+    expect(second.duplicateRows).toBe(2);
+    expect(await Transaction.countDocuments({ cafeId })).toBe(2);
   });
 });

@@ -13,10 +13,10 @@ const {
 const { clearApiCache } = require('../middleware/cache.middleware');
 const {
   DEFAULT_FORECAST_SETTINGS,
+  applyForecastSettingsUpdate,
   getFactorEntitlements,
   getForecastSettings,
   getSavedForecastSettings,
-  normalizeForecastSettings,
 } = require('../services/forecastFactors.service');
 const {
   generateBusinessChatResponse,
@@ -300,11 +300,16 @@ const getFactors = async (req, res, next) => {
     if (!cafe) return res.status(404).json({ success: false, message: 'Cafe not found' });
     const org = await Organization.findById(req.user.orgId).lean();
     const plan = org?.plan || 'starter';
+    const effective = getForecastSettings(cafe, plan);
 
     return res.status(200).json({
       success: true,
       defaults: DEFAULT_FORECAST_SETTINGS,
-      settings: getForecastSettings(cafe, plan),
+      // `settings` is the plan-clamped view the Factors page edits. `effective`
+      // is the same view under its honest name, so a UI can show what the
+      // forecast will actually use next to what is stored in `savedSettings`.
+      settings: effective,
+      effective,
       savedSettings: getSavedForecastSettings(cafe),
       entitlements: getFactorEntitlements(plan),
     });
@@ -320,7 +325,20 @@ const updateFactors = async (req, res, next) => {
     const org = await Organization.findById(req.user.orgId).lean();
     const plan = org?.plan || 'starter';
 
-    const savedSettings = normalizeForecastSettings(req.body.settings || req.body || {}, getSavedForecastSettings(cafe));
+    const { settings: savedSettings, lockedChange } = applyForecastSettingsUpdate(
+      cafe,
+      req.body.settings || req.body || {},
+      plan
+    );
+    if (lockedChange) {
+      return res.status(402).json({
+        success: false,
+        code: 'PLAN_UPGRADE_REQUIRED',
+        factor: lockedChange.key,
+        requiredPlan: lockedChange.requiredPlan,
+        message: lockedChange.message,
+      });
+    }
     cafe.forecastSettings = savedSettings;
     await cafe.save();
 
@@ -328,9 +346,11 @@ const updateFactors = async (req, res, next) => {
     await Forecast.deleteMany({ cafeId: cafe._id, date: { $gte: today } });
     clearApiCache();
 
+    const effective = getForecastSettings(cafe, plan);
     return res.status(200).json({
       success: true,
-      settings: getForecastSettings(cafe, plan),
+      settings: effective,
+      effective,
       savedSettings,
       entitlements: getFactorEntitlements(plan),
     });

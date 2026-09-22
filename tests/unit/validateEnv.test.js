@@ -11,6 +11,8 @@ const KEYS = [
   'ONEGATE_ORG_ID',
   'ONEGATE_API_SALT',
   'ONEGATE_API_URL',
+  'PAYSTACK_SECRET_KEY',
+  'PAYSTACK_API_URL',
   'API_PUBLIC_URL',
   'BILLING_MOCK_ENABLED',
   'TOKEN_ENCRYPTION_KEY',
@@ -72,6 +74,14 @@ const setProductionBillingEnv = () => {
   process.env.API_PUBLIC_URL = 'https://api.yourguava.example';
 };
 
+// Paystack is the provider the product actually launches on, so its branch of
+// validateEnv is the one that will run in production.
+const setProductionPaystackEnv = () => {
+  process.env.PAYMENT_PROVIDER = 'paystack';
+  process.env.PAYSTACK_SECRET_KEY = 'sk_live_realkeyvalue';
+  process.env.API_PUBLIC_URL = 'https://api.yourguava.example';
+};
+
 describe('validateEnv', () => {
   let env;
 
@@ -130,6 +140,50 @@ describe('validateEnv', () => {
 
     process.env.ONEGATE_API_URL = 'https://payments.attacker.example';
     expect(() => validateEnv()).toThrow(/ONEGATE_API_URL.*official OneGate/i);
+  });
+
+  it('allows production startup with Paystack billing configured', () => {
+    setProductionBaseEnv();
+    setProductionPaystackEnv();
+
+    expect(() => validateEnv()).not.toThrow();
+  });
+
+  it('rejects production startup without a Paystack secret key', () => {
+    setProductionBaseEnv();
+    setProductionPaystackEnv();
+    delete process.env.PAYSTACK_SECRET_KEY;
+
+    expect(() => validateEnv()).toThrow(/PAYSTACK_SECRET_KEY is required/i);
+  });
+
+  it('rejects a Paystack test key in production', () => {
+    setProductionBaseEnv();
+    setProductionPaystackEnv();
+    process.env.PAYSTACK_SECRET_KEY = 'sk_test_abc123';
+
+    expect(() => validateEnv()).toThrow(/PAYSTACK_SECRET_KEY must be a live key/i);
+  });
+
+  it('rejects a Paystack API base URL that is not the official HTTPS origin', () => {
+    setProductionBaseEnv();
+    setProductionPaystackEnv();
+
+    // The live secret key travels on every request built from this base URL.
+    process.env.PAYSTACK_API_URL = 'http://api.paystack.co';
+    expect(() => validateEnv()).toThrow(/PAYSTACK_API_URL.*official Paystack/i);
+
+    process.env.PAYSTACK_API_URL = 'https://api.attacker.example';
+    expect(() => validateEnv()).toThrow(/PAYSTACK_API_URL.*official Paystack/i);
+
+    process.env.PAYSTACK_API_URL = 'https://user:pass@api.paystack.co';
+    expect(() => validateEnv()).toThrow(/PAYSTACK_API_URL.*official Paystack/i);
+
+    process.env.PAYSTACK_API_URL = 'https://api.paystack.co/v1?debug=1';
+    expect(() => validateEnv()).toThrow(/PAYSTACK_API_URL.*official Paystack/i);
+
+    process.env.PAYSTACK_API_URL = 'https://api.paystack.co';
+    expect(() => validateEnv()).not.toThrow();
   });
 
   it('rejects production startup when a core service is unavailable', () => {

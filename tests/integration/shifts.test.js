@@ -1,5 +1,5 @@
 const supertest = require('supertest');
-const { setup, teardown, clearDB, createTestUser, app } = require('../setup');
+const { setup, teardown, clearDB, createTestUser, createTestManager, app } = require('../setup');
 
 const request = supertest(app);
 
@@ -22,6 +22,47 @@ describe('Shifts API', () => {
       .send({ name: 'Shift Worker', hourlyRate: 55, role: 'barista' });
 
     staffId = staffRes.body.staff._id;
+  });
+
+  describe('pay data visibility', () => {
+    // Staff reads already hide hourlyRate from managers; the roster and summary
+    // endpoints populate it straight from the Staff document, which reopened the
+    // same leak (and estimatedPay is the rate multiplied out).
+    it('hides hourlyRate and estimatedPay from managers on week and summary, but not from owners', async () => {
+      // Take the roster's own first day so the shift is guaranteed to fall
+      // inside the window /week reports, whatever the local/UTC offset is.
+      const emptyWeek = await request.get('/api/shifts/week').set('Authorization', `Bearer ${token}`);
+      const date = emptyWeek.body.roster[0].date;
+      await request
+        .post('/api/shifts')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ staffId, date, startTime: '07:00', endTime: '15:00' })
+        .expect(201);
+
+      const cafeRes = await request.get('/api/cafe/me').set('Authorization', `Bearer ${token}`);
+      const manager = await createTestManager(token, [cafeRes.body.cafe._id]);
+
+      const ownerWeek = await request.get('/api/shifts/week').set('Authorization', `Bearer ${token}`);
+      const ownerSummary = await request
+        .get(`/api/shifts/summary?startDate=${date}&endDate=${date}`)
+        .set('Authorization', `Bearer ${token}`);
+      const managerWeek = await request.get('/api/shifts/week').set('Authorization', `Bearer ${manager.token}`);
+      const managerSummary = await request
+        .get(`/api/shifts/summary?startDate=${date}&endDate=${date}`)
+        .set('Authorization', `Bearer ${manager.token}`);
+
+      expect(ownerWeek.status).toBe(200);
+      expect(JSON.stringify(ownerWeek.body)).toContain('"hourlyRate":55');
+      expect(ownerSummary.body.summary[0].hourlyRate).toBe(55);
+      expect(ownerSummary.body.summary[0].estimatedPay).toBe(440);
+
+      expect(managerWeek.status).toBe(200);
+      expect(JSON.stringify(managerWeek.body)).not.toContain('hourlyRate');
+      expect(managerSummary.status).toBe(200);
+      expect(managerSummary.body.summary[0].totalHours).toBe(8);
+      expect(managerSummary.body.summary[0]).not.toHaveProperty('hourlyRate');
+      expect(managerSummary.body.summary[0]).not.toHaveProperty('estimatedPay');
+    });
   });
 
   describe('POST /api/shifts', () => {
@@ -108,6 +149,86 @@ describe('Shifts API', () => {
         .query({ startDate: '2020-01-01', endDate: '2026-01-01' });
       expect(unbounded.status).toBe(400);
       expect(unbounded.body.message).toMatch(/cannot exceed/i);
+    });
+  });
+
+  describe('Shift overlap detection', () => {
+    const createShift = (body) =>
+      request
+        .post('/api/shifts')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ staffId, date: '2026-09-07', ...body });
+
+    it('rejects a shift that overlaps an existing shift for the same person on the same day', async () => {
+      const first = await createShift({ startTime: '07:00', endTime: '15:00' });
+      expect(first.status).toBe(201);
+
+      const overlapping = await createShift({ startTime: '08:00', endTime: '16:00' });
+      expect(overlapping.status).toBe(409);
+      expect(overlapping.body).toMatchObject({ success: false, code: 'SHIFT_OVERLAP' });
+      expect(overlapping.body.message).toMatch(/07:00/);
+
+      const summary = await request
+        .get('/api/shifts/summary')
+        .set('Authorization', `Bearer ${token}`)
+        .query({ startDate: '2026-09-07', endDate: '2026-09-07' });
+      expect(summary.body.summary[0].totalHours).toBe(8);
+    });
+
+    it('accepts an adjacent shift that starts exactly when the previous one ends', async () => {
+      await createShift({ startTime: '07:00', endTime: '15:00' });
+
+      const adjacent = await createShift({ startTime: '15:00', endTime: '18:00' });
+      expect(adjacent.status).toBe(201);
+      expect(adjacent.body.shift.hoursWorked).toBe(3);
+    });
+
+    it('does not treat another person, another day, or a cancelled shift as an overlap', async () => {
+      await createShift({ startTime: '07:00', endTime: '15:00' });
+
+      const otherStaff = await request
+        .post('/api/staff')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ name: 'Second Worker', hourlyRate: 50 });
+      const otherPerson = await createShift({
+        staffId: otherStaff.body.staff._id,
+        startTime: '08:00',
+        endTime: '16:00',
+      });
+      expect(otherPerson.status).toBe(201);
+
+      const otherDay = await createShift({ date: '2026-09-08', startTime: '08:00', endTime: '16:00' });
+      expect(otherDay.status).toBe(201);
+
+      const cancelled = await createShift({ date: '2026-09-09', startTime: '07:00', endTime: '15:00', status: 'cancelled' });
+      expect(cancelled.status).toBe(201);
+      const replacement = await createShift({ date: '2026-09-09', startTime: '08:00', endTime: '16:00' });
+      expect(replacement.status).toBe(201);
+    });
+
+    it('rejects an update that would overlap another shift', async () => {
+      await createShift({ startTime: '07:00', endTime: '15:00' });
+      const second = await createShift({ startTime: '15:00', endTime: '18:00' });
+
+      const res = await request
+        .put(`/api/shifts/${second.body.shift._id}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ startTime: '14:00' });
+
+      expect(res.status).toBe(409);
+      expect(res.body).toMatchObject({ success: false, code: 'SHIFT_OVERLAP' });
+    });
+
+    it('allows updating a shift to a superset of itself', async () => {
+      const created = await createShift({ startTime: '07:00', endTime: '15:00' });
+
+      const res = await request
+        .put(`/api/shifts/${created.body.shift._id}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ startTime: '06:00', endTime: '16:00' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.shift.hoursWorked).toBe(10);
     });
   });
 

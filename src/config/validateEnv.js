@@ -39,12 +39,12 @@ const isHttpsUrl = (value) => {
   }
 };
 
-const isOfficialOneGateUrl = (value) => {
+const isOfficialOrigin = (value, fallback, hostname) => {
   try {
-    const url = new URL(value || 'https://payments.onegate.co.za');
+    const url = new URL(value || fallback);
     return (
       url.protocol === 'https:' &&
-      url.hostname.toLowerCase() === 'payments.onegate.co.za' &&
+      url.hostname.toLowerCase() === hostname &&
       (!url.port || url.port === '443') &&
       !url.username &&
       !url.password &&
@@ -56,6 +56,16 @@ const isOfficialOneGateUrl = (value) => {
     return false;
   }
 };
+
+const isOfficialOneGateUrl = (value) =>
+  isOfficialOrigin(value, 'https://payments.onegate.co.za', 'payments.onegate.co.za');
+
+// The live Paystack secret key is sent as a bearer token on every request built
+// from this base URL, so an override that redirects it hands the key -- which
+// can charge cards and read the whole merchant account -- to whoever owns the
+// host. It gets the same treatment as the OneGate origin.
+const isOfficialPaystackUrl = (value) =>
+  isOfficialOrigin(value, 'https://api.paystack.co', 'api.paystack.co');
 
 /**
  * Validates required environment variables at startup.
@@ -118,6 +128,9 @@ const validateEnv = () => {
       } else if (!paystackKey.startsWith('sk_live_')) {
         // A test key in production takes real orders and settles none of them.
         errors.push('PAYSTACK_SECRET_KEY must be a live key (sk_live_...) in production');
+      }
+      if (!isOfficialPaystackUrl(process.env.PAYSTACK_API_URL)) {
+        errors.push('PAYSTACK_API_URL must be the HTTPS origin of the official Paystack API host');
       }
     }
 

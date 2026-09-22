@@ -40,15 +40,18 @@ app.set('trust proxy', 1);
 app.use(requestContext);
 app.use(requestLogger);
 app.use(helmet());
-app.use(globalLimiter);
 
-// CORS
+// CORS — mounted before the rate limiter so a 429 still carries
+// Access-Control-Allow-Origin; otherwise the browser hides the JSON body
+// behind an opaque network error.
 app.use(
   cors({
     origin: process.env.CLIENT_URL,
     credentials: true,
   })
 );
+
+app.use(globalLimiter);
 
 // Body parsers — rawBody is kept for webhook signature verification
 app.use(

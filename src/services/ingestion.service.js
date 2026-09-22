@@ -267,7 +267,15 @@ const reconcileParsedRows = async (parsed, { cafeId, session }) => {
 
 const persistParsedRowsBulk = async (
   parsed,
-  { cafeId, uploadId, session, itemsAlreadyReconciled = false, sourceFingerprint, timezone }
+  {
+    cafeId,
+    uploadId,
+    session,
+    itemsAlreadyReconciled = false,
+    failOnPersistenceError = false,
+    sourceFingerprint,
+    timezone,
+  }
 ) => {
   let skipped = 0;
   let errors = parsed.errors;
@@ -300,9 +308,15 @@ const persistParsedRowsBulk = async (
       seen.add(identityKey);
       candidates.push({ row, identity, identityKey });
     } catch (error) {
+      // These two lines used to be dead: an unconditional rethrow on the next
+      // statement discarded both, so one unreconcilable line aborted the whole
+      // import and the owner was told "import failed" with no row number. The
+      // upload flow still asks to fail hard -- it commits in a single
+      // transaction and cannot land a partial batch -- but every other caller
+      // now gets the row error the machinery was built to carry.
       errors++;
       addPersistenceRowError(rowErrors, row, 'Could not reconcile row items');
-      throw error;
+      if (failOnPersistenceError) throw error;
     }
   }
 
@@ -365,6 +379,7 @@ const persistParsedRows = async (
       uploadId,
       session,
       itemsAlreadyReconciled,
+      failOnPersistenceError,
       sourceFingerprint,
       timezone,
     });
@@ -379,6 +394,7 @@ const persistParsedRows = async (
   let approvedRows = 0;
   let declinedRows = 0;
   let duplicateRows = 0;
+  const zone = safeTimezone(timezone);
 
   for (const row of parsed.rows) {
     try {
@@ -390,22 +406,24 @@ const persistParsedRows = async (
       }
       approvedRows++;
 
-      const dedupKey = row.receiptId ? undefined : computeDedupKey({
-        date: row.date.toISOString().slice(0, 10),
-        time: row.date.toISOString().slice(11, 16),
-        total: row.total,
-        items: row.items,
-        sourceFingerprint,
-        sourceRowNumbers: row.__sourceRowNumbers,
-      });
+      // Identity is the same rule on both paths. This loop used to filter on
+      // the receipt ID alone, with no trading day, which is the very defect the
+      // day scoping was added to fix: on a till that restarts its order numbers
+      // each morning, Wednesday's "#0001" was recognised as Tuesday's and
+      // dropped, so a month of history collapsed to one day's receipts.
+      const identity = transactionIdentity(row, sourceFingerprint);
+      const dedupKey = identity.type === 'dedupKey' ? identity.value : undefined;
 
-      const filter = row.receiptId
-        ? { cafeId, receiptId: row.receiptId }
-        : { cafeId, dedupKey };
-
-      let existingQuery = Transaction.findOne(filter);
+      let existingQuery = identity.type === 'receiptId'
+        ? Transaction.find({ cafeId, receiptId: identity.value }).select('date')
+        : Transaction.find({ cafeId, dedupKey: identity.value }).select('date');
       if (session) existingQuery = existingQuery.session(session);
-      const existing = await existingQuery.lean();
+      const matches = await existingQuery.lean();
+      // Stored rows keep only the instant, so the trading day is recomputed in
+      // the cafe's timezone rather than read off a UTC date.
+      const existing = identity.type === 'receiptId'
+        ? matches.some((match) => zonedDateKey(match.date, zone) === identity.dayKey)
+        : matches.length > 0;
       if (existing) {
         skipped++;
         duplicateRows++;

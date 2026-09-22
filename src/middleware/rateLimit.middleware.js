@@ -61,9 +61,10 @@ const writeLimiter = rateLimit({
 
 // Paid AI calls are expensive and can hold provider connections open. Bound them
 // per organization and user independently of the broad IP-based global limiter.
+const AI_LIMIT = 20;
 const aiLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: 20,
+  limit: AI_LIMIT,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   skip: isTest,
@@ -76,8 +77,39 @@ const aiLimiter = rateLimit({
   },
 });
 
+// Uploads need their own budget. Most uploads never touch the AI mapper -- a Yoco
+// export is matched by preset and a returning cafe reuses its saved mapping -- so
+// charging them against the AI budget cut an owner off mid-import while telling
+// them they had made too many "AI requests", which is both wrong and unactionable.
+// This exists to bound disk writes and parsing work, so it sits ahead of multer.
+const UPLOAD_LIMIT = 40;
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: UPLOAD_LIMIT,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  skip: isTest,
+  keyGenerator: (req) => req.user?.id || req.ip,
+  validate: { keyGeneratorIpFallback: false },
+  message: {
+    success: false,
+    code: 'UPLOAD_RATE_LIMITED',
+    message: 'That is a lot of files at once. Wait a minute, then continue importing.',
+  },
+});
+
+// Exposed so tests can assert the budgets stay in the right relationship to each
+// other without reaching into express-rate-limit internals.
+const getLimiterOptions = (name) => {
+  if (name === 'ai') return { limit: AI_LIMIT, windowMs: 60 * 1000 };
+  if (name === 'upload') return { limit: UPLOAD_LIMIT, windowMs: 60 * 1000 };
+  throw new Error(`Unknown limiter: ${name}`);
+};
+
 module.exports = {
   aiLimiter,
+  uploadLimiter,
+  getLimiterOptions,
   globalLimiter,
   authLimiter,
   refreshLimiter,

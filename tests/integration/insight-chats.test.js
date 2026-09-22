@@ -95,6 +95,45 @@ describe('Insight Chats API', () => {
     expect(deleteRes.status).toBe(200);
   });
 
+  it('rejects a non-array messages payload as a client error, not a server fault', async () => {
+    const res = await request
+      .post('/api/insight-chats')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ messages: 'hello' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.message).toMatch(/messages/i);
+  });
+
+  it('stops one account creating unbounded chat documents', async () => {
+    const InsightChat = require('../../src/models/InsightChat.model');
+    const { MAX_CHATS_PER_USER } = require('../../src/controllers/insightChats.controller');
+    const decoded = await request
+      .post('/api/insight-chats')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ title: 'seed' });
+    const { userId, cafeId, orgId } = decoded.body.chat;
+
+    await InsightChat.insertMany(
+      Array.from({ length: MAX_CHATS_PER_USER }, (_, index) => ({
+        userId,
+        cafeId,
+        orgId,
+        title: `Filler ${index}`,
+        messages: [],
+      }))
+    );
+
+    const res = await request
+      .post('/api/insight-chats')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ title: 'One too many' });
+
+    expect(res.status).toBe(409);
+    expect(res.body.message).toMatch(/limit/i);
+  });
+
   it('scopes chats to the authenticated user and active cafe', async () => {
     await request
       .post('/api/insight-chats')
