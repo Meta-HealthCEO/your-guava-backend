@@ -144,6 +144,21 @@ const upload = async (req, res, next) => {
       }
     }
 
+    const hasRequiredMapping = hasRequiredHeaderMapping(columnMapping, headers, itemsMode);
+
+    // Record how we got here so the owner is told something true. A saved mapping or
+    // an AI guess that did not yield the required fields did not map this file, and
+    // labelling it 'Saved mapping' would credit a mapping that contributed nothing.
+    // 'none' means the wizard is about to ask, and until it is answered this upload
+    // has no mapping at all.
+    const mappingSource = posType === 'yoco'
+      ? 'yoco'
+      : usedSavedMapping && hasRequiredMapping
+        ? 'saved'
+        : mappingAssistedByAi && hasRequiredMapping
+          ? 'ai'
+          : 'none';
+
     const uploadDoc = await Upload.create({
       cafeId,
       uploadedBy: userId,
@@ -152,6 +167,7 @@ const upload = async (req, res, next) => {
       r2Key,
       fileFingerprint,
       posType,
+      mappingSource,
       columnMapping,
       itemsMode,
       headers,
@@ -160,12 +176,12 @@ const upload = async (req, res, next) => {
     });
     uploadDocCreated = true;
 
-    const hasRequiredMapping = hasRequiredHeaderMapping(columnMapping, headers, itemsMode);
 
     return res.status(200).json({
       success: true,
       uploadId: uploadDoc._id,
       posType,
+      mappingSource,
       columnMapping,
       itemsMode,
       headers,

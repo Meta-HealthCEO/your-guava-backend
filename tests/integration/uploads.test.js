@@ -994,6 +994,37 @@ describe('Uploads API', () => {
     });
   });
 
+  describe('Mapping source', () => {
+    it('records a Yoco preset as yoco', async () => {
+      const stage = await request.post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`).attach('file', yocoFixture);
+      expect(stage.body.mappingSource).toBe('yoco');
+      expect((await Upload.findById(stage.body.uploadId).lean()).mappingSource).toBe('yoco');
+    });
+
+    it('records an unknown shape with no AI as none, then manual once the wizard answers', async () => {
+      const csv = Buffer.from([
+        'Whenever,Whatever,Howmuch',
+        '2026/08/01,1 x Flat White,38.00',
+      ].join(String.fromCharCode(10)));
+
+      const stage = await request.post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`).attach('file', csv, 'unknown-shape.csv');
+      expect(stage.body.mappingSource).toBe('none');
+      expect(stage.body.needsConfirmation).toBe(true);
+
+      await request.post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          columnMapping: { date: 'Whenever', items: 'Whatever', total: 'Howmuch' },
+          itemsMode: 'packed',
+        })
+        .expect(200);
+
+      expect((await Upload.findById(stage.body.uploadId).lean()).mappingSource).toBe('manual');
+    });
+  });
+
   describe('Forecast invalidation', () => {
     it('preserves historical forecasts and refreshes planning forecasts on successful confirm', async () => {
       const Forecast = require('../../src/models/Forecast.model');

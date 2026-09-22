@@ -476,6 +476,14 @@ const commitParsedUpload = async ({
             status: 'completed',
             columnMapping,
             itemsMode,
+            // If the confirmed mapping is not the one we staged, a human chose it in
+            // the wizard. Saying 'AI mapping' on a mapping the owner corrected by
+            // hand would credit the guess for their work.
+            mappingSource:
+              confirmationMappingHash(columnMapping, itemsMode)
+              === confirmationMappingHash(upload.columnMapping || {}, upload.itemsMode)
+                ? upload.mappingSource || 'manual'
+                : 'manual',
             stats: {
               imported: result.imported,
               skipped: result.skipped,

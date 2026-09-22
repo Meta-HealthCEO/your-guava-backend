@@ -51,6 +51,13 @@ const uploadSchema = new mongoose.Schema(
       enum: ['yoco', 'wizard'],
       required: true,
     },
+    // How the column mapping was arrived at, for the owner's benefit. posType only
+    // distinguishes yoco from everything else, so the history column read 'Mapped'
+    // for a saved mapping, an AI guess and an abandoned upload alike.
+    mappingSource: {
+      type: String,
+      enum: ['yoco', 'saved', 'ai', 'manual', 'none'],
+    },
     columnMapping: { type: columnMappingSchema, default: {} },
     itemsMode: {
       type: String,
