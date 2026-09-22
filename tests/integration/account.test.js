@@ -15,7 +15,10 @@ afterEach(async () => {
   delete process.env.ONEGATE_ORG_ID;
   delete process.env.ONEGATE_API_SALT;
   delete process.env.API_PUBLIC_URL;
-  delete process.env.BILLING_MOCK_ENABLED;
+  // Restored, not deleted. It used to be deleted because the production test
+  // leaked it; now that mock billing is gated on the flag rather than on
+  // NODE_ENV, deleting it turned off the path most of this suite exercises.
+  process.env.BILLING_MOCK_ENABLED = 'true';
   await clearDB();
 });
 
@@ -201,7 +204,9 @@ describe('Account API', () => {
   });
 
   it('does not allow mock checkout in production', async () => {
+    // Deliberately opts in AND sets production: the flag must not be enough.
     const savedNodeEnv = process.env.NODE_ENV;
+    const savedFlag = process.env.BILLING_MOCK_ENABLED;
     process.env.NODE_ENV = 'production';
     process.env.BILLING_MOCK_ENABLED = 'true';
 
@@ -216,6 +221,54 @@ describe('Account API', () => {
     } finally {
       if (savedNodeEnv == null) delete process.env.NODE_ENV;
       else process.env.NODE_ENV = savedNodeEnv;
+      // This used to leak `true` into every test that ran after it.
+      if (savedFlag == null) delete process.env.BILLING_MOCK_ENABLED;
+      else process.env.BILLING_MOCK_ENABLED = savedFlag;
+    }
+  });
+
+  it('refuses mock checkout on any environment that has not opted in', async () => {
+    // `NODE_ENV !== 'production'` was the whole gate, so a staging deploy with
+    // no payment provider handed out plan upgrades for free, and so did any
+    // box where NODE_ENV happened to be unset.
+    const savedNodeEnv = process.env.NODE_ENV;
+    const savedFlag = process.env.BILLING_MOCK_ENABLED;
+    process.env.NODE_ENV = 'staging';
+    delete process.env.BILLING_MOCK_ENABLED;
+
+    try {
+      const res = await request
+        .post('/api/account/checkout')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({ plan: 'growth', billingCycle: 'monthly' });
+
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('BILLING_PROVIDER_NOT_CONFIGURED');
+    } finally {
+      process.env.NODE_ENV = savedNodeEnv;
+      if (savedFlag == null) delete process.env.BILLING_MOCK_ENABLED;
+      else process.env.BILLING_MOCK_ENABLED = savedFlag;
+    }
+  });
+
+  it('allows mock checkout on a non-production environment that opts in', async () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    const savedFlag = process.env.BILLING_MOCK_ENABLED;
+    process.env.NODE_ENV = 'staging';
+    process.env.BILLING_MOCK_ENABLED = 'true';
+
+    try {
+      const res = await request
+        .post('/api/account/checkout')
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .send({ plan: 'growth', billingCycle: 'monthly' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.checkout.provider).toBe('mock');
+    } finally {
+      process.env.NODE_ENV = savedNodeEnv;
+      if (savedFlag == null) delete process.env.BILLING_MOCK_ENABLED;
+      else process.env.BILLING_MOCK_ENABLED = savedFlag;
     }
   });
 

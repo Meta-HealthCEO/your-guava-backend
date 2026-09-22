@@ -38,7 +38,19 @@ const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value || {},
 const normalizedProfileText = (value) =>
   typeof value === 'string' ? value.trim() : null;
 
-const mockBillingEnabled = () => process.env.NODE_ENV !== 'production';
+/**
+ * Mock billing grants plans and credit packs without taking money. It needs
+ * both an explicit opt-in and a non-production environment.
+ *
+ * `NODE_ENV !== 'production'` was the whole gate, so a staging deploy with no
+ * payment provider handed out upgrades for free — and so did any box where
+ * NODE_ENV happened to be unset, which is the default. Requiring the flag
+ * makes that an active choice. Keeping the production check means setting the
+ * flag by accident in production still cannot open it. See DECISIONS D-010.
+ */
+const mockBillingEnabled = () =>
+  process.env.NODE_ENV !== 'production' &&
+  String(process.env.BILLING_MOCK_ENABLED || '').trim().toLowerCase() === 'true';
 
 const billingNotConfigured = (res) =>
   res.status(503).json({

@@ -8,6 +8,11 @@ process.env.JWT_REFRESH_SECRET = 'test-jwt-refresh-secret-key-12345';
 process.env.JWT_EXPIRES_IN = '15m';
 process.env.JWT_REFRESH_EXPIRES_IN = '7d';
 process.env.NODE_ENV = 'test';
+// The mock billing path is exercised deliberately by the billing suites, so
+// the test environment opts in explicitly. It is no longer implied by
+// NODE_ENV: a staging deploy that never set this flag was handing out plan
+// upgrades and credit packs for free. See DECISIONS D-010.
+process.env.BILLING_MOCK_ENABLED = 'true';
 process.env.WEATHER_API_KEY = '';
 process.env.WEATHER_API_URL = '';
 delete process.env.YOCO_INTEGRATION_ENABLED;
