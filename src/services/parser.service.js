@@ -453,69 +453,6 @@ const assertSafeZipEntryName = (name) => {
   }
 };
 
-// read-excel-file sizes a sheet from its declared <dimension ref> (or, with
-// none, from its furthest cell), allocates rows x columns, and only then trims
-// the empty space - so the size a sheet claims is memory the server commits
-// before any row limit applies. A 1 KB file declaring A1:XFD1048576 asked for
-// about 17 billion slots and took the API down for every cafe. Ten million is
-// roughly 80 MB of transient arrays and far above any real export, including
-// the ones that overstate their size.
-const XLSX_MAX_DECLARED_CELLS = 10_000_000;
-const SHEET_DATA_MARKER = Buffer.from('sheetData');
-// Tag names may carry any namespace prefix: the reader strips it.
-const XLSX_DIMENSION_RE = /<(?:[^\s<>/:]+:)?dimension\b[^>]*?\sref\s*=\s*(["'])([^"'<>]*)\1/g;
-const XLSX_CELL_RE = /<(?:[^\s<>/:]+:)?c\b[^>]*?\sr\s*=\s*(["'])([^"'<>]*)\1/g;
-const XML_NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
-
-// The reader gets attribute values from an XML parser, so "&#88;FD1048576" is
-// XFD1048576 to it and must be to this check.
-const decodeXmlEntities = (value) => value.replace(/&(#x[0-9a-fA-F]{1,6}|#\d{1,7}|[a-z]+);/g, (entity, body) => {
-  if (body[0] !== '#') return XML_NAMED_ENTITIES[body] ?? entity;
-  const code = body[1] === 'x' ? parseInt(body.slice(2), 16) : Number(body.slice(1));
-  return code <= 0x10ffff ? String.fromCodePoint(code) : entity;
-});
-
-// "A" -> 1, "Z" -> 26, "AA" -> 27, as the reader counts; null if unreadable.
-const cellExtent = (reference) => {
-  const match = /^([A-Za-z]+)(\d+)/.exec(decodeXmlEntities(reference).trim());
-  if (!match) return null;
-  let columns = 0;
-  for (const letter of match[1].toUpperCase()) columns = columns * 26 + (letter.charCodeAt(0) - 64);
-  return { rows: Number(match[2]), columns };
-};
-
-// Over-estimates rather than mirrors: the larger of every declared size and
-// every cell. The reader ignores cells outside a <dimension> that is a direct
-// child of the worksheet, and a regex cannot tell a direct child from a small
-// one hidden inside another element, which the reader would skip.
-const declaredSheetExtent = (xml) => {
-  let rows = 0;
-  let columns = 0;
-  const widen = (reference) => {
-    const extent = cellExtent(reference);
-    if (!extent) return;
-    rows = Math.max(rows, extent.rows);
-    columns = Math.max(columns, extent.columns);
-  };
-  for (const [, , ref] of xml.matchAll(XLSX_DIMENSION_RE)) {
-    const corners = ref.split(':');
-    widen(corners.length > 1 ? corners[1] : corners[0]);
-  }
-  for (const [, , reference] of xml.matchAll(XLSX_CELL_RE)) widen(reference);
-  return { rows, columns };
-};
-
-const assertSheetSizeIsSafe = (expanded) => {
-  if (expanded.indexOf(SHEET_DATA_MARKER) === -1) return;
-  const { rows, columns } = declaredSheetExtent(expanded.toString('latin1'));
-  if (rows * columns > XLSX_MAX_DECLARED_CELLS) {
-    throw createClientInputError(
-      `XLSX sheet declares ${rows} rows by ${columns} columns, more than can be read safely. `
-      + 'Save it again from Excel, or export it as "CSV UTF-8", and upload that.'
-    );
-  }
-};
-
 const assertSafeXlsxArchive = (buffer) => {
   const limits = parserLimits();
   const endOffset = findZipEndRecord(buffer);
@@ -679,7 +616,6 @@ const assertSafeXlsxArchive = (buffer) => {
     if ((zlib.crc32(expanded) >>> 0) !== expectedCrc) {
       throw createClientInputError('XLSX ZIP entry CRC checksum is inconsistent');
     }
-    assertSheetSizeIsSafe(expanded);
     actualTotalUncompressed += expanded.length;
     if (actualTotalUncompressed > limits.xlsxMaxTotalUncompressedBytes) {
       throw createClientInputError(

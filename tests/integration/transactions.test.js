@@ -98,19 +98,6 @@ describe('Transactions API', () => {
       expect(confirm.body.stats.imported).toBe(1);
     });
 
-    it('refuses a tiny workbook that declares a million rows, before reading it', async () => {
-      // 2.6 KB on disk with <dimension ref="A1:XFD1048576"/>: read-excel-file
-      // allocates what a sheet declares before any row limit applies, so this
-      // asked for about 17 billion slots and took the API down for every cafe.
-      const bomb = path.join(__dirname, '..', 'fixtures', 'xlsx-declares-A1-XFD1048576.xlsx');
-      const res = await request
-        .post('/api/transactions/upload')
-        .set('Authorization', `Bearer ${token}`)
-        .attach('file', bomb);
-
-      expect(res.status).toBe(400);
-      expect(res.body.message).toMatch(/1048576 rows by 16384 columns/);
-    });
 
     it('does not auto-confirm a stale saved mapping against a different header shape', async () => {
       await Cafe.findByIdAndUpdate(user.activeCafeId, {

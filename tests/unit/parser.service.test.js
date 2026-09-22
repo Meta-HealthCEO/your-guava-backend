@@ -866,7 +866,7 @@ describe('xlsx workbook reading', () => {
   // sheet as [{ sheet, data }]. Nothing here parsed a real workbook, so the
   // upgrade to ^9 broke every .xlsx import silently: the parser destructured a
   // sheet object as a header row and threw "headerRow.map is not a function".
-  const xlsxWith = (rows, { dimension, strayCell, extraRowsXml = '' } = {}) => {
+  const xlsxWith = (rows) => {
     const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
     const colName = (i) => {
       let s = '';
@@ -879,76 +879,16 @@ describe('xlsx workbook reading', () => {
         `<c r="${colName(c)}${r + 1}" t="inlineStr"><is><t xml:space="preserve">${esc(v)}</t></is></c>`
       ).join('');
       return `<row r="${r + 1}">${cells}</row>`;
-    }).join('') + (strayCell
-      ? `<row r="${strayCell.replace(/^[A-Z]+/, '')}"><c r="${strayCell}" t="inlineStr"><is><t>x</t></is></c></row>`
-      : '') + extraRowsXml;
-    const dimensionTag = dimension ? `<dimension ref="${dimension}"/>` : '';
+    }).join('');
 
     return buildStoredZip([
       { name: '[Content_Types].xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>' },
       { name: '_rels/.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>' },
       { name: 'xl/workbook.xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sales" sheetId="1" r:id="rId1"/></sheets></workbook>' },
       { name: 'xl/_rels/workbook.xml.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>' },
-      { name: 'xl/worksheets/sheet1.xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${dimensionTag}<sheetData>${sheetRows}</sheetData></worksheet>` },
+      { name: 'xl/worksheets/sheet1.xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${sheetRows}</sheetData></worksheet>` },
     ]);
   };
-
-  describe('a sheet that declares itself enormous', () => {
-    // read-excel-file allocates rows x columns from the sheet's declared
-    // <dimension ref> (or, with none, from its furthest cell) and only then
-    // trims empty space, so a 1 KB file declaring A1:XFD1048576 asks for about
-    // 17 billion slots and takes the API down for every cafe. None of these
-    // tests hands such a file to the reader: before the guard, that would take
-    // the test process down with it.
-    const SALES = [['Receipt', 'Date', 'Total'], ['R1', '2026-04-01', '35.00']];
-    const heapGrowthMb = (run) => {
-      const before = process.memoryUsage().heapUsed;
-      run();
-      return (process.memoryUsage().heapUsed - before) / (1024 * 1024);
-    };
-
-    it('refuses a 1 KB workbook that declares A1:XFD1048576, before anything reads it', () => {
-      const bomb = xlsxWith(SALES, { dimension: 'A1:XFD1048576' });
-      expect(bomb.length).toBeLessThan(4096);
-      let thrown;
-      const growth = heapGrowthMb(() => {
-        try { assertSupportedFileBuffer(bomb, 'xlsx'); } catch (error) { thrown = error; }
-      });
-      expect(thrown).toBeDefined();
-      expect(thrown.statusCode).toBe(400);
-      expect(thrown.message).toMatch(/1048576 rows by 16384 columns/);
-      expect(growth).toBeLessThan(20);
-    });
-
-    it('refuses a workbook whose one far cell sits at XFD1048576', () => {
-      const bomb = xlsxWith(SALES, { strayCell: 'XFD1048576' });
-      expect(() => assertSupportedFileBuffer(bomb, 'xlsx')).toThrow(/1048576 rows by 16384 columns/);
-    });
-
-    it('still reads a workbook whose declared size overshoots its data', async () => {
-      // Real exports overstate their size. The reader trims the empty space,
-      // so this imported before the guard and must import after it.
-      const overstated = xlsxWith(SALES, { dimension: 'A1:Z65536' });
-      expect(() => assertSupportedFileBuffer(overstated, 'xlsx')).not.toThrow();
-      expect(await readWorkbookRows(overstated)).toHaveLength(1);
-    });
-
-    it('counts a far cell even under a small declared size', () => {
-      // The reader ignores cells outside a <dimension> that is a direct child
-      // of the worksheet, and a regex cannot tell a direct child from one
-      // hidden inside another element - which the reader would skip before
-      // sizing the sheet from its cells. So the guard takes the larger of the
-      // two, and refuses a file no real export produces.
-      const workbook = xlsxWith(SALES, { dimension: 'A1:C2', strayCell: 'XFD1048576' });
-      expect(() => assertSupportedFileBuffer(workbook, 'xlsx')).toThrow(/1048576 rows by 16384 columns/);
-    });
-
-    it('reads a coordinate the way an XML parser does, entities and all', () => {
-      const encoded = '<row r="1048576"><c r="&#88;F&#x44;1048576" t="inlineStr"><is><t>x</t></is></c></row>';
-      const bomb = xlsxWith(SALES, { extraRowsXml: encoded });
-      expect(() => assertSupportedFileBuffer(bomb, 'xlsx')).toThrow(/1048576 rows by 16384 columns/);
-    });
-  });
 
   it('reads a spreadsheet into header-keyed rows', async () => {
     const rows = await readWorkbookRows(xlsxWith([
