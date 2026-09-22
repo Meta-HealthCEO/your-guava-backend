@@ -524,6 +524,69 @@ const initializeHostedPaymentSession = async (paymentSession, org) => {
   }
 };
 
+/**
+ * Grants a mock credit pack through the same reference-keyed fulfilment a real
+ * payment uses.
+ *
+ * The mock path used to `$inc` the bonus balance directly, with no session and
+ * no reference, so a double-click, a retried request or a refreshed tab
+ * granted the pack again. Real purchases have been idempotent since
+ * `fulfilledPaymentReferences` existed; only the path used for testing and
+ * demos was not, which is the path most likely to be clicked twice.
+ *
+ * Without an Idempotency-Key there is nothing to be idempotent against, and a
+ * purchase that 400s because a header is missing is a worse failure than a
+ * duplicate, so it still proceeds — just with a session of its own.
+ */
+const fulfilMockCreditPurchase = async ({ org, userId, credits, amount, idempotencyKey }) => {
+  // Validated when supplied, not demanded. `normalizePaymentIdempotencyKey`
+  // throws on a missing key because a card payment must never be replayable;
+  // a mock grant that 400s on a missing header would be a worse failure than
+  // the duplicate it prevents, and no client is obliged to send one today.
+  const key = idempotencyKey ? normalizePaymentIdempotencyKey(idempotencyKey) : null;
+  const find = () =>
+    PaymentSession.findOne({ orgId: org._id, kind: 'credits', idempotencyKey: key });
+
+  let session = key ? await find() : null;
+  if (!session) {
+    const reference = generateReference('credits');
+    try {
+      session = await PaymentSession.create({
+        orgId: org._id,
+        userId,
+        provider: 'mock',
+        kind: 'credits',
+        idempotencyKey: key,
+        requestFingerprint: paymentRequestFingerprint({ kind: 'credits', credits, amount }),
+        initializationStatus: 'ready',
+        reference,
+        providerTransactionId: `mock-${reference}`,
+        amount,
+        currency: 'ZAR',
+        credits,
+        status: 'pending',
+      });
+    } catch (error) {
+      // Two requests with the same key can race past the findOne above; the
+      // unique index on (orgId, kind, idempotencyKey) is what actually decides
+      // which one creates the session.
+      if (error?.code === 11000 && key) session = await find();
+      if (!session) throw error;
+    }
+  }
+
+  const { org: updated, applied } = await applyCreditPayment(session);
+
+  if (session.status !== 'paid') {
+    await PaymentSession.updateOne(
+      { _id: session._id },
+      { $set: { status: 'paid', paidAt: session.paidAt || new Date() } }
+    );
+  }
+
+  return { org: updated, session, applied };
+};
+
 const createHostedPaymentSession = async ({
   org,
   userId,
@@ -814,6 +877,7 @@ const getCreditPack = (org, requestedCredits) => {
 module.exports = {
   billingPeriodForPayment,
   createHostedPaymentSession,
+  fulfilMockCreditPurchase,
   generateReference,
   getCreditPack,
   invalidateFutureForecastsForOrg,

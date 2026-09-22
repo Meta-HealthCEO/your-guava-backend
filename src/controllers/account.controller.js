@@ -14,6 +14,7 @@ const {
 const {
   billingPeriodForPayment,
   createHostedPaymentSession,
+  fulfilMockCreditPurchase,
   getCreditPack,
   invalidateFutureForecastsForOrg,
   reconcileOneGatePayment,
@@ -475,10 +476,17 @@ const buyAiCredits = async (req, res, next) => {
     if (!mockBillingEnabled()) return billingNotConfigured(res);
 
     await refreshCreditWindow(org._id);
-    await Organization.updateOne(
-      { _id: org._id },
-      { $inc: { 'aiCredits.bonus': pack.credits, __v: 1 } }
-    );
+    // Through the same reference-keyed fulfilment a real payment uses, rather
+    // than a bare $inc: a replayed request must grant the pack once. The
+    // receipt is the session reference, so it names a row that exists instead
+    // of a timestamp that identifies nothing.
+    const { session } = await fulfilMockCreditPurchase({
+      org,
+      userId: req.user.id,
+      credits: pack.credits,
+      amount: pack.price,
+      idempotencyKey: req.get('Idempotency-Key'),
+    });
     clearApiCache();
 
     const account = await buildAccountPayload(req.user.id);
@@ -486,7 +494,7 @@ const buyAiCredits = async (req, res, next) => {
       success: true,
       purchase: {
         provider: 'mock',
-        receiptId: `mock_guava_${Date.now()}`,
+        receiptId: session.reference,
         credits: pack.credits,
         amount: pack.price,
         currency: 'ZAR',

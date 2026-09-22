@@ -167,3 +167,77 @@ describe('abandoned checkout sessions', () => {
     expect(org.aiCredits.bonus).toBe(500);
   });
 });
+
+describe('mock credit purchases', () => {
+  // The mock path did a bare $inc with no session and no reference, so a
+  // double-click, a retried request or a refreshed tab granted the pack again.
+  // Real purchases have been idempotent since fulfilledPaymentReferences
+  // existed; only the path used for testing and demos was not.
+  const buy = (request, token, key) =>
+    request
+      .post('/api/account/ai-credits')
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', key)
+      .send({ credits: 500 });
+
+  it('grants the pack once when the same key is replayed', async () => {
+    const supertest = require('supertest');
+    const { app } = require('../setup');
+    const request = supertest(app);
+    const { token, user } = await createTestUser();
+
+    const before = await Organization.findById(user.orgId).lean();
+    const first = await buy(request, token, 'mock-credits-replay');
+    const second = await buy(request, token, 'mock-credits-replay');
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+
+    const after = await Organization.findById(user.orgId).lean();
+    const granted = (after.aiCredits?.bonus || 0) - (before.aiCredits?.bonus || 0);
+    const pack = first.body.purchase.credits;
+    expect(pack).toBeGreaterThan(0);
+    expect(granted).toBe(pack);
+
+    const sessions = await PaymentSession.find({ orgId: user.orgId, kind: 'credits' }).lean();
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].provider).toBe('mock');
+    expect(sessions[0].status).toBe('paid');
+    expect(sessions[0].providerTransactionId).toEqual(expect.stringContaining('mock'));
+  });
+
+  it('grants twice for two genuinely different purchases', async () => {
+    const supertest = require('supertest');
+    const { app } = require('../setup');
+    const request = supertest(app);
+    const { token, user } = await createTestUser();
+
+    const before = await Organization.findById(user.orgId).lean();
+    const first = await buy(request, token, 'mock-credits-one');
+    const second = await buy(request, token, 'mock-credits-two');
+
+    const after = await Organization.findById(user.orgId).lean();
+    const granted = (after.aiCredits?.bonus || 0) - (before.aiCredits?.bonus || 0);
+    expect(granted).toBe(first.body.purchase.credits + second.body.purchase.credits);
+    expect(await PaymentSession.countDocuments({ orgId: user.orgId, kind: 'credits' })).toBe(2);
+  });
+
+  it('still works for a client that sends no idempotency key', async () => {
+    // Nothing in the product requires one today, and a purchase that 400s
+    // because a header is missing is a worse failure than a duplicate.
+    const supertest = require('supertest');
+    const { app } = require('../setup');
+    const request = supertest(app);
+    const { token, user } = await createTestUser();
+
+    const res = await request
+      .post('/api/account/ai-credits')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ credits: 500 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.purchase.provider).toBe('mock');
+    const org = await Organization.findById(user.orgId).lean();
+    expect(org.aiCredits.bonus).toBeGreaterThan(0);
+  });
+});
