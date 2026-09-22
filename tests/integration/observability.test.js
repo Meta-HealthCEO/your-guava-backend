@@ -84,4 +84,60 @@ describe('Observability', () => {
       requestId,
     });
   });
+
+  describe('readiness reports product capability, not just env presence', () => {
+    const ENV = { ...process.env };
+    afterEach(() => { process.env = { ...ENV }; });
+
+    it('reports email ready outside production via the console transport', async () => {
+      const res = await request.get('/api/ready');
+      expect(res.status).toBe(200);
+      expect(res.body.checks.email).toEqual(
+        expect.objectContaining({ ok: true, mode: 'console' })
+      );
+    });
+
+    it('reports email NOT ready when production has no Resend credentials', async () => {
+      process.env.NODE_ENV = 'production';
+      delete process.env.RESEND_API_KEY;
+      delete process.env.RESEND_FROM_EMAIL;
+
+      const res = await request.get('/api/ready');
+
+      expect(res.status).toBe(503);
+      expect(res.body.status).toBe('not_ready');
+      expect(res.body.checks.email.ok).toBe(false);
+      expect(res.body.checks.email.configured).toBe(false);
+      expect(res.body.checks.email.reason).toMatch(/RESEND_API_KEY/);
+    });
+
+    it('reports payments NOT ready when production has no provider', async () => {
+      process.env.NODE_ENV = 'production';
+      delete process.env.PAYMENT_PROVIDER;
+
+      const res = await request.get('/api/ready');
+
+      expect(res.status).toBe(503);
+      expect(res.body.checks.payments.ok).toBe(false);
+      expect(res.body.checks.payments.reason).toMatch(/PAYMENT_PROVIDER/);
+    });
+
+    it('names the selected provider when one is configured', async () => {
+      process.env.PAYMENT_PROVIDER = 'paystack';
+      process.env.PAYSTACK_SECRET_KEY = 'sk_test_readiness_probe';
+
+      const res = await request.get('/api/ready');
+
+      expect(res.body.checks.payments).toEqual(
+        expect.objectContaining({ ok: true, provider: 'paystack' })
+      );
+    });
+
+    it('does not gate readiness on payments outside production', async () => {
+      delete process.env.PAYMENT_PROVIDER;
+      const res = await request.get('/api/ready');
+      expect(res.status).toBe(200);
+      expect(res.body.checks.payments.ok).toBe(true);
+    });
+  });
 });

@@ -70,6 +70,41 @@ const providerForSession = (session) =>
 /** Names of every provider that settles remotely and therefore needs sweeping. */
 const hostedProviderNames = () => Object.keys(PROVIDERS);
 
+/**
+ * What card checkout can actually do right now, for the readiness probe.
+ * Outside production an unconfigured provider is normal, so it is reported but
+ * does not make the service unready.
+ */
+const paymentCapability = () => {
+  const name = providerName();
+  const production = process.env.NODE_ENV === 'production';
+  if (!name) {
+    return {
+      ok: !production,
+      configured: false,
+      provider: null,
+      reason: 'PAYMENT_PROVIDER is not set: no card checkout is available',
+    };
+  }
+  if (!PROVIDERS[name]) {
+    return {
+      ok: !production,
+      configured: false,
+      provider: name,
+      reason: `PAYMENT_PROVIDER is "${name}", which is not a provider this build knows`,
+    };
+  }
+  if (!isHostedCheckoutConfigured()) {
+    return {
+      ok: !production,
+      configured: false,
+      provider: name,
+      reason: `${name} is selected but its credentials are missing`,
+    };
+  }
+  return { ok: true, configured: true, provider: name };
+};
+
 const requireProvider = () => {
   const provider = getProvider();
   if (!provider) {
@@ -86,6 +121,7 @@ module.exports = {
   providerName,
   isHostedCheckoutEnabled,
   isHostedCheckoutConfigured,
+  paymentCapability,
   requireProvider,
   providerForSession,
   hostedProviderNames,

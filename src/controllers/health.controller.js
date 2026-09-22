@@ -2,6 +2,8 @@ const mongoose = require('mongoose');
 const packageJson = require('../../package.json');
 const r2 = require('../services/r2.service');
 const validateEnv = require('../config/validateEnv');
+const email = require('../services/email.service');
+const paymentProvider = require('../services/paymentProvider.service');
 
 const DB_STATES = {
   0: 'disconnected',
@@ -82,6 +84,11 @@ const readiness = async (req, res) => {
       mode: storage.mode,
       missing: storage.missing,
     },
+    // Capability, not env presence. A deploy that boots, connects and stores files
+    // but cannot email a verification link or take a payment is not ready to serve
+    // customers, and used to report itself ready anyway.
+    email: email.deliveryCapability(),
+    payments: paymentProvider.paymentCapability(),
   };
   const ready = Object.values(checks).every((check) => check.ok);
 

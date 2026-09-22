@@ -97,6 +97,37 @@ const canUseConsoleTransport = () =>
   process.env.NODE_ENV !== 'production' &&
   String(process.env.EMAIL_DEV_CONSOLE || 'true').toLowerCase() !== 'false';
 
+/**
+ * What the mailer can actually do right now, for the readiness probe.
+ *
+ * Readiness used to check that two env vars were present and call that healthy,
+ * which is how a production deploy that could not send a single verification
+ * email reported itself ready for three months. This answers the question the
+ * probe is really asking: if a customer signs up in the next second, does a
+ * message reach them?
+ */
+const deliveryCapability = () => {
+  if (isConfigured()) return { ok: true, configured: true, mode: 'resend' };
+  if (canUseConsoleTransport()) {
+    return {
+      ok: true,
+      configured: false,
+      mode: 'console',
+      reason: 'RESEND_API_KEY is not set; links are written to the server log (never in production)',
+    };
+  }
+  const missing = [
+    !process.env.RESEND_API_KEY && 'RESEND_API_KEY',
+    !process.env.RESEND_FROM_EMAIL && 'RESEND_FROM_EMAIL',
+  ].filter(Boolean);
+  return {
+    ok: false,
+    configured: false,
+    mode: 'none',
+    reason: `${missing.join(' and ')} not set: signup verification and team invites cannot be delivered`,
+  };
+};
+
 const sendEmail = async ({ to, subject, html, text, tags }) => {
   const resend = getClient();
   if (!resend) {
@@ -274,5 +305,6 @@ module.exports = {
   sendTeamInviteEmail,
   sendEmail,
   isConfigured,
+  deliveryCapability,
   _resetClient,
 };
