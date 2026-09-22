@@ -86,8 +86,21 @@ describe('Observability', () => {
   });
 
   describe('readiness reports product capability, not just env presence', () => {
-    const ENV = { ...process.env };
-    afterEach(() => { process.env = { ...ENV }; });
+    // Snapshot inside beforeAll, not in the describe body: the body is evaluated
+    // before beforeAll(setup) runs, so at that point MONGODB_URI (set by
+    // mongodb-memory-server) does not exist yet and a restore would delete it,
+    // making every later readiness call 503 on checks.environment for a reason
+    // unrelated to the assertion. Restore by key, never `process.env = {...}`:
+    // replacing the object strands every module that captured a reference.
+    // A populated local .env masked both mistakes; CI caught them.
+    let ENV;
+    beforeAll(() => { ENV = { ...process.env }; });
+    afterEach(() => {
+      for (const key of Object.keys(process.env)) {
+        if (!(key in ENV)) delete process.env[key];
+      }
+      for (const [key, value] of Object.entries(ENV)) process.env[key] = value;
+    });
 
     it('reports email ready outside production via the console transport', async () => {
       const res = await request.get('/api/ready');
