@@ -9,6 +9,7 @@ const Transaction = require('./models/Transaction.model');
 const Item = require('./models/Item.model');
 const { readWorkbookRows } = require('./services/parser.service');
 const { isSafeSeedMongoUri } = require('./utils/seedMongoSafety');
+const { normaliseTransactionStatus } = require('./utils/transactionStatus');
 
 const MONGO_URI = process.argv[2] || process.env.MONGODB_URI;
 const IMPORT_FILE = process.env.SEED_IMPORT_FILE || process.argv[3];
@@ -103,7 +104,7 @@ async function seed() {
 
   for (const row of rows) {
     const status = (row['Status'] || '').trim();
-    if (status.toLowerCase() !== 'approved') continue;
+    if (normaliseTransactionStatus(status).status !== 'approved') continue;
 
     const receiptId = (row['Receipt'] || '').trim();
     const dateStr = (row['Date'] || '').trim().replace(/\//g, '-');

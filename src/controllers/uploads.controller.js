@@ -9,6 +9,7 @@ const GeneratedInsight = require('../models/GeneratedInsight.model');
 const r2 = require('../services/r2.service');
 const ingestion = require('../services/ingestion.service');
 const parser = require('../services/parser.service');
+const { normaliseTransactionStatus } = require('../utils/transactionStatus');
 const { updateForecastActuals, generateWeekForecast } = require('../services/forecast.service');
 const { computeDedupKey } = require('../utils/dedupKey');
 const { clearApiCache } = require('../middleware/cache.middleware');
@@ -164,7 +165,7 @@ const assertParsedRowsImportable = (parsed, { allowSeverePartial = false } = {})
     throw err;
   }
 
-  const approvedRows = parsed.rows.filter((row) => (row.status || 'approved').toLowerCase() === 'approved');
+  const approvedRows = parsed.rows.filter((row) => normaliseTransactionStatus(row.status).status === 'approved');
   if (approvedRows.length === 0) {
     const err = new Error('No approved transaction rows could be imported with this mapping');
     err.statusCode = 400;
@@ -298,7 +299,7 @@ const duplicateIdentityForRow = (row, sourceFingerprint, timezone) => {
 const receiptIdentityKey = (receiptId, dayKey) => `receiptId:${receiptId}|${dayKey}`;
 
 const assertRemapHasImportableRows = async (parsed, cafeId, uploadId, sourceFingerprint, timezone) => {
-  const approvedRows = parsed.rows.filter((row) => (row.status || 'approved').toLowerCase() === 'approved');
+  const approvedRows = parsed.rows.filter((row) => normaliseTransactionStatus(row.status).status === 'approved');
   if (approvedRows.length === 0) {
     const err = new Error('No approved transaction rows could be imported with this mapping');
     err.statusCode = 400;
@@ -478,6 +479,7 @@ const commitParsedUpload = async ({
             stats: {
               imported: result.imported,
               skipped: result.skipped,
+              skippedByReason: result.skippedByReason || {},
               errors: result.errors,
               totalRows: result.totalRows,
             },

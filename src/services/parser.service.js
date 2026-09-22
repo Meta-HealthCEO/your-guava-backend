@@ -1367,6 +1367,9 @@ const buildPackedRow = (raw, mapping, rowNumber, timezone) => {
     discount,
     paymentMethod: paymentMethod || undefined,
     status: mapping.status ? String(raw[mapping.status] || 'approved').trim().toLowerCase() : 'approved',
+    // The operator's own wording, kept so a skip reason can quote their file
+    // rather than a lowercased version of it.
+    statusRaw: mapping.status ? String(raw[mapping.status] || '').trim() : '',
   };
   return { row: setSourceRowNumbers(row, [rowNumber]) };
 };
@@ -1484,6 +1487,7 @@ const groupLinePerRow = (rawRows, mapping, timezone) => {
           discount,
           paymentMethod: paymentMethod || undefined,
           status: mapping.status ? String(raw[mapping.status] || 'approved').trim().toLowerCase() : 'approved',
+          statusRaw: mapping.status ? String(raw[mapping.status] || '').trim() : '',
           invalidReason: undefined,
         }, []));
       }

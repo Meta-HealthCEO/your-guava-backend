@@ -68,6 +68,9 @@ const uploadSchema = new mongoose.Schema(
       skipped: { type: Number, default: 0 },
       errors: { type: Number, default: 0 },
       totalRows: { type: Number, default: 0 },
+      // Why rows were skipped, keyed by reason (e.g. status_not_approved: 2).
+      // 'skipped' alone told an operator a number and nothing else.
+      skippedByReason: { type: Object, default: {} },
     },
     dateRange: {
       firstDate: { type: Date },

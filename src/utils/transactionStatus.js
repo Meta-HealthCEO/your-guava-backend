@@ -1,0 +1,48 @@
+/**
+ * What a POS export's Status column means.
+ *
+ * The importer used to compare against the single literal 'approved', so a till
+ * that writes "Completed", "Paid" or "Successful" had every row counted as
+ * declined and silently skipped — the upload finished reporting "0 imported,
+ * N skipped, 0 errors", which reads as a broken importer rather than a
+ * vocabulary mismatch. Yoco writes "Approved"; nothing guarantees the next
+ * vendor does.
+ *
+ * An unrecognised value is still declined — importing a row whose status we do
+ * not understand would be a guess about money — but it is flagged so the caller
+ * can tell the operator which word it did not know, instead of saying nothing.
+ */
+
+// An empty Status column means the export does not track status at all: every
+// row in it is a sale. That is the historical default and stays.
+const APPROVED = new Set([
+  'approved', 'approve',
+  'complete', 'completed',
+  'paid',
+  'success', 'successful',
+  'settled',
+  'captured',
+  'ok',
+]);
+
+const DECLINED = new Set([
+  'declined', 'decline',
+  'refunded', 'refund', 'partially refunded',
+  'failed', 'failure',
+  'void', 'voided',
+  'cancelled', 'canceled',
+  'reversed', 'chargeback',
+  'error', 'aborted', 'expired', 'pending',
+]);
+
+const SKIP_REASON_STATUS = 'status_not_approved';
+
+const normaliseTransactionStatus = (raw) => {
+  const key = String(raw ?? '').trim().toLowerCase();
+  if (key === '') return { status: 'approved', recognised: true };
+  if (APPROVED.has(key)) return { status: 'approved', recognised: true };
+  if (DECLINED.has(key)) return { status: 'declined', recognised: true };
+  return { status: 'declined', recognised: false };
+};
+
+module.exports = { normaliseTransactionStatus, SKIP_REASON_STATUS, APPROVED, DECLINED };

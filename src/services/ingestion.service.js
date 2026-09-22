@@ -18,6 +18,10 @@ const {
 } = require('./parser.service');
 const { computeDedupKey } = require('../utils/dedupKey');
 const {
+  normaliseTransactionStatus,
+  SKIP_REASON_STATUS,
+} = require('../utils/transactionStatus');
+const {
   rebuildItemsForCafe,
   reconcileTransactionItems,
 } = require('./menuItems.service');
@@ -253,7 +257,7 @@ const findExistingIdentities = async (cafeId, candidates, session, timezone) => 
 const reconcileParsedRows = async (parsed, { cafeId, session }) => {
   const reconciledCache = new Map();
   for (const row of parsed.rows) {
-    if ((row.status || 'approved').toLowerCase() !== 'approved') continue;
+    if (normaliseTransactionStatus(row.status).status !== 'approved') continue;
     const cacheKey = JSON.stringify(row.items || []);
     let reconciled = reconciledCache.get(cacheKey);
     if (!reconciled) {
@@ -278,6 +282,7 @@ const persistParsedRowsBulk = async (
   }
 ) => {
   let skipped = 0;
+  const skippedByReason = {};
   let errors = parsed.errors;
   const rowErrors = cloneRowErrors(parsed.rowErrors);
   let approvedRows = 0;
@@ -287,10 +292,18 @@ const persistParsedRowsBulk = async (
   const seen = new Set();
 
   for (const row of parsed.rows) {
-    const status = (row.status || 'approved').toLowerCase();
+    const { status, recognised } = normaliseTransactionStatus(row.status);
     if (status !== 'approved') {
       skipped++;
       declinedRows++;
+      skippedByReason[SKIP_REASON_STATUS] = (skippedByReason[SKIP_REASON_STATUS] || 0) + 1;
+      if (!recognised) {
+        addPersistenceRowError(
+          rowErrors,
+          row,
+          `Status "${row.statusRaw || row.status}" is not a recognised sale status`
+        );
+      }
       continue;
     }
     approvedRows++;
@@ -338,6 +351,7 @@ const persistParsedRowsBulk = async (
   return {
     imported: documents.length,
     skipped,
+    skippedByReason,
     errors,
     rowErrors,
     totalRows: parsed.totalRows,
@@ -389,6 +403,7 @@ const persistParsedRows = async (
 
   let imported = 0;
   let skipped = 0;
+  const skippedByReason = {};
   let errors = parsed.errors;
   const rowErrors = cloneRowErrors(parsed.rowErrors);
   let approvedRows = 0;
@@ -398,10 +413,18 @@ const persistParsedRows = async (
 
   for (const row of parsed.rows) {
     try {
-      const status = (row.status || 'approved').toLowerCase();
+      const { status, recognised } = normaliseTransactionStatus(row.status);
       if (status !== 'approved') {
         skipped++;
         declinedRows++;
+        skippedByReason[SKIP_REASON_STATUS] = (skippedByReason[SKIP_REASON_STATUS] || 0) + 1;
+        if (!recognised) {
+          addPersistenceRowError(
+            rowErrors,
+            row,
+            `Status "${row.statusRaw || row.status}" is not a recognised sale status`
+          );
+        }
         continue;
       }
       approvedRows++;
@@ -471,6 +494,7 @@ const persistParsedRows = async (
   return {
     imported,
     skipped,
+    skippedByReason,
     errors,
     rowErrors,
     totalRows: parsed.totalRows,

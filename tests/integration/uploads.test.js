@@ -64,6 +64,66 @@ describe('Uploads API', () => {
       expect(txns[0].uploadId.toString()).toBe(uploadId);
     });
 
+    it('imports a till that writes Completed instead of Approved', async () => {
+      // Yoco writes "Approved"; nothing guarantees the next vendor does. This file
+      // used to import 0 of 3 rows and report "0 errors", which reads as a broken
+      // importer rather than a vocabulary mismatch.
+      const csv = Buffer.from([
+        'Receipt,Date,Time,Status,Items,Total (incl. tax)',
+        '2026/04/000001,2026/04/01,09:30:00,Completed,1 x Flat White,38.00',
+        '2026/04/000002,2026/04/01,10:15:00,Paid,2 x Latte,80.00',
+        '2026/04/000003,2026/04/01,11:00:00,Successful,1 x Croissant,32.00',
+      ].join(String.fromCharCode(10)));
+
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', csv, 'completed-status.csv');
+
+      const confirm = await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      expect(confirm.status).toBe(200);
+      expect(confirm.body.stats.imported).toBe(3);
+      expect(confirm.body.stats.skipped).toBe(0);
+    });
+
+    it('names the word it did not recognise instead of silently skipping the row', async () => {
+      const csv = Buffer.from([
+        'Receipt,Date,Time,Status,Items,Total (incl. tax)',
+        '2026/04/000001,2026/04/01,09:30:00,Approved,1 x Flat White,38.00',
+        '2026/04/000002,2026/04/01,10:15:00,Banana,2 x Latte,80.00',
+        '2026/04/000003,2026/04/01,11:00:00,Declined,1 x Croissant,32.00',
+      ].join(String.fromCharCode(10)));
+
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', csv, 'unknown-status.csv');
+
+      const confirm = await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      expect(confirm.status).toBe(200);
+      expect(confirm.body.stats.imported).toBe(1);
+      expect(confirm.body.stats.skipped).toBe(2);
+      // The breakdown says why, and the unknown word is named. "Declined" is
+      // understood, so it needs no row error - only the word we did not know does.
+      expect(confirm.body.stats.skippedByReason).toEqual(
+        expect.objectContaining({ status_not_approved: 2 })
+      );
+      // confirmationResponse() returns rowErrors at the top level, not inside stats
+      const reasons = (confirm.body.rowErrors || []).map((e) => e.reason);
+      expect(reasons).toEqual(
+        expect.arrayContaining([expect.stringMatching(/"Banana" is not a recognised/)])
+      );
+      expect(reasons.join(' ')).not.toMatch(/Declined/);
+    });
+
     it('stages and confirms semicolon CSVs with normalised headers', async () => {
       const csv = Buffer.from([
         '\uFEFF Sale Date ; Sale Time ; Description ; Amount ',
