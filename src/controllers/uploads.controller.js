@@ -1213,19 +1213,35 @@ const remove = async (req, res, next) => {
     const session = await mongoose.startSession();
     try {
       await session.withTransaction(async () => {
-        await Transaction.deleteMany({ cafeId, uploadId: upload._id }).session(session);
-        await ingestion.rebuildItemsForCafe(cafeId, { session });
-        await Forecast.deleteMany({ cafeId, date: { $gte: today } }).session(session);
-        await GeneratedInsight.updateOne(
-          { cafeId },
-          { $set: { invalidatedAt: new Date() } },
-          { session }
-        );
-        const remainingTransactions = await Transaction.countDocuments({ cafeId }).session(session);
-        const cafeStateUpdate = remainingTransactions > 0
-          ? { $set: { dataUploaded: true, lastSyncAt: new Date() } }
-          : { $set: { dataUploaded: false }, $unset: { lastSyncAt: '' } };
-        await Cafe.updateOne({ _id: cafeId }, cafeStateUpdate, { session });
+        // Count what this upload actually contributed before removing it, rather
+        // than trusting stats.imported - a re-map rewrites the rows without
+        // rewriting the stat. An upload that contributed nothing (staged and
+        // abandoned, or a duplicate that imported no new rows) changed none of the
+        // model's inputs, so deleting it must not wipe the planning horizon or
+        // invalidate insights. Doing so meant tidying up a stranded upload cost an
+        // owner every forecast they had.
+        const contributedRows = await Transaction.countDocuments({
+          cafeId,
+          uploadId: upload._id,
+        }).session(session);
+
+        if (contributedRows > 0) {
+          await Transaction.deleteMany({ cafeId, uploadId: upload._id }).session(session);
+          await ingestion.rebuildItemsForCafe(cafeId, { session });
+          await Forecast.deleteMany({ cafeId, date: { $gte: today } }).session(session);
+          await GeneratedInsight.updateOne(
+            { cafeId },
+            { $set: { invalidatedAt: new Date() } },
+            { session }
+          );
+        }
+        if (contributedRows > 0) {
+          const remainingTransactions = await Transaction.countDocuments({ cafeId }).session(session);
+          const cafeStateUpdate = remainingTransactions > 0
+            ? { $set: { dataUploaded: true, lastSyncAt: new Date() } }
+            : { $set: { dataUploaded: false }, $unset: { lastSyncAt: '' } };
+          await Cafe.updateOne({ _id: cafeId }, cafeStateUpdate, { session });
+        }
         const deletedUpload = await Upload.findOneAndUpdate(
           {
             _id: upload._id,

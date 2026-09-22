@@ -917,6 +917,83 @@ describe('Uploads API', () => {
     });
   });
 
+  describe('Deleting an upload that imported nothing', () => {
+    it('leaves the forecast horizon and dataUploaded alone', async () => {
+      const Forecast = require('../../src/models/Forecast.model');
+      const Cafe = require('../../src/models/Cafe.model');
+      const mongoose = require('mongoose');
+
+      const u = await createTestUser({ email: 'zero@yourguava.com', cafeName: 'Cafe Zero', orgName: 'Org Zero' });
+      const cafeId = u.user?.cafeIds?.[0];
+      if (!cafeId) throw new Error('test user did not expose a cafeId');
+
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours(0, 0, 0, 0);
+      await Forecast.create({
+        cafeId, date: tomorrow, generatedAt: new Date(), items: [], predictedRevenue: 1234,
+      });
+      await Cafe.updateOne({ _id: cafeId }, { $set: { dataUploaded: true } });
+
+      // An upload that was staged and abandoned: no transactions ever linked to it.
+      const stranded = await Upload.create({
+        cafeId,
+        uploadedBy: new mongoose.Types.ObjectId(u.user.id || u.user._id),
+        fileName: 'abandoned.csv',
+        fileSize: 10,
+        posType: 'wizard',
+        r2Key: 'uploads/test/abandoned.csv',
+        status: 'pending_mapping',
+        stats: { imported: 0, skipped: 0, errors: 0, totalRows: 0 },
+      });
+
+      const res = await request
+        .delete(`/api/uploads/${stranded._id}`)
+        .set('Authorization', `Bearer ${u.token}`);
+
+      expect(res.status).toBe(200);
+      // The forecast horizon must survive: this upload contributed no data, so
+      // nothing about the model's inputs changed.
+      expect(await Forecast.countDocuments({ cafeId })).toBe(1);
+      expect((await Cafe.findById(cafeId).lean()).dataUploaded).toBe(true);
+      expect((await Upload.findById(stranded._id).lean()).status).toBe('deleted');
+    });
+
+    it('still clears the horizon when the upload did import rows', async () => {
+      const Forecast = require('../../src/models/Forecast.model');
+
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', yocoFixture);
+      await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ columnMapping: stage.body.columnMapping, itemsMode: stage.body.itemsMode });
+
+      const upload = await Upload.findById(stage.body.uploadId).lean();
+      const cafeId = upload.cafeId;
+      expect(await Transaction.countDocuments({ cafeId, uploadId: upload._id })).toBeGreaterThan(0);
+
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours(0, 0, 0, 0);
+      await Forecast.deleteMany({ cafeId });
+      await Forecast.create({
+        cafeId, date: tomorrow, generatedAt: new Date(), items: [], predictedRevenue: 99,
+      });
+
+      await request
+        .delete(`/api/uploads/${stage.body.uploadId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+
+      // Its rows are gone, so every forecast built on them is stale and must go.
+      expect(await Forecast.countDocuments({ cafeId, date: { $gte: tomorrow } })).toBe(0);
+      expect(await Transaction.countDocuments({ cafeId, uploadId: upload._id })).toBe(0);
+    });
+  });
+
   describe('Forecast invalidation', () => {
     it('preserves historical forecasts and refreshes planning forecasts on successful confirm', async () => {
       const Forecast = require('../../src/models/Forecast.model');
