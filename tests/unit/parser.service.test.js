@@ -1496,3 +1496,86 @@ describe('legacy .xls detection', () => {
     expect(() => parser.assertSupportedFileBuffer(notZip, 'xlsx')).toThrow(/signature is invalid/i);
   });
 });
+
+describe('Excel "sep=" preamble', () => {
+  const {
+    csvSeparatorDirective,
+    detectCsvSeparator,
+    parseBuffer,
+  } = require('../../src/services/parser.service');
+  const LF = String.fromCharCode(10);
+  const MAPPING = {
+    receiptId: 'Receipt',
+    date: 'Date',
+    time: 'Time',
+    status: 'Status',
+    items: 'Items',
+    total: 'Total (incl. tax)',
+  };
+  const parse = (text) =>
+    parseBuffer(Buffer.isBuffer(text) ? text : Buffer.from(text), {
+      columnMapping: MAPPING,
+      fileExt: 'csv',
+    });
+
+  // Excel writes `sep=;` as the first line whenever the machine's list
+  // separator is not a comma, which is the default on South African and most
+  // European Windows installs. Production upload 6a3289a4 is stuck on exactly
+  // this: its headers read ["sep=", ""] and it imported nothing.
+  //
+  // It matters beyond that one file. The fix we hand someone with a legacy
+  // .xls is "Save As CSV UTF-8", so this is the very next thing that same
+  // owner produces.
+  it('imports a semicolon export instead of reading the directive as headers', async () => {
+    const result = await parse([
+      'sep=;',
+      'Receipt;Date;Time;Status;Items;Total (incl. tax)',
+      '1001;2026/09/14;09:00:00;Approved;1 x Flat White;38.00',
+    ].join(LF));
+
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0].receiptId).toBe('1001');
+    expect(result.rows[0].total).toBe(38);
+    expect(result.errors).toBe(0);
+  });
+
+  it('believes the file about its separator, over its own guess', () => {
+    // One column per row gives the detector nothing to score, so the
+    // declaration is the only reliable signal.
+    const declared = Buffer.from(['sep=;', 'Receipt', '1001'].join(LF));
+    expect(detectCsvSeparator(declared)).toBe(';');
+  });
+
+  it('accepts a tab declaration behind a BOM', async () => {
+    const TAB = String.fromCharCode(9);
+    const body = [
+      'sep=\\t',
+      ['Receipt', 'Date', 'Time', 'Status', 'Items', 'Total (incl. tax)'].join(TAB),
+      ['1001', '2026/09/14', '09:00:00', 'Approved', '1 x Flat White', '38.00'].join(TAB),
+    ].join(LF);
+    const withBom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(body)]);
+
+    const result = await parse(withBom);
+
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0].total).toBe(38);
+  });
+
+  it('leaves an ordinary comma export exactly as it was', async () => {
+    const plain = [
+      'Receipt,Date,Time,Status,Items,Total (incl. tax)',
+      '1001,2026/09/14,09:00:00,Approved,1 x Flat White,38.00',
+    ].join(LF);
+
+    expect(detectCsvSeparator(Buffer.from(plain))).toBe(',');
+    const result = await parse(plain);
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0].receiptId).toBe('1001');
+  });
+
+  it('does not mistake a genuine column named sep= for a directive', () => {
+    // The directive only counts on the first line, alone on it.
+    expect(csvSeparatorDirective(Buffer.from('Receipt,sep=x' + LF + '1001,yes'))).toBeNull();
+    expect(csvSeparatorDirective(Buffer.from('Receipt,Total' + LF + 'sep=;'))).toBeNull();
+  });
+});

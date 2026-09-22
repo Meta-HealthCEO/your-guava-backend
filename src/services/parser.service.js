@@ -714,7 +714,52 @@ const CSV_SEPARATOR_SAMPLE_LINES = 5;
  * smallest per-line count: a real delimiter separates every row, while a comma
  * inside one quoted item cell shows up on one line only.
  */
+/**
+ * Excel writes `sep=;` as the first line of a CSV whenever the machine's list
+ * separator is not a comma, which is the default on South African and most
+ * European Windows installs. It is a directive to Excel, not data.
+ *
+ * Read as data it becomes the header row: production upload 6a3289a4 has
+ * `headers: ["sep=", ""]` and imported nothing, and its owner was told "no
+ * valid transaction rows could be imported with this mapping" beside a mapping
+ * screen listing one nonsensical column.
+ *
+ * It matters beyond that one file. The fix we hand someone with a legacy .xls
+ * is "Save As CSV UTF-8", so this is the very next thing that same owner
+ * produces. Without this they walk out of one dead end into another.
+ *
+ * Only the first line counts, and only when the directive is the whole of it,
+ * so a genuine column named `sep=x` stays a column.
+ */
+const SEP_DIRECTIVE_RE = /^﻿?sep=(\\t|.)[ \t]*$/i;
+
+const csvSeparatorDirective = (buffer) => {
+  if (!Buffer.isBuffer(buffer)) return null;
+  const head = buffer.toString('utf8', 0, Math.min(buffer.length, 64));
+  const firstLine = head.split(/\r?\n/)[0];
+  const match = SEP_DIRECTIVE_RE.exec(firstLine || '');
+  if (!match) return null;
+  // `sep=\t` is written literally, two characters, not a tab byte.
+  const separator = match[1] === '\\t' ? '\t' : match[1];
+  return { separator, byteLength: Buffer.byteLength(firstLine, 'utf8') };
+};
+
+/** The buffer with any `sep=` directive line removed, ready to be parsed. */
+const stripCsvSeparatorDirective = (buffer) => {
+  const directive = csvSeparatorDirective(buffer);
+  if (!directive) return buffer;
+  let offset = directive.byteLength;
+  if (buffer[offset] === 0x0d) offset += 1;
+  if (buffer[offset] === 0x0a) offset += 1;
+  return buffer.subarray(offset);
+};
+
 const detectCsvSeparator = (buffer) => {
+  // The file declaring its own separator beats guessing from the shape of
+  // the rows, which a one-column-per-row export gives nothing to score.
+  const declared = csvSeparatorDirective(buffer);
+  if (declared) return declared.separator;
+
   const lines = (Buffer.isBuffer(buffer)
     ? buffer.toString('utf8', 0, Math.min(buffer.length, 4096))
     : '')
@@ -963,7 +1008,9 @@ const readRows = (buffer, fileExt) => {
       reject(error);
     };
     const dedupeHeader = headerDeduper();
-    const input = Readable.from(buffer);
+    // Stripped before parsing; left in place the directive becomes the
+    // header row and every real column disappears behind it.
+    const input = Readable.from(stripCsvSeparatorDirective(buffer));
     const parserStream = csv({
         separator: detectCsvSeparator(buffer),
         mapHeaders: ({ header, index }) => dedupeHeader(header, index),
@@ -1695,7 +1742,9 @@ module.exports = {
   normaliseCell,
   normaliseRow,
   normaliseRows,
+  csvSeparatorDirective,
   detectCsvSeparator,
+  stripCsvSeparatorDirective,
   assertSupportedFileBuffer,
   readWorkbookRows,
   readWorkbook,
