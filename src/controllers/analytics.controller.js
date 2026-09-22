@@ -412,18 +412,21 @@ const getItems = async (req, res, next) => {
 
     const trendData = await Transaction.aggregate(trendPipeline);
 
-    // Build trend lookup: { itemName: { current, previous } }
-    const trendMap = {};
+    // Build trend lookup: itemName -> { current, previous }. A Map, because
+    // item names come from POS files: on a plain object, trendMap['__proto__']
+    // returned Object.prototype and this loop wrote current/previous onto every
+    // object in the process, for every cafe, until restart.
+    const trendMap = new Map();
     for (const entry of trendData) {
       const name = entry._id.name;
       const period = entry._id.period;
-      if (!trendMap[name]) trendMap[name] = { current: 0, previous: 0 };
-      trendMap[name][period] = entry.totalQty;
+      if (!trendMap.has(name)) trendMap.set(name, { current: 0, previous: 0 });
+      trendMap.get(name)[period] = entry.totalQty;
     }
 
     // Attach trend to items
     const itemsWithTrend = items.map((item) => {
-      const t = trendMap[item.name];
+      const t = trendMap.get(item.name);
       let trend = 0;
       if (t && t.previous > 0) {
         trend = parseFloat((((t.current - t.previous) / t.previous) * 100).toFixed(1));
@@ -434,7 +437,7 @@ const getItems = async (req, res, next) => {
     });
 
     // Build full trend list for rising/declining (not limited to top 20)
-    const allItemTrends = Object.entries(trendMap)
+    const allItemTrends = [...trendMap.entries()]
       .map(([name, t]) => {
         let trend = 0;
         if (t.previous > 0) {

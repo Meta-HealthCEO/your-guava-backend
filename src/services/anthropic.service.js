@@ -535,7 +535,9 @@ const buildSummaryStats = (transactions, timezone = 'Africa/Johannesburg') => {
   const dailyRevenue = {};
   const dayOfWeekRevenue = { 0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 };
   const dayOfWeekCount = { 0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0 };
-  const itemCounts = {};
+  // No prototype: item names come from POS files, and "constructor" or
+  // "__proto__" must count like any other name.
+  const itemCounts = Object.create(null);
 
   for (const tx of transactions) {
     const dateKey = zonedDateKey(tx.date, timezone);
@@ -1538,6 +1540,7 @@ const _resetInsightsCache = () => GeneratedInsight.deleteMany({});
 
 module.exports = {
   _resetInsightsCache,
+  buildSummaryStats,
   _resetMappingCache,
   buildBusinessContext,
   invalidateInsights,

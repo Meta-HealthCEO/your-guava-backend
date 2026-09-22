@@ -177,6 +177,25 @@ describe('Integrations API', () => {
     expect(res.body.success).toBe(false);
   });
 
+  it.each(['constructor', '__proto__', 'toString'])(
+    'treats a provider named %s as unknown, not as a built-in',
+    async (provider) => {
+      // The allow-list was a plain object, so services['constructor'] was
+      // Object - truthy - and walked past the "Unknown provider" guard into a
+      // 500. Only the three real providers are providers.
+      process.env.ACCOUNTING_INTEGRATIONS_ENABLED = 'true';
+      const auth = await request
+        .get(`/api/integrations/${provider}/auth`)
+        .set('Authorization', `Bearer ${token}`);
+      const sync = await request
+        .post(`/api/integrations/${provider}/sync`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(auth.status).toBe(400);
+      expect(sync.status).toBe(400);
+    }
+  );
+
   it('GET /api/integrations requires auth', async () => {
     const res = await request.get('/api/integrations');
     expect(res.status).toBe(401);

@@ -186,6 +186,49 @@ describe('Analytics API', () => {
       );
       expect(res.body.meta.risingItems).toContainEqual({ name: 'Flat White', trend: 100 });
     });
+
+    it('keeps an item named __proto__, constructor or prototype to itself', async () => {
+      // Item names come straight from POS files. The trend lookup was a plain
+      // object, so trendMap['__proto__'] returned Object.prototype and the loop
+      // wrote current/previous onto every object in the process - for every
+      // cafe, until restart. Saving Ask Guava history was one thing it broke.
+      const names = ['__proto__', 'constructor', 'prototype'];
+      const docs = [];
+      for (let day = 1; day <= 14; day++) {
+        docs.push({
+          cafeId,
+          date: new Date(`2026-01-${String(day).padStart(2, '0')}T09:00:00+02:00`),
+          hour: 9,
+          dayOfWeek: day % 7,
+          status: 'approved',
+          items: names.map((name) => ({ name, quantity: day <= 7 ? 1 : 2, unitPrice: 10 })),
+          total: 30,
+        });
+      }
+      await Transaction.insertMany(docs);
+
+      try {
+        const res = await request
+          .get('/api/analytics/items')
+          .set('Authorization', `Bearer ${token}`)
+          .query({ startDate: '2026-01-01', endDate: '2026-01-14' });
+
+        expect(res.status).toBe(200);
+        for (const target of [Object.prototype, Object]) {
+          expect(Object.hasOwn(target, 'current')).toBe(false);
+          expect(Object.hasOwn(target, 'previous')).toBe(false);
+        }
+        for (const name of names) {
+          expect(res.body.items).toContainEqual(expect.objectContaining({ name, totalQty: 21, trend: 100 }));
+          expect(res.body.meta.risingItems).toContainEqual({ name, trend: 100 });
+        }
+      } finally {
+        for (const target of [Object.prototype, Object]) {
+          delete target.current;
+          delete target.previous;
+        }
+      }
+    });
   });
 
   describe('GET /api/analytics/heatmap', () => {

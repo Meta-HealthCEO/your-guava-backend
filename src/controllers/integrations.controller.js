@@ -9,15 +9,19 @@ const xeroService = require('../services/integrations/xero.service');
 const quickbooksService = require('../services/integrations/quickbooks.service');
 const sageService = require('../services/integrations/sage.service');
 
-/** Map provider name → service module. Returns null for unknown providers. */
-const getService = (provider) => {
-  const services = {
-    xero: xeroService,
-    quickbooks: quickbooksService,
-    sage: sageService,
-  };
-  return services[provider] || null;
-};
+const SERVICES = Object.freeze({
+  xero: xeroService,
+  quickbooks: quickbooksService,
+  sage: sageService,
+});
+
+/**
+ * Map provider name → service module. Returns null for unknown providers.
+ * Own keys only: on a plain lookup, "constructor", "__proto__" or "toString"
+ * resolved to a built-in, walked past the "Unknown provider" guard and ended
+ * in a 500.
+ */
+const getService = (provider) => (Object.hasOwn(SERVICES, provider) ? SERVICES[provider] : null);
 
 const isConfigError = (error) =>
   /CLIENT_ID|CLIENT_SECRET|REDIRECT_URI|is not set/i.test(error?.message || '');
@@ -220,7 +224,8 @@ const sync = async (req, res, next) => {
       transactionCount: txns.length,
       totalRevenue: txns.reduce((s, t) => s + (t.total || 0), 0),
       totalTip: txns.reduce((s, t) => s + (t.tip || 0), 0),
-      itemBreakdown: {},
+      // No prototype: keyed by POS item names (see getService).
+      itemBreakdown: Object.create(null),
     };
 
     for (const tx of txns) {
@@ -268,7 +273,7 @@ const sync = async (req, res, next) => {
 const disconnect = async (req, res, next) => {
   try {
     const { provider } = req.params;
-    if (!['xero', 'quickbooks', 'sage'].includes(provider)) {
+    if (!getService(provider)) {
       return res.status(400).json({ success: false, message: 'Unknown provider' });
     }
     await Cafe.findByIdAndUpdate(req.user.cafeId, {
