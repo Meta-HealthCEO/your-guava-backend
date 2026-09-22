@@ -254,5 +254,37 @@ describe('Transactions API', () => {
       expect(res.body.stats.totalTransactions).toBe(0);
       expect(res.body.stats.totalRevenue).toBe(0);
     });
+  });
+  it('covers the 30 completed days the portal draws, not 29 of them', async () => {
+    const parser = require('../../src/services/parser.service');
+    const Transaction = require('../../src/models/Transaction.model');
+    const tz = 'Africa/Johannesburg';
+    const { token, user } = await createTestUser({
+      email: 'cov@yourguava.com', cafeName: 'Cafe Cov', orgName: 'Org Cov',
+    });
+    // The token's own cafe, not whichever cafe happens to be first in the
+    // collection - /transactions/status scopes to req.user.cafeId.
+    const cafe = user.activeCafeId || user.cafeIds[0];
+
+    // one sale exactly 30 completed days ago - the oldest cell the strip draws
+    await Transaction.create({
+      cafeId: cafe,
+      date: parser.addZonedDays(new Date(), -30, tz),
+      dayOfWeek: 1,
+      hour: 9,
+      total: 42,
+      status: 'approved',
+      items: [],
+    });
+
+    const res = await request.get('/api/transactions/status').set('Authorization', `Bearer ${token}`);
+    expect(res.status).toBe(200);
+    const oldest = parser.zonedDateKey(parser.addZonedDays(new Date(), -30, tz), tz);
+    const keys = (res.body.data.coverage30d || []).map((c) => c.date);
+    // Before this the window started at -29, so the portal's oldest cell was
+    // always absent from the response and rendered as a gap that did not exist.
+    expect(keys).toContain(oldest);
   });
+
+
 });

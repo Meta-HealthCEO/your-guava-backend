@@ -359,8 +359,12 @@ const getDataStatus = async (req, res, next) => {
     const earliest = await Transaction.findOne({ cafeId }).sort({ date: 1 }).select('date').lean();
     const totalCount = await Transaction.countDocuments({ cafeId });
 
-    // Coverage: count distinct dates with transactions in the last 30 days.
-    const thirtyDaysAgo = parser.addZonedDays(new Date(), -29, timezone);
+    // Coverage: the last 30 COMPLETED trading days plus today, so the portal can
+    // show today separately. Today is in progress, not missing: a cafe that has
+    // not sold anything yet this morning has left no gap, and counting it as one
+    // reported a hole the owner could do nothing about. Thirty-one days back so
+    // the oldest completed day the strip draws is still inside this window.
+    const thirtyDaysAgo = parser.addZonedDays(new Date(), -30, timezone);
 
     const coverage = await Transaction.aggregate([
       { $match: { cafeId: new mongoose.Types.ObjectId(String(cafeId)), date: { $gte: thirtyDaysAgo } } },
