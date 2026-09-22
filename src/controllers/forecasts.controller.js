@@ -34,6 +34,10 @@ const {
 
 const REQUIRED_PLANNING_FACTOR_KEYS = ['weather', 'loadShedding', 'holiday', 'payday', 'events'];
 const HISTORY_BACKFILL_BATCH_SIZE = 14;
+// Live scored days needed before the headline accuracy stops leaning on
+// backtests. Five is a working week: enough that one bad Saturday cannot move
+// the figure twenty points. See DECISIONS D-004.
+const LIVE_ACCURACY_MIN_DAYS = 5;
 
 const clampHistoryDays = (value) => {
   const parsed = Number.parseInt(value, 10);
@@ -366,26 +370,51 @@ const getAccuracy = async (req, res, next) => {
     const today = zonedDayStart(new Date(), timezone);
     const thirtyDaysAgo = addZonedDays(today, -30, timezone);
 
-    const forecasts = await Forecast.find({
+    const scored = await Forecast.find({
       cafeId,
       date: { $gte: thirtyDaysAgo, $lt: today },
       accuracy: { $exists: true, $ne: null },
       actualsUpdatedAt: { $exists: true, $ne: null },
-      origin: { $ne: 'backfill' },
     })
       .sort({ date: -1 })
       .select('date dateKey origin modelVersion accuracy totalPredictedRevenue actualRevenue actualTransactionCount actualsUpdatedAt')
       .lean();
 
+    // A backfilled day was scored against sales the model had not seen, so it
+    // is a real measurement -- just a retrospective one. Anything that is not
+    // a backfill is live, including older documents written before `origin`
+    // existed and the occasional manual regeneration.
+    const live = scored.filter((forecast) => forecast.origin !== 'backfill');
+    const backtest = scored.filter((forecast) => forecast.origin === 'backfill');
+
+    // Under five live days the figure swings twenty points on one bad
+    // Saturday, so claiming it is live would make the headline less reliable
+    // the moment it started saying so. A new cafe that has run a backfill sees
+    // the backtest estimate instead of a blank screen (DECISIONS D-004).
+    const basis = live.length >= LIVE_ACCURACY_MIN_DAYS
+      ? 'live'
+      : backtest.length > 0
+        ? 'backtest'
+        : 'none';
+    const chosen = basis === 'live' ? live : basis === 'backtest' ? backtest : [];
+
     const avgAccuracy =
-      forecasts.length > 0
-        ? forecasts.reduce((sum, f) => sum + f.accuracy, 0) / forecasts.length
+      chosen.length > 0
+        ? chosen.reduce((sum, f) => sum + f.accuracy, 0) / chosen.length
         : null;
+
+    // The day live scoring starts, so the UI can say what the estimate will be
+    // replaced by and when.
+    const earliestLive = live.length > 0 ? live[live.length - 1] : null;
 
     return res.status(200).json({
       success: true,
       avgAccuracy: avgAccuracy !== null ? parseFloat(avgAccuracy.toFixed(1)) : null,
-      forecasts: forecasts.map((forecast) => forecastForApi(forecast, timezone)),
+      basis,
+      liveCount: live.length,
+      backtestCount: backtest.length,
+      liveFrom: earliestLive ? new Date(earliestLive.date).toISOString() : null,
+      forecasts: chosen.map((forecast) => forecastForApi(forecast, timezone)),
     });
   } catch (error) {
     next(error);

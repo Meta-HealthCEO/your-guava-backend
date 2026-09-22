@@ -454,6 +454,27 @@ describe('Forecasts API', () => {
   });
 
   describe('GET /api/forecasts/accuracy', () => {
+    // A scored day, `daysAgo` back, from either origin.
+    const scoreDay = async (cafeId, daysAgo, origin, accuracy) => {
+      const Forecast = require('../../src/models/Forecast.model');
+      const date = new Date();
+      date.setDate(date.getDate() - daysAgo);
+      date.setHours(0, 0, 0, 0);
+      return Forecast.create({
+        cafeId,
+        date,
+        generatedAt: new Date(),
+        origin,
+        items: [{ itemName: 'Flat White', predictedQty: 3, actualQty: 3 }],
+        signals: { weather: { temp: 20, condition: 'clear', humidity: 60 }, loadSheddingStage: 0, isPublicHoliday: false, isSchoolHoliday: false, isPayday: false, dayOfWeek: 0, events: [] },
+        totalPredictedRevenue: 100,
+        actualRevenue: 100,
+        actualTransactionCount: 1,
+        actualsUpdatedAt: new Date(),
+        accuracy,
+      });
+    };
+
     it('returns accuracy data (empty when no historical forecasts)', async () => {
       const res = await request
         .get('/api/forecasts/accuracy')
@@ -461,6 +482,84 @@ describe('Forecasts API', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
+      expect(res.body.basis).toBe('none');
+      expect(res.body.avgAccuracy).toBeNull();
+      expect(res.body.liveCount).toBe(0);
+      expect(res.body.backtestCount).toBe(0);
+    });
+
+    it('reports a backtest estimate rather than nothing, when only backfills are scored', async () => {
+      // A new cafe that has run a backfill has 56 scored days and was shown
+      // "Awaiting matched sales data" for weeks. The engine knows the number;
+      // withholding it is not honesty, it is a blank screen.
+      const Cafe = require('../../src/models/Cafe.model');
+      const Forecast = require('../../src/models/Forecast.model');
+      const cafe = await Cafe.findOne({});
+      await Forecast.deleteMany({ cafeId: cafe._id });
+      for (let i = 1; i <= 10; i += 1) {
+        await scoreDay(cafe._id, i, 'backfill', 70 + i);
+      }
+
+      const res = await request
+        .get('/api/forecasts/accuracy')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.basis).toBe('backtest');
+      expect(res.body.backtestCount).toBe(10);
+      expect(res.body.liveCount).toBe(0);
+      // mean of 71..80
+      expect(res.body.avgAccuracy).toBe(75.5);
+      expect(res.body.forecasts).toHaveLength(10);
+    });
+
+    it('does not dilute a live figure with backtests once five live days exist', async () => {
+      const Cafe = require('../../src/models/Cafe.model');
+      const Forecast = require('../../src/models/Forecast.model');
+      const cafe = await Cafe.findOne({});
+      await Forecast.deleteMany({ cafeId: cafe._id });
+      for (let i = 1; i <= 10; i += 1) {
+        await scoreDay(cafe._id, i, 'backfill', 40);
+      }
+      for (let i = 11; i <= 15; i += 1) {
+        await scoreDay(cafe._id, i, 'live', 90);
+      }
+
+      const res = await request
+        .get('/api/forecasts/accuracy')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.basis).toBe('live');
+      expect(res.body.liveCount).toBe(5);
+      expect(res.body.backtestCount).toBe(10);
+      expect(res.body.avgAccuracy).toBe(90);
+      expect(res.body.forecasts).toHaveLength(5);
+      expect(res.body.liveFrom).toBeTruthy();
+    });
+
+    it('holds the backtest basis while live days are still too few to mean anything', async () => {
+      // Four live days is a sample that swings twenty points on one bad
+      // Saturday. Switching to it early would make the headline less reliable
+      // the moment it starts claiming to be live.
+      const Cafe = require('../../src/models/Cafe.model');
+      const Forecast = require('../../src/models/Forecast.model');
+      const cafe = await Cafe.findOne({});
+      await Forecast.deleteMany({ cafeId: cafe._id });
+      for (let i = 1; i <= 10; i += 1) {
+        await scoreDay(cafe._id, i, 'backfill', 80);
+      }
+      for (let i = 11; i <= 14; i += 1) {
+        await scoreDay(cafe._id, i, 'live', 30);
+      }
+
+      const res = await request
+        .get('/api/forecasts/accuracy')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.body.basis).toBe('backtest');
+      expect(res.body.liveCount).toBe(4);
+      expect(res.body.avgAccuracy).toBe(80);
     });
   });
 
