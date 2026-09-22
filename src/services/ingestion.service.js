@@ -1,14 +1,10 @@
 const fs = require('fs');
 const path = require('path');
-const csv = require('csv-parser');
-const { Readable } = require('stream');
 const Transaction = require('../models/Transaction.model');
 const {
   parseBuffer,
-  normaliseHeader,
-  normaliseCell,
   normaliseRow,
-  detectCsvSeparator,
+  readCsvStream,
   readWorkbookRows,
   readWorkbook,
   assertSupportedFileBuffer,
@@ -81,11 +77,7 @@ const extractHeaders = async (buffer, fileExt = 'csv') => {
   }
   return new Promise((resolve, reject) => {
     let captured = false;
-    const stream = Readable.from(buffer).pipe(csv({
-      separator: detectCsvSeparator(buffer),
-      mapHeaders: ({ header, index }) => normaliseHeader(header, index),
-      mapValues: ({ value }) => normaliseCell(value),
-    }));
+    const stream = readCsvStream(buffer);
     stream.on('headers', (h) => {
       captured = true;
       resolve(h);
@@ -114,14 +106,8 @@ const previewBuffer = async (buffer, fileExt = 'csv') => {
     const rows = [];
     let headers = [];
     let settled = false;
-    const input = Readable.from(buffer);
-    const parserStream = csv({
-        separator: detectCsvSeparator(buffer),
-        mapHeaders: ({ header, index }) => normaliseHeader(header, index),
-        mapValues: ({ value }) => normaliseCell(value),
-      });
-    input
-      .pipe(parserStream)
+    const parserStream = readCsvStream(buffer);
+    parserStream
       .on('headers', (h) => {
         if (h.length > limits.maxColumns) {
           parserStream.destroy(new Error(`File exceeds the ${limits.maxColumns} column limit`));

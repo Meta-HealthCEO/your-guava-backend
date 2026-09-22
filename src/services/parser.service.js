@@ -844,6 +844,25 @@ const detectCsvSeparator = (buffer) => {
   return best;
 };
 
+/**
+ * The one way an uploaded CSV is read: the upload preview, the wizard's
+ * headers and the import itself all come through here. The preview used to
+ * have its own reader, and it drifted: it kept an Excel "sep=" line as its
+ * header row (so the wizard had nothing to map) and showed a repeated "Total"
+ * once, with one column's money, while the import read the other column.
+ * Returns the csv-parser stream; the source is piped in already.
+ */
+const readCsvStream = (buffer) => {
+  const dedupeHeader = headerDeduper();
+  // Stripped before parsing; left in place the directive becomes the header
+  // row and every real column disappears behind it.
+  return Readable.from(stripCsvSeparatorDirective(buffer)).pipe(csv({
+    separator: detectCsvSeparator(buffer),
+    mapHeaders: ({ header, index }) => dedupeHeader(header, index),
+    mapValues: ({ value }) => normaliseCell(value),
+  }));
+};
+
 // Quantities may be fractional: cafes selling by weight export rows like
 // "0.35 x Cheese Wheel". Matching digits only made the engine skip past the
 // "0." and read the decimal part as the whole quantity, turning 0.35 into 35.
@@ -1071,17 +1090,8 @@ const readRows = (buffer, fileExt) => {
       settled = true;
       reject(error);
     };
-    const dedupeHeader = headerDeduper();
-    // Stripped before parsing; left in place the directive becomes the
-    // header row and every real column disappears behind it.
-    const input = Readable.from(stripCsvSeparatorDirective(buffer));
-    const parserStream = csv({
-        separator: detectCsvSeparator(buffer),
-        mapHeaders: ({ header, index }) => dedupeHeader(header, index),
-        mapValues: ({ value }) => normaliseCell(value),
-      });
-    input
-      .pipe(parserStream)
+    const parserStream = readCsvStream(buffer);
+    parserStream
       .on('data', (row) => {
         if (settled) return;
         if (Object.keys(row).length > limits.maxColumns) {
@@ -1808,6 +1818,7 @@ module.exports = {
   normaliseRows,
   csvSeparatorDirective,
   detectCsvSeparator,
+  readCsvStream,
   stripCsvSeparatorDirective,
   assertSupportedFileBuffer,
   readWorkbookRows,

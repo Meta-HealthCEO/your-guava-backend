@@ -66,6 +66,38 @@ describe('Transactions API', () => {
       expect(res.body.message).toMatch(/csv/i);
     });
 
+    it('takes an Excel "sep=;" export from upload through confirm', async () => {
+      // The first customer's file. The import learned to skip the directive in
+      // b1d532c, but the upload preview still read "sep=" as the header row,
+      // so the wizard had nothing to map and the file never reached confirm.
+      const semicolonExport = Buffer.from([
+        'sep=;',
+        'Receipt;Date;Time;Status;Items;Total (incl. tax)',
+        '1001;2026/09/14;09:00:00;Approved;1 x Flat White;38.00',
+      ].join('\n'));
+
+      const stage = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', semicolonExport, 'till-export.csv');
+
+      expect(stage.status).toBe(200);
+      expect(stage.body.headers).toEqual(['Receipt', 'Date', 'Time', 'Status', 'Items', 'Total (incl. tax)']);
+
+      const confirm = await request
+        .post(`/api/uploads/${stage.body.uploadId}/confirm`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          columnMapping: {
+            receiptId: 'Receipt', date: 'Date', time: 'Time', status: 'Status', items: 'Items', total: 'Total (incl. tax)',
+          },
+          itemsMode: 'packed',
+        });
+
+      expect(confirm.status).toBe(200);
+      expect(confirm.body.stats.imported).toBe(1);
+    });
+
     it('refuses a tiny workbook that declares a million rows, before reading it', async () => {
       // 2.6 KB on disk with <dimension ref="A1:XFD1048576"/>: read-excel-file
       // allocates what a sheet declares before any row limit applies, so this
