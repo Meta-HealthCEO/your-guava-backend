@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { getEventLoopStats } = require('../utils/eventLoopMonitor');
 const packageJson = require('../../package.json');
 const r2 = require('../services/r2.service');
 const validateEnv = require('../config/validateEnv');
@@ -55,6 +56,25 @@ const health = (req, res) => {
   });
 };
 
+// Informational: one instance (D-005) must not take itself out of rotation
+// because the loop was busy, so ok is always true; `degraded` says whether
+// the last complete window's p99 passed 200 ms.
+const EVENT_LOOP_DEGRADED_P99_MS = 200;
+
+const eventLoopCheck = () => {
+  const { running, lastWindow, current } = getEventLoopStats();
+  const window = lastWindow || current;
+  return {
+    ok: true,
+    running,
+    p50Ms: window ? window.p50Ms : null,
+    p99Ms: window ? window.p99Ms : null,
+    maxMs: window ? window.maxMs : null,
+    windowMs: window ? window.windowMs : null,
+    degraded: Boolean(lastWindow && lastWindow.p99Ms > EVENT_LOOP_DEGRADED_P99_MS),
+  };
+};
+
 const readiness = async (req, res) => {
   const databaseState = DB_STATES[mongoose.connection.readyState] || 'unknown';
   const database = await databaseCapability();
@@ -89,6 +109,7 @@ const readiness = async (req, res) => {
     // customers, and used to report itself ready anyway.
     email: email.deliveryCapability(),
     payments: paymentProvider.paymentCapability(),
+    eventLoop: eventLoopCheck(),
   };
   const ready = Object.values(checks).every((check) => check.ok);
 

@@ -1,5 +1,6 @@
 require('dotenv').config();
 const paymentProvider = require('./services/paymentProvider.service');
+const { startEventLoopMonitor, stopEventLoopMonitor } = require('./utils/eventLoopMonitor');
 
 process.env.TZ = process.env.TZ || process.env.DEFAULT_TIMEZONE || 'Africa/Johannesburg';
 
@@ -198,6 +199,11 @@ const start = async () => {
     schedulePendingUploadCleanup();
     schedulePaymentReconciliation();
     scheduleUsageReconciliation();
+    // The loop's own lag, logged per window and shown on /api/ready. Started
+    // here, not in app.js, so suites that load the app never start an interval.
+    startEventLoopMonitor({
+      intervalMs: boundedInteger(process.env.EVENT_LOOP_LOG_INTERVAL_MS, 60 * 1000, 5 * 1000, 60 * 60 * 1000),
+    });
     return httpServer;
   } catch (error) {
     try {
@@ -216,6 +222,7 @@ const shutdown = async (signal = 'shutdown', { exitProcess = false } = {}) => {
     if (cleanupTimer) clearInterval(cleanupTimer);
     if (paymentReconciliationTimer) clearInterval(paymentReconciliationTimer);
     if (usageReconciliationTimer) clearInterval(usageReconciliationTimer);
+    stopEventLoopMonitor();
 
     const timeoutMs = boundedInteger(
       process.env.SHUTDOWN_TIMEOUT_MS,

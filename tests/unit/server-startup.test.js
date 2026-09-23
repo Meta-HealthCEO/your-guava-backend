@@ -148,4 +148,23 @@ describe('server startup cleanup', () => {
     listeningServer.close = (callback) => callback();
     await shutdown();
   });
+  it('starts the event-loop monitor with the server and stops it on shutdown', async () => {
+    const listeningServer = new EventEmitter();
+    listeningServer.listening = true;
+    listeningServer.off = listeningServer.removeListener.bind(listeningServer);
+    mockListen.mockImplementationOnce(() => {
+      queueMicrotask(() => listeningServer.emit('listening'));
+      return listeningServer;
+    });
+    const { start, shutdown } = require('../../src/server');
+    const { getEventLoopStats } = require('../../src/utils/eventLoopMonitor');
+
+    await start();
+    expect(getEventLoopStats().running).toBe(true);
+
+    listeningServer.closeIdleConnections = jest.fn();
+    listeningServer.close = (callback) => callback();
+    await shutdown();
+    expect(getEventLoopStats().running).toBe(false);
+  });
 });

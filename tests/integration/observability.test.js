@@ -153,4 +153,22 @@ describe('Observability', () => {
       expect(res.body.checks.payments.ok).toBe(true);
     });
   });
+  it('reports event-loop lag on readiness without letting it decide readiness', async () => {
+    const { startEventLoopMonitor, stopEventLoopMonitor } = require('../../src/utils/eventLoopMonitor');
+    const idle = await request.get('/api/ready');
+    expect(idle.body.checks.eventLoop).toEqual(expect.objectContaining({ ok: true, running: false, p99Ms: null }));
+
+    startEventLoopMonitor({ intervalMs: 50, log: () => {} });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const res = await request.get('/api/ready');
+      expect(res.status).toBe(200);
+      expect(res.body.checks.eventLoop).toEqual(expect.objectContaining({
+        ok: true, running: true, p50Ms: expect.any(Number), p99Ms: expect.any(Number),
+        maxMs: expect.any(Number), windowMs: expect.any(Number), degraded: expect.any(Boolean),
+      }));
+    } finally {
+      stopEventLoopMonitor();
+    }
+  });
 });
