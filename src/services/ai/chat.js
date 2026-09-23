@@ -2,7 +2,7 @@
 // Moved from anthropic.service.js by BE-11-T02; behaviour unchanged.
 const { withUsageDiagnostics } = require('../usage.service');
 const { createAnthropicClient, withAnthropicErrors } = require('../anthropicClient.service');
-const { fencedJson, missingChatKeyResponse, TRUNCATED_ANSWER_MARKER } = require('./prompts');
+const { modelId, fencedJson, missingChatKeyResponse, TRUNCATED_ANSWER_MARKER } = require('./prompts');
 const { providerDiagnostics } = require('./json');
 const { buildBusinessContext } = require('./context');
 
@@ -78,7 +78,7 @@ const buildBusinessChatRequest = async ({ cafeId, orgId, authorizedCafeIds, mess
   }
 
   const context = await buildBusinessContext({ cafeId, orgId, authorizedCafeIds });
-  const model = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
+  const model = modelId();
 
   const system = `You are Your Guava's embedded AI business analyst for coffee shops.
 Use the provided business, location, forecast, event, item, and transaction context to answer the operator's questions.

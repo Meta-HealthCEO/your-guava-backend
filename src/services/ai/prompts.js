@@ -2,6 +2,10 @@
 // Moved from anthropic.service.js by BE-11-T02; behaviour unchanged.
 const { zonedDateKey, zonedDayOfWeek, zonedDayStart, getZonedDateParts } = require('../../utils/timezone');
 
+const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
+// Read at call time, as every site did; BE-05-T08 replaces the body with its model config.
+const modelId = () => process.env.ANTHROPIC_MODEL || DEFAULT_MODEL;
+
 const MAX_FORECAST_ITEMS_IN_PROMPT = 15;
 
 const TRUNCATED_ANSWER_MARKER =
@@ -154,6 +158,7 @@ const missingChatKeyResponse = () => ({
 });
 
 module.exports = {
+  DEFAULT_MODEL, modelId,
   MAX_FORECAST_ITEMS_IN_PROMPT, TRUNCATED_ANSWER_MARKER, fencedJson, missingInsightsKeyResponse, insufficientInsightDataResponse, buildSummaryStats,
   dayNames, weekdayForKey, relativeDayLabel, roundMoney, zonedDateTimeLabel, missingChatKeyResponse,
 };

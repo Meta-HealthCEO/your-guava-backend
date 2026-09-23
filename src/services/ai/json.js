@@ -1,9 +1,10 @@
 // Model output: validated insight strings and the provider diagnostics attached to a response.
 // Moved from anthropic.service.js by BE-11-T02; behaviour unchanged.
+const { modelId } = require('./prompts');
 
 const providerDiagnostics = (response, startedAt, operation) => ({
   operation,
-  model: response?.model || process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001',
+  model: response?.model || modelId(),
   providerRequestId: response?.id,
   inputTokens: Number(response?.usage?.input_tokens) || 0,
   outputTokens: Number(response?.usage?.output_tokens) || 0,
