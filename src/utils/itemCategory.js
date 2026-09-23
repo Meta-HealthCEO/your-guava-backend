@@ -85,4 +85,9 @@ const inferItemCategory = (name = '') => {
   return 'other';
 };
 
-module.exports = { inferItemCategory };
+// The categories a menu item may have: the Item schema's enum, the Menu Items edit check and the AI
+// review's validation all read this list.
+const ITEM_CATEGORIES = Object.freeze(['coffee', 'food', 'cold_drink', 'water', 'retail', 'other']);
+const isItemCategory = (value) => ITEM_CATEGORIES.includes(value);
+
+module.exports = { inferItemCategory, ITEM_CATEGORIES, isItemCategory };

@@ -50,5 +50,5 @@ const addRowError = (rowErrors, rowNumber, reason, raw) => {
 };
 
 module.exports = {
-  SOURCE_ROW_NUMBERS, sourceRowNumber, setSourceRowNumbers, addRowError,
+  SOURCE_ROW_NUMBERS, MAX_ROW_ERRORS, sourceRowNumber, setSourceRowNumbers, addRowError,
 };

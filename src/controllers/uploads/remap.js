@@ -9,7 +9,7 @@ const {
   transactionIdentity, identityComparisonKey, findExistingIdentities,
 } = require('../../services/transactionIdentity');
 const {
-  CONFIRMATION_KEY_MAX_LENGTH, validateMapping, getCafeTimezone, assertParsedRowsImportable, confirmationMappingHash, confirmationResponse,
+  CONFIRMATION_KEY_MAX_LENGTH, validateUploadMapping, getCafeTimezone, assertParsedRowsImportable, confirmationMappingHash, confirmationResponse,
 } = require('./shared');
 const { sha256Hex } = require('../../utils/authPrimitives');
 const {
@@ -59,7 +59,7 @@ const remap = async (req, res, next) => {
       return res.status(409).json({ success: false, message: `Cannot remap while ${upload.status}` });
     }
 
-    const mappingError = validateMapping(upload, columnMapping, itemsMode);
+    const mappingError = validateUploadMapping(upload, columnMapping, itemsMode);
     if (mappingError) {
       return res.status(400).json({ success: false, message: mappingError });
     }

@@ -5,7 +5,7 @@ const r2 = require('../../services/r2.service');
 const parser = require('../../services/parser.service');
 const { clearApiCache } = require('../../middleware/cache.middleware');
 const {
-  CONFIRMATION_KEY_MAX_LENGTH, confirmationMappingHash, confirmationResponse, validateMapping, getCafeTimezone, assertParsedRowsImportable,
+  CONFIRMATION_KEY_MAX_LENGTH, confirmationMappingHash, confirmationResponse, validateUploadMapping, getCafeTimezone, assertParsedRowsImportable,
 } = require('./shared');
 const { sha256Hex } = require('../../utils/authPrimitives');
 const {
@@ -64,7 +64,7 @@ const confirm = async (req, res, next) => {
       return res.status(200).json(confirmationResponse(upload, { replayed: true }));
     }
 
-    const mappingError = validateMapping(upload, columnMapping, itemsMode);
+    const mappingError = validateUploadMapping(upload, columnMapping, itemsMode);
     if (mappingError) {
       return res.status(400).json({ success: false, message: mappingError });
     }

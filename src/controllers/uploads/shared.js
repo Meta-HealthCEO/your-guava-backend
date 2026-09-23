@@ -1,11 +1,10 @@
 // Constants and helpers every uploads handler shares: mapping validation, importability checks, response shapes.
 // Moved from uploads.controller.js by BE-11-T03; behaviour unchanged.
 const { sha256Hex } = require('../../utils/authPrimitives');
+const parser = require('../../services/parser.service');
 const { getCafeTimezone } = require('../../utils/timezone');
 const { normaliseTransactionStatus } = require('../../utils/transactionStatus');
 
-const REQUIRED = ['date', 'items', 'total'];
-const VALID_ITEMS_MODES = new Set(['packed', 'line-per-row']);
 
 const MAX_LIST_PAGE = 10000;
 const STORAGE_CLEANUP_PENDING = 'Stored file cleanup pending; background cleanup will retry.';
@@ -27,7 +26,7 @@ const confirmationMappingHash = (columnMapping, itemsMode) => sha256Hex(JSON.str
 }));
 
 const sanitizeRowErrors = (rowErrors) =>
-  (Array.isArray(rowErrors) ? rowErrors : []).slice(0, 50).map((rowError) => ({
+  (Array.isArray(rowErrors) ? rowErrors : []).slice(0, parser.MAX_ROW_ERRORS).map((rowError) => ({
     rowNumber: rowError?.rowNumber,
     reason: String(rowError?.reason || 'Could not import row').slice(0, 500),
   }));
@@ -42,20 +41,15 @@ const confirmationResponse = (upload, { replayed = false } = {}) => ({
   replayed,
 });
 
-const boundedInteger = (value, fallback, min, max) => {
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(min, Math.min(parsed, max));
-};
+// One definition, in services/parser/limits.js; lease, jobs and sweeper take it from here.
+const { boundedInteger } = parser;
 
-const validateMapping = (upload, columnMapping, itemsMode) => {
+// The upload-level mapping check (items mode, required fields, columns present in the file). The
+// parser's own validateMapping checks required fields only; this one was a second function of that name.
+const validateUploadMapping = (upload, columnMapping, itemsMode) => {
   const mode = itemsMode || 'packed';
-  if (!VALID_ITEMS_MODES.has(mode)) {
-    return `Invalid itemsMode: ${itemsMode}`;
-  }
-
-  const required = mode === 'line-per-row' ? [...REQUIRED, 'receiptId'] : REQUIRED;
-  const missing = required.filter((f) => !columnMapping?.[f]);
+  if (!parser.VALID_ITEMS_MODES.has(mode)) return `Invalid itemsMode: ${itemsMode}`;
+  const missing = parser.requiredFieldsForMode(mode).filter((f) => !columnMapping?.[f]);
   if (missing.length > 0) {
     return `Missing required mapping: ${missing.join(', ')}`;
   }
@@ -141,7 +135,7 @@ const assertParsedRowsImportable = (parsed, { allowSeverePartial = false } = {})
 };
 
 module.exports = {
-  REQUIRED, VALID_ITEMS_MODES, MAX_LIST_PAGE, STORAGE_CLEANUP_PENDING, ABANDONED_CLEANUP_CLAIM, CONFIRMATION_KEY_MAX_LENGTH,
-  confirmationMappingHash, sanitizeRowErrors, confirmationResponse, boundedInteger, validateMapping,
+  MAX_LIST_PAGE, STORAGE_CLEANUP_PENDING, ABANDONED_CLEANUP_CLAIM, CONFIRMATION_KEY_MAX_LENGTH,
+  confirmationMappingHash, sanitizeRowErrors, confirmationResponse, boundedInteger, validateUploadMapping,
   assertImportableResult, assertParsedRowsImportable, getCafeTimezone,
 };

@@ -1,13 +1,12 @@
 const crypto = require('crypto');
 const Item = require('../models/Item.model');
-const { inferItemCategory } = require('../utils/itemCategory');
+const { inferItemCategory, isItemCategory } = require('../utils/itemCategory');
 const { meterGuavaCredits, withUsageDiagnostics } = require('./usage.service');
 const { createAnthropicClient, withAnthropicErrors } = require('./anthropicClient.service');
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
 const MAX_AI_REVIEW_ITEMS = 10;
 const AI_REVIEW_CONCURRENCY = 2;
-const VALID_CATEGORIES = new Set(['coffee', 'food', 'cold_drink', 'water', 'retail', 'other']);
 
 const roundMoney = (value) => {
   const number = Number(value);
@@ -73,7 +72,7 @@ const cleanSuggestion = (suggestion, item, candidates = []) => {
     targetName: validTarget
       ? candidates.find((candidate) => String(candidate.item._id) === targetItemId)?.item.name
       : undefined,
-    category: VALID_CATEGORIES.has(suggestion?.category)
+    category: isItemCategory(suggestion?.category)
       ? suggestion.category
       : item.category || inferItemCategory(item.name),
     expectedPrice: (() => {

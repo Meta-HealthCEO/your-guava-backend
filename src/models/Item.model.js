@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { ITEM_CATEGORIES } = require('../utils/itemCategory');
 
 const itemSchema = new mongoose.Schema(
   {
@@ -20,7 +21,7 @@ const itemSchema = new mongoose.Schema(
     aliasKeys: [{ type: String, maxlength: 200 }],
     category: {
       type: String,
-      enum: ['coffee', 'food', 'cold_drink', 'water', 'retail', 'other'],
+      enum: [...ITEM_CATEGORIES],
       default: 'other',
     },
     expectedPrice: {

@@ -13,15 +13,9 @@ const { proposeColumnMapping } = require('../services/anthropic.service');
 const { canSpendCredits } = require('../middleware/rbac.middleware');
 const { activeCafeId } = require('../utils/tenancy');
 
-const REQUIRED_UPLOAD_MAPPING = ['date', 'items', 'total'];
 const MIN_HEADER_COUNT = 2;
 const MAX_TRANSACTION_QUERY_RANGE_DAYS = 5 * 366;
 const MAX_TRANSACTION_PAGE = 10000;
-
-const requiredUploadMappingForMode = (itemsMode = 'packed') =>
-  itemsMode === 'line-per-row'
-    ? [...REQUIRED_UPLOAD_MAPPING, 'receiptId']
-    : REQUIRED_UPLOAD_MAPPING;
 
 const cleanupLocalFile = async (filePath) => {
   if (!filePath) return;
@@ -40,7 +34,7 @@ const cleanColumnMapping = (mapping = {}, headers = []) => {
 };
 
 const hasRequiredHeaderMapping = (mapping = {}, headers = [], itemsMode = 'packed') =>
-  requiredUploadMappingForMode(itemsMode).every((field) => {
+  parser.requiredFieldsForMode(itemsMode).every((field) => {
     const mappedHeader = mapping?.[field];
     return typeof mappedHeader === 'string' && headers.includes(mappedHeader);
   });

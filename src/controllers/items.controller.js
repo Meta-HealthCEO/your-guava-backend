@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { isItemCategory } = require('../utils/itemCategory');
 const Item = require('../models/Item.model');
 const Organization = require('../models/Organization.model');
 const {
@@ -20,7 +21,6 @@ const { clearApiCache } = require('../middleware/cache.middleware');
 const { creditSnapshot } = require('../services/usage.service');
 const { activeCafeId } = require('../utils/tenancy');
 
-const VALID_CATEGORIES = new Set(['coffee', 'food', 'cold_drink', 'water', 'retail', 'other']);
 const VALID_REVIEW_STATUSES = new Set(['matched', 'needs_review', 'ignored', 'merged']);
 const MAX_RECONCILIATION_ITEMS = 100;
 const MAX_ITEM_NAME_CHARS = 200;
@@ -79,7 +79,7 @@ const validateItemMutation = (body = {}, { allowName = true, allowStatus = true 
       return `name must be a string no longer than ${MAX_ITEM_NAME_CHARS} characters`;
     }
   }
-  if (body.category !== undefined && !VALID_CATEGORIES.has(body.category)) {
+  if (body.category !== undefined && !isItemCategory(body.category)) {
     return 'category is invalid';
   }
   if (body.expectedPrice !== undefined) {
@@ -121,7 +121,7 @@ const itemPayload = (body, { creating = false } = {}) => {
     payload.name = String(body.name).trim();
     payload.normalizedName = normalizeItemName(payload.name);
   }
-  if (body.category !== undefined && VALID_CATEGORIES.has(body.category)) payload.category = body.category;
+  if (body.category !== undefined && isItemCategory(body.category)) payload.category = body.category;
   if (body.expectedPrice !== undefined) payload.expectedPrice = numberOrUndefined(body.expectedPrice);
   if (body.priceTolerancePct !== undefined) payload.priceTolerancePct = numberOrUndefined(body.priceTolerancePct);
   if (body.aliases !== undefined) {

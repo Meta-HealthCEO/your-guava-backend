@@ -11,6 +11,7 @@ const {
   readWorkbook,
   assertSupportedFileBuffer,
   parserLimits,
+  MAX_ROW_ERRORS,
 } = require('./parser.service');
 const { zonedDateKey, safeTimezone } = require('../utils/timezone');
 const {
@@ -30,7 +31,6 @@ const YOCO_HEADERS = [
   'Card Reader', 'Items', 'Note', 'Currency', 'Tip', 'Discount', 'VAT',
   'Total (incl. tax)', 'Fee Amount', 'Net Amount',
 ];
-const MAX_ROW_ERRORS = 50;
 
 /**
  * Returns true if the headers strongly match a Yoco export.

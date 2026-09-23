@@ -8,6 +8,7 @@ const mongoose = require('mongoose');
 const app = require('./app');
 const connectDB = require('./config/db');
 const validateEnv = require('./config/validateEnv');
+const { boundedInteger } = require('./services/parser.service');
 const {
   cleanupAbandonedPendingUploads,
   recoverPendingUploadMaintenance,
@@ -36,12 +37,6 @@ const DEFAULT_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 const DEFAULT_PAYMENT_RECONCILIATION_INTERVAL_MS = 60 * 1000;
 const DEFAULT_USAGE_RECONCILIATION_INTERVAL_MS = 60 * 1000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10 * 1000;
-
-const boundedInteger = (value, fallback, min, max) => {
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(min, Math.min(parsed, max));
-};
 
 let httpServer;
 let cleanupTimer;

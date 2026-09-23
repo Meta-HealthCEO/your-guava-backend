@@ -8,7 +8,7 @@ const {
   safeTimezone, getZonedDateParts, zonedDateTimeToUtc, zonedDayStart, zonedDayEnd,
   addZonedDays, zonedDayOrdinal, zonedDateKey, zonedDayOfWeek, processLocalCalendarDate,
 } = require('../utils/timezone');
-const { parserLimits, tooManyColumnsError } = require('./parser/limits');
+const { parserLimits, boundedInteger, tooManyColumnsError } = require('./parser/limits');
 const {
   requiredFieldsForMode, normaliseHeader, headerDeduper, normaliseCell, normaliseRow, normaliseRows, MAX_HEADER_CHARS,
 } = require('./parser/headers');
@@ -20,11 +20,12 @@ const {
 } = require('./parser/csv');
 const { parsePackedItems } = require('./parser/packedItems');
 const { groupLinePerRow } = require('./parser/lineItems');
-const { parseBuffer } = require('./parser/parse');
+const { VALID_ITEMS_MODES, parseBuffer } = require('./parser/parse');
+const { MAX_ROW_ERRORS } = require('./parser/rowErrors');
 
 module.exports = {
   // The import pipeline
-  parseBuffer, groupLinePerRow, parsePackedItems,
+  parseBuffer, groupLinePerRow, parsePackedItems, VALID_ITEMS_MODES, MAX_ROW_ERRORS,
   // Headers and cells
   requiredFieldsForMode, normaliseHeader, headerDeduper, normaliseCell, normaliseRow, normaliseRows, MAX_HEADER_CHARS,
   // Readers and file checks
@@ -32,7 +33,7 @@ module.exports = {
   readWorkbook, readWorkbookRows, assertSupportedFileBuffer,
   streamXlsxSharedStrings, streamXlsxSheetCells, xlsxPartTooLargeError,
   // Limits
-  parserLimits, tooManyColumnsError,
+  parserLimits, boundedInteger, tooManyColumnsError,
   // Cafe-local dates (home: utils/timezone.js; re-exported until BE-11-T05 moves every caller)
   safeTimezone, getZonedDateParts, zonedDateTimeToUtc, zonedDayStart, zonedDayEnd,
   addZonedDays, zonedDayOrdinal, zonedDateKey, zonedDayOfWeek, processLocalCalendarDate,
