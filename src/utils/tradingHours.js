@@ -119,8 +119,35 @@ const isWeekdayHourOpen = (dayOfWeek, hour, cafe) => {
   return isHourOpen(hour, { isOpen: true, openMinutes, closeMinutes });
 };
 
+/**
+ * Why a request's trading hours cannot be stored, or null (identity-18). normalizeTradingHours stays lenient for stored data;
+ * this is the strict gate for what a client may send, so a malformed body can no longer reset the week and wipe forecasts.
+ */
+const tradingHoursInputError = (input) => {
+  if (!Array.isArray(input)) return 'tradingHours must be a list of days';
+  if (input.length === 0 || input.length > 7) return 'tradingHours must list between 1 and 7 days';
+  const seen = new Set();
+  for (const entry of input) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return 'Each trading-hours entry must be an object';
+    const { dayOfWeek } = entry;
+    if (!Number.isInteger(dayOfWeek) || dayOfWeek < 0 || dayOfWeek > 6) {
+      return 'dayOfWeek must be a whole number from 0 (Sunday) to 6 (Saturday)';
+    }
+    if (seen.has(dayOfWeek)) return `Day ${dayOfWeek} is listed twice`;
+    seen.add(dayOfWeek);
+    if (entry.isOpen !== undefined && typeof entry.isOpen !== 'boolean') return `isOpen must be true or false for day ${dayOfWeek}`;
+    if (entry.isOpen !== false) {
+      for (const field of ['openTime', 'closeTime']) {
+        if (entry[field] !== undefined && parseTime(entry[field]) == null) return `${field} must be HH:MM for day ${dayOfWeek}`;
+      }
+    }
+  }
+  return null;
+};
+
 module.exports = {
   defaultTradingHours,
+  tradingHoursInputError,
   normalizeTradingHours,
   getCafeTradingHours,
   getOpenWindowForDate,

@@ -8,6 +8,7 @@ process.env.JWT_REFRESH_SECRET = 'test-jwt-refresh-secret-key-12345';
 process.env.JWT_EXPIRES_IN = '15m';
 process.env.JWT_REFRESH_EXPIRES_IN = '7d';
 process.env.NODE_ENV = 'test';
+process.env.BCRYPT_ROUNDS = '4'; // one cost everywhere; cheap in tests only
 // The mock billing path is exercised deliberately by the billing suites, so
 // the test environment opts in explicitly. It is no longer implied by
 // NODE_ENV: a staging deploy that never set this flag was handing out plan

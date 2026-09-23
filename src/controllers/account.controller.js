@@ -5,6 +5,7 @@ const Cafe = require('../models/Cafe.model');
 const Organization = require('../models/Organization.model');
 const PaymentSession = require('../models/PaymentSession.model');
 const TeamInvitation = require('../models/TeamInvitation.model');
+const AccessAuditEvent = require('../models/AccessAuditEvent.model');
 const {
   getPlan,
   getPlans,
@@ -303,11 +304,32 @@ const updateProfile = async (req, res, next) => {
       }
 
       if (changesName) user.name = cleanName;
+      const previousOrgName = org.name;
+      const previousBillingEmail = org.billingEmail;
       if (changesOrganization) org.name = cleanOrganizationName;
       if (changesBillingEmail) org.billingEmail = cleanBillingEmail;
 
       await user.save({ session });
       await org.save({ session });
+
+      // identity-16: who controls the organisation's name and billing contact is audited like every other access change.
+      const audits = [];
+      if (changesOrganization && previousOrgName !== org.name) {
+        audits.push({ action: 'org.renamed', details: { from: previousOrgName, to: org.name } });
+      }
+      if (changesBillingEmail && previousBillingEmail !== org.billingEmail) {
+        audits.push({
+          action: 'org.billing_email_changed',
+          targetEmail: org.billingEmail,
+          details: { from: previousBillingEmail || null, to: org.billingEmail },
+        });
+      }
+      if (audits.length > 0) {
+        await AccessAuditEvent.create(
+          audits.map((audit) => ({ orgId: org._id, actorUserId: user._id, requestId: req.id, ...audit })),
+          { session, ordered: true }
+        );
+      }
     });
     clearApiCache();
 

@@ -117,6 +117,10 @@ const validateEnv = () => {
     }
   }
 
+  if (process.env.BCRYPT_ROUNDS && isHardenedEnvironment() && Number.parseInt(process.env.BCRYPT_ROUNDS, 10) < 10) {
+    errors.push('BCRYPT_ROUNDS cannot be below 10 outside development and test');
+  }
+
   if (isProduction) {
     if ((process.env.JWT_SECRET || '').length < 32) {
       errors.push('JWT_SECRET must be at least 32 characters in production');

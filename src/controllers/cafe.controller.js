@@ -1,7 +1,7 @@
 const Cafe = require('../models/Cafe.model');
 const User = require('../models/User.model');
 const Forecast = require('../models/Forecast.model');
-const { normalizeTradingHours, defaultTradingHours } = require('../utils/tradingHours');
+const { normalizeTradingHours, defaultTradingHours, tradingHoursInputError } = require('../utils/tradingHours');
 const { clearApiCache } = require('../middleware/cache.middleware');
 const { safeTimezone, zonedDayStart } = require('../services/parser.service');
 
@@ -103,7 +103,14 @@ const updateMe = async (req, res, next) => {
 
     const setUpdates = {};
     const unsetUpdates = {};
-    if (name !== undefined) setUpdates.name = String(name).trim();
+    // identity-18: nothing is coerced; a bad body is refused before any write, so the forecasts stay as they were.
+    if (name !== undefined) {
+      const cleanName = typeof name === 'string' ? name.trim() : '';
+      if (cleanName.length < 2 || cleanName.length > 120) {
+        return res.status(400).json({ success: false, message: 'Cafe name must be between 2 and 120 characters' });
+      }
+      setUpdates.name = cleanName;
+    }
     if (location !== undefined) {
       if (!location || typeof location !== 'object' || Array.isArray(location)) {
         return res.status(400).json({ success: false, message: 'location must be an object' });
@@ -138,6 +145,8 @@ const updateMe = async (req, res, next) => {
       }
     }
     if (tradingHours !== undefined) {
+      const hoursError = tradingHoursInputError(tradingHours);
+      if (hoursError) return res.status(400).json({ success: false, message: hoursError });
       setUpdates.tradingHours = normalizeTradingHours(tradingHours);
     }
 

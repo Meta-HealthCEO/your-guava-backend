@@ -23,6 +23,34 @@ const escapeHtml = (value = '') =>
 
 const plainLines = (lines) => lines.filter(Boolean).join('\n');
 
+const cc = (code) => String.fromCharCode(code);
+// C0 and C1 controls, zero-width and direction marks, line and paragraph separators, bidi embeddings and isolates.
+const CONTROL_AND_DIRECTION_RE = new RegExp(
+  `[${cc(0)}-${cc(0x1f)}${cc(0x7f)}-${cc(0x9f)}${cc(0x200b)}-${cc(0x200f)}${cc(0x2028)}${cc(0x2029)}${cc(0x202a)}-${cc(0x202e)}${cc(0x2066)}-${cc(0x2069)}]`,
+  'g'
+);
+const SCHEME_LINK_RE = /\b[a-z][a-z0-9+.-]{1,20}:\/\/\S*/gi;
+const WWW_LINK_RE = /\bwww\.\S*/gi;
+const DOMAIN_DOT_RE = /([a-z0-9])\.(?=[a-z]{2,})/gi;
+const EMAIL_TEXT_MAX = 60;
+
+/**
+ * Names and cafe names come from any trial owner and go to arbitrary inboxes (identity-17). HTML escaping stops markup; this
+ * also removes control and direction characters, anything link-like and the dot that makes a word read as a domain, then caps
+ * the length. Input is cut to 500 characters first, so every pattern runs on a bounded string.
+ */
+const safeEmailText = (value, max = EMAIL_TEXT_MAX) => {
+  const cleaned = String(value ?? '')
+    .slice(0, 500)
+    .replace(CONTROL_AND_DIRECTION_RE, ' ')
+    .replace(SCHEME_LINK_RE, '[link removed]')
+    .replace(WWW_LINK_RE, '[link removed]')
+    .replace(DOMAIN_DOT_RE, '$1 .')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned.length > max ? `${cleaned.slice(0, max - 1).trimEnd()}…` : cleaned;
+};
+
 const baseHtml = ({ title, intro, children, ctaLabel, ctaUrl }) => `
 <!doctype html>
 <html>
@@ -155,12 +183,13 @@ const sendEmail = async ({ to, subject, html, text, tags }) => {
 
 const sendWelcomeEmail = async ({ user, org, cafe }) => {
   const loginUrl = `${appUrl()}/login`;
-  const orgName = org?.name || 'your organisation';
-  const cafeName = cafe?.name || 'your first cafe';
+  const userName = safeEmailText(user.name) || 'there';
+  const orgName = safeEmailText(org?.name) || 'your organisation';
+  const cafeName = safeEmailText(cafe?.name) || 'your first cafe';
 
   const html = baseHtml({
     title: 'Welcome to Your Guava',
-    intro: `Hi ${user.name}, your workspace is ready.`,
+    intro: `Hi ${userName}, your workspace is ready.`,
     ctaLabel: 'Open Your Guava',
     ctaUrl: loginUrl,
     children: `
@@ -171,7 +200,7 @@ const sendWelcomeEmail = async ({ user, org, cafe }) => {
   });
 
   const text = plainLines([
-    `Hi ${user.name}, welcome to Your Guava.`,
+    `Hi ${userName}, welcome to Your Guava.`,
     `Your workspace "${orgName}" is ready with "${cafeName}" as the first cafe location.`,
     'Next, upload your sales data from the Connect Data page so forecasts and insights can start working.',
     `Sign in: ${loginUrl}`,
@@ -186,12 +215,13 @@ const sendWelcomeEmail = async ({ user, org, cafe }) => {
   });
 };
 
-const sendVerificationEmail = async ({ registration, verificationToken }) => {
+const buildVerificationEmail = ({ registration, verificationToken }) => {
   if (!verificationToken) throw new Error('Verification token is required');
   const verificationUrl = `${appUrl()}/verify-email#token=${encodeURIComponent(verificationToken)}`;
+  const name = safeEmailText(registration.name) || 'there';
   const html = baseHtml({
     title: 'Verify your email address',
-    intro: `Hi ${registration.name}, confirm this email to finish creating your Your Guava workspace.`,
+    intro: `Hi ${name}, confirm this email to finish creating your Your Guava workspace.`,
     ctaLabel: 'Verify email',
     ctaUrl: verificationUrl,
     children: `
@@ -200,19 +230,21 @@ const sendVerificationEmail = async ({ registration, verificationToken }) => {
     `,
   });
   const text = plainLines([
-    `Hi ${registration.name},`,
+    `Hi ${name},`,
     'Verify your email to finish creating your Your Guava workspace.',
     `Verify email: ${verificationUrl}`,
     'This single-use link expires in 24 hours.',
   ]);
-  return sendEmail({
+  return {
     to: registration.email,
     subject: 'Verify your Your Guava email',
     html,
     text,
     tags: [{ name: 'email_type', value: 'email_verification' }],
-  });
+  };
 };
+
+const sendVerificationEmail = async (args) => sendEmail(buildVerificationEmail(args));
 
 // Register answers an existing address exactly like a new one (identity-4); the real owner learns about the attempt here.
 const sendAccountExistsEmail = async ({ user }) => {
@@ -246,13 +278,14 @@ const sendAccountExistsEmail = async ({ user }) => {
 const sendPasswordResetEmail = async ({ user, resetToken, expiresAt }) => {
   if (!resetToken) throw new Error('Password reset token is required');
   const resetUrl = `${appUrl()}/reset-password#token=${encodeURIComponent(resetToken)}`;
+  const name = safeEmailText(user.name) || 'there';
   const expiry = new Date(expiresAt).toLocaleString('en-ZA', {
     dateStyle: 'medium',
     timeStyle: 'short',
   });
   const html = baseHtml({
     title: 'Reset your password',
-    intro: `Hi ${user.name}, use this secure link to choose a new password.`,
+    intro: `Hi ${name}, use this secure link to choose a new password.`,
     ctaLabel: 'Reset password',
     ctaUrl: resetUrl,
     children: `
@@ -261,7 +294,7 @@ const sendPasswordResetEmail = async ({ user, resetToken, expiresAt }) => {
     `,
   });
   const text = plainLines([
-    `Hi ${user.name},`,
+    `Hi ${name},`,
     `Reset your password: ${resetUrl}`,
     `This single-use link expires at ${expiry}.`,
     'If you did not request this, your password has not changed.',
@@ -275,10 +308,12 @@ const sendPasswordResetEmail = async ({ user, resetToken, expiresAt }) => {
   });
 };
 
-const sendTeamInviteEmail = async ({ invitation, owner, cafes = [], invitationToken }) => {
+const buildTeamInviteEmail = ({ invitation, owner, cafes = [], invitationToken }) => {
   if (!invitationToken) throw new Error('Invitation token is required');
   const invitationUrl = `${appUrl()}/accept-invite#token=${encodeURIComponent(invitationToken)}`;
-  const cafeNames = cafes.map((cafe) => cafe.name).filter(Boolean);
+  const inviteeName = safeEmailText(invitation.name) || 'there';
+  const ownerName = safeEmailText(owner?.name) || 'The owner';
+  const cafeNames = cafes.map((cafe) => safeEmailText(cafe?.name)).filter(Boolean);
   const cafeList = cafeNames.length > 0 ? cafeNames.join(', ') : 'assigned cafe locations';
   const expiresAt = new Date(invitation.expiresAt).toLocaleString('en-ZA', {
     dateStyle: 'medium',
@@ -287,7 +322,7 @@ const sendTeamInviteEmail = async ({ invitation, owner, cafes = [], invitationTo
 
   const html = baseHtml({
     title: 'You have been invited to Your Guava',
-    intro: `${owner.name} invited you to join as a manager.`,
+    intro: `${ownerName} invited you to join as a manager.`,
     ctaLabel: 'Accept invitation',
     ctaUrl: invitationUrl,
     children: `
@@ -301,8 +336,8 @@ const sendTeamInviteEmail = async ({ invitation, owner, cafes = [], invitationTo
   });
 
   const text = plainLines([
-    `Hi ${invitation.name},`,
-    `${owner.name} invited you to join Your Guava as a manager.`,
+    `Hi ${inviteeName},`,
+    `${ownerName} invited you to join Your Guava as a manager.`,
     `Cafe access: ${cafeList}`,
     `Email: ${invitation.email}`,
     `Invitation expires: ${expiresAt}`,
@@ -310,14 +345,66 @@ const sendTeamInviteEmail = async ({ invitation, owner, cafes = [], invitationTo
     'Choose your password when you accept. The link works once.',
   ]);
 
-  return sendEmail({
+  return {
     to: invitation.email,
     subject: 'You have been invited to Your Guava',
     html,
     text,
     tags: [{ name: 'email_type', value: 'team_invite' }],
-  });
+  };
 };
+
+const sendTeamInviteEmail = async (args) => sendEmail(buildTeamInviteEmail(args));
+
+const SECURITY_NOTICES = {
+  password_changed: {
+    subject: 'Your Your Guava password was changed',
+    title: 'Your password was changed',
+    line: () => 'The password for your Your Guava account was just changed, and your other sessions were signed out.',
+  },
+  password_reset: {
+    subject: 'Your Your Guava password was reset',
+    title: 'Your password was reset',
+    line: () => 'Your Your Guava password was just reset with an emailed link, and every session was signed out.',
+  },
+  ownership_transferred_away: {
+    subject: 'You are no longer the owner of your Your Guava organisation',
+    title: 'Ownership was transferred',
+    line: ({ orgName, counterpartName }) => `${orgName} is now owned by ${counterpartName}. You remain a manager.`,
+  },
+  ownership_received: {
+    subject: 'You are now the owner of your Your Guava organisation',
+    title: 'You are now the owner',
+    line: ({ orgName, counterpartName }) => `${counterpartName} made you the owner of ${orgName}.`,
+  },
+};
+
+// identity-16: the account holder hears about every change to who controls the account.
+const buildSecurityNoticeEmail = ({ kind, user, orgName, counterpartName }) => {
+  const notice = SECURITY_NOTICES[kind];
+  if (!notice) throw new Error(`Unknown security notice: ${kind}`);
+  const resetUrl = `${appUrl()}/forgot-password`;
+  const line = notice.line({
+    orgName: safeEmailText(orgName || 'your organisation'),
+    counterpartName: safeEmailText(counterpartName || 'another member'),
+  });
+  const html = baseHtml({
+    title: notice.title,
+    intro: line,
+    ctaLabel: 'Reset password',
+    ctaUrl: resetUrl,
+    children: '<p style="margin:0;">If this was not you, reset your password now and contact support@yourguava.co.za.</p>',
+  });
+  const text = plainLines([
+    `Hi ${safeEmailText(user.name || 'there')},`,
+    line,
+    `If this was not you, reset your password now: ${resetUrl}`,
+    'Then contact support@yourguava.co.za.',
+  ]);
+  return { to: user.email, subject: notice.subject, html, text, tags: [{ name: 'email_type', value: `security_${kind}` }] };
+};
+
+const sendSecurityNoticeEmail = (args) => sendEmail(buildSecurityNoticeEmail(args));
 
 const _resetClient = () => {
   client = null;
@@ -330,6 +417,11 @@ module.exports = {
   sendPasswordResetEmail,
   sendTeamInviteEmail,
   sendEmail,
+  sendSecurityNoticeEmail,
+  safeEmailText,
+  buildVerificationEmail,
+  buildTeamInviteEmail,
+  buildSecurityNoticeEmail,
   deliveryAccepted,
   deliveryMode,
   isConfigured,

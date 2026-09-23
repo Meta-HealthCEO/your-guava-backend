@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const { isValidEmail } = require('../utils/email');
 const bcrypt = require('bcryptjs');
+const { hashPassword, BCRYPT_HASH_RE } = require('../utils/password');
 
 const userSchema = new mongoose.Schema(
   {
@@ -86,10 +87,15 @@ userSchema.index({ orgId: 1 });
 userSchema.index({ 'refreshTokens.tokenHash': 1 }, { sparse: true });
 userSchema.index({ 'refreshTokens.token': 1 }, { sparse: true });
 
-userSchema.pre('save', async function (next) {
+userSchema.pre('save', async function hashChangedPassword(next) {
   if (!this.isModified('password')) return next();
-  this.password = await bcrypt.hash(this.password, 10);
-  next();
+  // verifyEmail stores the hash taken at registration; hashing it again would lock the owner out (identity-13).
+  if (this.$locals.passwordIsHash) {
+    if (!BCRYPT_HASH_RE.test(this.password)) return next(new Error('A pre-hashed password must be a bcrypt hash'));
+    return next();
+  }
+  this.password = await hashPassword(this.password);
+  return next();
 });
 
 userSchema.methods.comparePassword = async function (candidatePassword) {

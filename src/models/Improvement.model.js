@@ -36,7 +36,8 @@ const STATUSES = ['open', 'planned', 'in_progress', 'done', 'declined'];
 const improvementSchema = new mongoose.Schema(
   {
     // Sequential, human-friendly ticket number (1, 2, 3, ...). Assigned on create.
-    ticketNumber: { type: Number, unique: true },
+    // Numbered per organisation (gap-10); unique on { orgId, ticketNumber } below.
+    ticketNumber: { type: Number },
     type: {
       type: String,
       enum: IMPROVEMENT_TYPES,
@@ -70,13 +71,18 @@ const improvementSchema = new mongoose.Schema(
 );
 
 improvementSchema.index({ orgId: 1, status: 1, createdAt: -1 });
+improvementSchema.index({ orgId: 1, ticketNumber: 1 }, { unique: true });
 
 // Assign the next ticket number atomically before validation. Numbers are
 // unique and monotonically increasing; a rare gap can occur if a save fails
 // after the counter increments, which is acceptable for human-facing IDs.
 improvementSchema.pre('validate', async function assignTicketNumber() {
-  if (this.isNew && this.ticketNumber == null) {
-    this.ticketNumber = await Counter.next('improvementTicket');
+  if (this.isNew && this.ticketNumber == null && this.orgId) {
+    const Improvement = this.constructor;
+    this.ticketNumber = await Counter.nextScoped('improvementTicket', this.orgId, async () => {
+      const top = await Improvement.findOne({ orgId: this.orgId }).sort({ ticketNumber: -1 }).select('ticketNumber').lean();
+      return top?.ticketNumber || 0;
+    });
   }
 });
 

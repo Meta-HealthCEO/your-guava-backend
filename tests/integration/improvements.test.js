@@ -118,6 +118,21 @@ describe('Improvements API', () => {
       expect(res.status).toBe(201);
       expect(res.body.improvement.createdBy.email).toBe('manager@yourguava.com');
     });
+
+    it('numbers tickets per organisation', async () => {
+      const other = await createTestUser({ email: 'other-org@yourguava.com' });
+      const mine = await request.post('/api/improvements').set('Authorization', `Bearer ${ownerToken}`).send(validBody());
+      const mine2 = await request.post('/api/improvements').set('Authorization', `Bearer ${ownerToken}`).send(validBody());
+      const theirs = await request.post('/api/improvements').set('Authorization', `Bearer ${other.token}`).send(validBody());
+      expect([mine.body.improvement.ticketNumber, mine2.body.improvement.ticketNumber]).toEqual([1, 2]);
+      expect(theirs.body.improvement.ticketNumber).toBe(1);
+    });
+
+    it('continues after the highest number an organisation already has', async () => {
+      await Improvement.create({ ...validBody(), orgId: ownerUser.orgId, ticketNumber: 41 });
+      const next = await request.post('/api/improvements').set('Authorization', `Bearer ${ownerToken}`).send(validBody());
+      expect(next.body.improvement.ticketNumber).toBe(42);
+    });
   });
 
   describe('GET /api/improvements', () => {

@@ -70,5 +70,7 @@ teamInvitationSchema.index(
   }
 );
 teamInvitationSchema.index({ orgId: 1, status: 1, expiresAt: 1 });
+// Signup and verification look invitations up by address across all orgs (identity-20).
+teamInvitationSchema.index({ email: 1, status: 1, expiresAt: 1 });
 
 module.exports = mongoose.model('TeamInvitation', teamInvitationSchema);

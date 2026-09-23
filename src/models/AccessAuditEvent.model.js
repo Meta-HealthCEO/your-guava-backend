@@ -32,6 +32,9 @@ const accessAuditEventSchema = new mongoose.Schema(
         'location.created',
         'password.changed',
         'password.reset',
+        'session.reuse_detected',
+        'org.renamed',
+        'org.billing_email_changed',
       ],
       index: true,
     },
@@ -43,5 +46,7 @@ const accessAuditEventSchema = new mongoose.Schema(
 );
 
 accessAuditEventSchema.index({ orgId: 1, createdAt: -1 });
+// identity-19: the list sorts by (createdAt, _id) and pages on both.
+accessAuditEventSchema.index({ orgId: 1, createdAt: -1, _id: -1 });
 
 module.exports = mongoose.model('AccessAuditEvent', accessAuditEventSchema);

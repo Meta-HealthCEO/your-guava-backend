@@ -12,7 +12,7 @@ const AuthSession = require('../models/AuthSession.model');
 const AccessAuditEvent = require('../models/AccessAuditEvent.model');
 const emailService = require('../services/email.service');
 const { isValidEmail } = require('../utils/email');
-const { passwordTooLong, passwordInputError, dummyPasswordHash } = require('../utils/password');
+const { passwordTooLong, passwordInputError, dummyPasswordHash, hashPassword } = require('../utils/password');
 const { runAfterResponse } = require('../utils/afterResponse');
 const authThrottle = require('../services/authThrottle.service');
 const { resolveSessionCafeId } = require('../utils/sessionCafe');
@@ -23,7 +23,8 @@ const MAX_REFRESH_TOKENS = 10;
 const ACTION_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
-const REFRESH_REUSE_GRACE_MS = 5 * 1000;
+// A lost response on a slow connection is retried well inside this (identity-15).
+const REFRESH_REUSE_GRACE_MS = 2 * 60 * 1000;
 const MAX_VERIFICATION_RESENDS = 5;
 const MAX_VERIFY_PASSWORD_ATTEMPTS = 5;
 const INVALID_VERIFICATION_MESSAGE = 'This verification link is invalid or has expired';
@@ -219,7 +220,7 @@ const register = async (req, res, next) => {
     const existingUser = await User.findOne({ email: normalizedEmail }).select('_id').lean();
     if (existingUser) {
       // Identity-4: same status, body and work as a new address: one bcrypt hash, one email.
-      await bcrypt.hash(password, 10);
+      await hashPassword(password);
       const notice = await emailService.sendAccountExistsEmail({ user: { email: normalizedEmail } });
       return respondToRegistration(res, notice, normalizedEmail);
     }
@@ -228,7 +229,7 @@ const register = async (req, res, next) => {
     const verificationToken = generateActionToken();
     const registration = await upsertPendingRegistration({
       email: normalizedEmail,
-      passwordHash: await bcrypt.hash(password, 10),
+      passwordHash: await hashPassword(password),
       name: normalizedName,
       cafeName: normalizedCafeName,
       orgName: normalizedOrgName,
@@ -375,19 +376,17 @@ const verifyEmail = async (req, res, next) => {
         throw error;
       }
 
-      [user] = await User.create([{
+      // The hash taken at registration is the password; nothing is hashed again here (identity-13).
+      user = new User({
         email: registration.email,
-        password: generateActionToken(),
+        password: registration.passwordHash,
         name: registration.name,
         role: 'owner',
         emailVerified: true,
         emailVerifiedAt: new Date(),
-      }], { session });
-      await User.updateOne(
-        { _id: user._id },
-        { $set: { password: registration.passwordHash } },
-        { session, runValidators: false }
-      );
+      });
+      user.$locals.passwordIsHash = true;
+      await user.save({ session });
       [org] = await Organization.create([{
         name: registration.orgName,
         ownerId: user._id,
@@ -579,10 +578,25 @@ const refresh = async (req, res, next) => {
           // Outside the narrow concurrency grace, a valid signed token that is
           // no longer current is a replay signal. Revoke the whole family,
           // including its replacement.
-          await AuthSession.updateOne(
+          const revoked = await AuthSession.updateOne(
             { userId: decoded.id, familyId: decoded.sid, revokedAt: null },
             { $set: { revokedAt: new Date(), revokeReason: 'refresh_token_reuse' } }
           );
+          if (revoked.modifiedCount > 0) {
+            // identity-16: the revocation is audited once (not emailed: after the grace window an innocent retry looks the same).
+            const holder = await User.findById(decoded.id).select('orgId email').lean();
+            if (holder?.orgId) {
+              await AccessAuditEvent.create({
+                orgId: holder.orgId,
+                actorUserId: holder._id,
+                targetUserId: holder._id,
+                action: 'session.reuse_detected',
+                targetEmail: holder.email,
+                details: { familyId: decoded.sid },
+                requestId: req.id,
+              });
+            }
+          }
           return res.status(401).json({ success: false, message: 'Invalid or expired refresh token' });
         }
       }
@@ -736,6 +750,7 @@ const resetPassword = async (req, res, next) => {
       return res.status(400).json({ success: false, message: newPasswordError });
     }
 
+    let holder;
     session = await mongoose.startSession();
     await session.withTransaction(async () => {
       const reset = await PasswordResetToken.findOneAndUpdate(
@@ -753,6 +768,7 @@ const resetPassword = async (req, res, next) => {
         throw error;
       }
       const user = await User.findById(reset.userId).select('+password +refreshTokens').session(session);
+      if (user) holder = { email: user.email, name: user.name };
       if (!user) {
         const error = new Error('This reset link is invalid or has expired');
         error.statusCode = 404;
@@ -787,6 +803,9 @@ const resetPassword = async (req, res, next) => {
       }
     });
 
+    emailService.sendSecurityNoticeEmail({ kind: 'password_reset', user: holder })
+      .catch((error) => console.warn('[auth] password reset notice failed:', error.message));
+
     res.clearCookie('refreshToken', refreshCookieOptions({ clearing: true }));
     return res.status(200).json({
       success: true,
@@ -818,9 +837,11 @@ const changePassword = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'Current password is incorrect' });
     }
 
+    let holder;
     session = await mongoose.startSession();
     await session.withTransaction(async () => {
       const user = await User.findById(req.user.id).select('+password +refreshTokens').session(session);
+      if (user) holder = { email: user.email, name: user.name };
       if (!user) {
         const error = new Error('User not found');
         error.statusCode = 404;
@@ -859,6 +880,10 @@ const changePassword = async (req, res, next) => {
         requestId: req.id,
       }], { session });
     });
+
+    // identity-16: the account holder hears about it; a failed notice never fails the change.
+    emailService.sendSecurityNoticeEmail({ kind: 'password_changed', user: holder })
+      .catch((error) => console.warn('[auth] password change notice failed:', error.message));
 
     res.clearCookie('refreshToken', refreshCookieOptions({ clearing: true }));
 

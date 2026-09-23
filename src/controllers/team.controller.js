@@ -378,12 +378,19 @@ const listAccessAudit = async (req, res, next) => {
   try {
     const limit = Math.max(1, Math.min(100, Number.parseInt(req.query.limit, 10) || 50));
     const filter = { orgId: req.user.orgId };
-    if (req.query.before) {
-      const before = new Date(req.query.before);
+    if (req.query.before !== undefined) {
+      const before = typeof req.query.before === 'string' ? new Date(req.query.before) : new Date(Number.NaN);
       if (Number.isNaN(before.getTime())) {
         return res.status(400).json({ success: false, message: 'before must be a valid date' });
       }
-      filter.createdAt = { $lt: before };
+      const beforeId = req.query.beforeId;
+      if (beforeId !== undefined && (typeof beforeId !== 'string' || !/^[a-f0-9]{24}$/i.test(beforeId))) {
+        return res.status(400).json({ success: false, message: 'beforeId must be an event id' });
+      }
+      // identity-19: (createdAt, _id) is the sort key, so it is the cursor; events sharing a millisecond are not skipped.
+      filter.$or = beforeId
+        ? [{ createdAt: { $lt: before } }, { createdAt: before, _id: { $lt: new mongoose.Types.ObjectId(beforeId) } }]
+        : [{ createdAt: { $lt: before } }];
     }
 
     const events = await AccessAuditEvent.find(filter)
@@ -395,14 +402,14 @@ const listAccessAudit = async (req, res, next) => {
     const hasMore = events.length > limit;
     if (hasMore) events.pop();
 
+    const last = events.length > 0 ? events[events.length - 1] : null;
     return res.status(200).json({
       success: true,
       events,
       pagination: {
         hasMore,
-        nextBefore: hasMore && events.length > 0
-          ? events[events.length - 1].createdAt
-          : null,
+        nextBefore: hasMore && last ? last.createdAt : null,
+        nextBeforeId: hasMore && last ? String(last._id) : null,
       },
     });
   } catch (error) {
@@ -943,6 +950,7 @@ const transferOwnership = async (req, res, next) => {
     }
 
     let target;
+    let handoff;
     session = await mongoose.startSession();
     await session.withTransaction(async () => {
       const currentOwner = await User.findOne({
@@ -999,6 +1007,11 @@ const transferOwnership = async (req, res, next) => {
       target.tokenVersion = Number(target.tokenVersion || 0) + 1;
       await currentOwner.save({ session });
       await target.save({ session });
+      handoff = {
+        orgName: org.name,
+        previous: { email: currentOwner.email, name: currentOwner.name },
+        next: { email: target.email, name: target.name },
+      };
       // Pending and expired invitations remain manageable after ownership
       // changes. Their capability tokens are organization-bound, and preview /
       // acceptance validates the current owner against invitedByUserId.
@@ -1031,6 +1044,17 @@ const transferOwnership = async (req, res, next) => {
         session,
       });
     });
+
+    // identity-16: both people hear about the transfer; a failed notice never fails the transfer.
+    if (handoff) {
+      const warn = (who) => (error) => console.warn(`[team] ownership notice to the ${who} failed:`, error.message);
+      emailService.sendSecurityNoticeEmail({
+        kind: 'ownership_transferred_away', user: handoff.previous, orgName: handoff.orgName, counterpartName: handoff.next.name,
+      }).catch(warn('previous owner'));
+      emailService.sendSecurityNoticeEmail({
+        kind: 'ownership_received', user: handoff.next, orgName: handoff.orgName, counterpartName: handoff.previous.name,
+      }).catch(warn('new owner'));
+    }
 
     res.clearCookie('refreshToken', refreshCookieOptions({ clearing: true }));
     return res.status(200).json({
