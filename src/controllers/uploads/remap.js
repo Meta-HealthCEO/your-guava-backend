@@ -1,13 +1,13 @@
 // PATCH /uploads/:id/mapping: re-import an upload under a new mapping.
 // Moved from uploads.controller.js by BE-11-T03; behaviour unchanged.
 const Upload = require('../../models/Upload.model');
-const Transaction = require('../../models/Transaction.model');
 const r2 = require('../../services/r2.service');
 const parser = require('../../services/parser.service');
-const { zonedDateKey } = require('../../utils/timezone');
 const { normaliseTransactionStatus } = require('../../utils/transactionStatus');
-const { computeDedupKey } = require('../../utils/dedupKey');
 const { clearApiCache } = require('../../middleware/cache.middleware');
+const {
+  transactionIdentity, identityComparisonKey, findExistingIdentities,
+} = require('../../services/transactionIdentity');
 const {
   CONFIRMATION_KEY_MAX_LENGTH, sha256, validateMapping, getCafeTimezone, assertParsedRowsImportable, confirmationMappingHash,
   confirmationResponse,
@@ -17,34 +17,6 @@ const {
 } = require('./lease');
 const { schedulePostImportMaintenance } = require('./jobs');
 
-/**
- * Identity a remapped row would be stored under. A receipt number is only
- * unique within a cafe-local trading day (plenty of tills restart numbering
- * each morning), so it is paired with the day exactly as the write path and
- * the unique index do; keyed on the number alone, a reused "#0001" on another
- * day was refused as a duplicate.
- */
-const duplicateIdentityForRow = (row, sourceFingerprint, timezone) => {
-  if (row.receiptId) {
-    return {
-      receiptId: row.receiptId,
-      dayKey: row.dateKey || zonedDateKey(row.date, timezone),
-    };
-  }
-
-  const dedupKey = computeDedupKey({
-    date: row.date.toISOString().slice(0, 10),
-    time: row.date.toISOString().slice(11, 16),
-    total: row.total,
-    items: row.items,
-    sourceFingerprint,
-    sourceRowNumbers: row.__sourceRowNumbers,
-  });
-  return { dedupKey };
-};
-
-const receiptIdentityKey = (receiptId, dayKey) => `receiptId:${receiptId}|${dayKey}`;
-
 const assertRemapHasImportableRows = async (parsed, cafeId, uploadId, sourceFingerprint, timezone) => {
   const approvedRows = parsed.rows.filter((row) => normaliseTransactionStatus(row.status).status === 'approved');
   if (approvedRows.length === 0) {
@@ -53,41 +25,9 @@ const assertRemapHasImportableRows = async (parsed, cafeId, uploadId, sourceFing
     throw err;
   }
 
-  const identities = approvedRows.map((row) => duplicateIdentityForRow(row, sourceFingerprint, timezone));
-  const receiptIds = [...new Set(identities.map((identity) => identity.receiptId).filter(Boolean))];
-  const dedupKeys = [...new Set(identities.map((identity) => identity.dedupKey).filter(Boolean))];
-  const existingIdentities = new Set();
-  const chunks = (values, size = 500) => {
-    const result = [];
-    for (let index = 0; index < values.length; index += size) result.push(values.slice(index, index + size));
-    return result;
-  };
-  const queries = [
-    ...chunks(receiptIds).map((values) => ({ receiptId: { $in: values } })),
-    ...chunks(dedupKeys).map((values) => ({ dedupKey: { $in: values } })),
-  ];
-  for (const identityQuery of queries) {
-    const existingRows = await Transaction.find({
-      cafeId,
-      uploadId: { $ne: uploadId },
-      ...identityQuery,
-    }).select('receiptId dedupKey date').lean();
-    for (const existing of existingRows) {
-      // Stored rows keep only the instant; the trading day is recomputed in
-      // the cafe's timezone, as the write path does.
-      if (existing.receiptId) {
-        existingIdentities.add(
-          receiptIdentityKey(existing.receiptId, zonedDateKey(existing.date, timezone))
-        );
-      }
-      if (existing.dedupKey) existingIdentities.add(`dedupKey:${existing.dedupKey}`);
-    }
-  }
-  const duplicateRows = identities.filter((identity) => (
-    identity.receiptId
-      ? existingIdentities.has(receiptIdentityKey(identity.receiptId, identity.dayKey))
-      : existingIdentities.has(`dedupKey:${identity.dedupKey}`)
-  )).length;
+  const identities = approvedRows.map((row) => transactionIdentity(row, sourceFingerprint, timezone));
+  const existing = await findExistingIdentities(cafeId, identities, { timezone, excludeUploadId: uploadId });
+  const duplicateRows = identities.filter((identity) => existing.has(identityComparisonKey(identity))).length;
 
   if (duplicateRows === approvedRows.length) {
     const err = new Error('Every valid row already exists in another upload; remap would leave this upload empty');

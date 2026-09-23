@@ -13,7 +13,9 @@ const {
   parserLimits,
 } = require('./parser.service');
 const { zonedDateKey, safeTimezone } = require('../utils/timezone');
-const { computeDedupKey } = require('../utils/dedupKey');
+const {
+  transactionIdentity, identityComparisonKey, findExistingIdentities,
+} = require('./transactionIdentity');
 const {
   normaliseTransactionStatus,
   SKIP_REASON_STATUS,
@@ -167,24 +169,6 @@ const addPersistenceRowError = (rowErrors, row, reason) => {
  * receipt on the same day -- while letting "#0001" on Tuesday and "#0001" on
  * Wednesday be recognised as the two different sales they are.
  */
-const transactionIdentity = (row, sourceFingerprint) => {
-  if (row.receiptId) {
-    const dayKey = row.dateKey || row.date.toISOString().slice(0, 10);
-    return { type: 'receiptId', value: row.receiptId, dayKey };
-  }
-  return {
-    type: 'dedupKey',
-    value: computeDedupKey({
-      date: row.date.toISOString().slice(0, 10),
-      time: row.date.toISOString().slice(11, 16),
-      total: row.total,
-      items: row.items,
-      sourceFingerprint,
-      sourceRowNumbers: row.__sourceRowNumbers,
-    }),
-  };
-};
-
 const transactionDocument = (row, { cafeId, uploadId, identity }) => ({
   cafeId,
   uploadId,
@@ -201,52 +185,6 @@ const transactionDocument = (row, { cafeId, uploadId, identity }) => ({
   discount: row.discount,
   source: 'csv',
 });
-
-const chunksOf = (values, size = 500) => {
-  const chunks = [];
-  for (let index = 0; index < values.length; index += size) {
-    chunks.push(values.slice(index, index + size));
-  }
-  return chunks;
-};
-
-/** Receipt identities compare on the receipt AND its trading day; others on value alone. */
-const identityComparisonKey = (identity) =>
-  identity.type === 'receiptId'
-    ? `receiptId:${identity.value}|${identity.dayKey}`
-    : `${identity.type}:${identity.value}`;
-
-const findExistingIdentities = async (cafeId, candidates, session, timezone) => {
-  const existing = new Set();
-  const zone = safeTimezone(timezone);
-  const receiptIds = [...new Set(
-    candidates.filter((candidate) => candidate.identity.type === 'receiptId')
-      .map((candidate) => candidate.identity.value)
-  )];
-  const dedupKeys = [...new Set(
-    candidates.filter((candidate) => candidate.identity.type === 'dedupKey')
-      .map((candidate) => candidate.identity.value)
-  )];
-
-  const queries = [
-    ...chunksOf(receiptIds).map((chunk) => ({ receiptId: { $in: chunk } })),
-    ...chunksOf(dedupKeys).map((chunk) => ({ dedupKey: { $in: chunk } })),
-  ];
-  for (const identityQuery of queries) {
-    let query = Transaction.find({ cafeId, ...identityQuery }).select('receiptId dedupKey date');
-    if (session) query = query.session(session);
-    const rows = await query.lean();
-    for (const row of rows) {
-      // Stored rows keep only the instant, so the trading day is recomputed in
-      // the cafe's timezone rather than read off a UTC date.
-      if (row.receiptId) {
-        existing.add(`receiptId:${row.receiptId}|${zonedDateKey(row.date, zone)}`);
-      }
-      if (row.dedupKey) existing.add(`dedupKey:${row.dedupKey}`);
-    }
-  }
-  return existing;
-};
 
 const reconcileParsedRows = async (parsed, { cafeId, session }) => {
   const reconciledCache = new Map();
@@ -305,7 +243,7 @@ const persistParsedRowsBulk = async (
       if (!itemsAlreadyReconciled) {
         row.items = await reconcileTransactionItems(cafeId, row.items, { session });
       }
-      const identity = transactionIdentity(row, sourceFingerprint);
+      const identity = transactionIdentity(row, sourceFingerprint, timezone);
       const identityKey = identityComparisonKey(identity);
       if (seen.has(identityKey)) {
         skipped++;
@@ -327,7 +265,11 @@ const persistParsedRowsBulk = async (
     }
   }
 
-  const existing = await findExistingIdentities(cafeId, candidates, session, timezone);
+  const existing = await findExistingIdentities(
+    cafeId,
+    candidates.map((candidate) => candidate.identity),
+    { session, timezone }
+  );
   const importable = candidates.filter((candidate) => {
     if (!existing.has(candidate.identityKey)) return true;
     skipped++;
@@ -428,7 +370,7 @@ const persistParsedRows = async (
       // day scoping was added to fix: on a till that restarts its order numbers
       // each morning, Wednesday's "#0001" was recognised as Tuesday's and
       // dropped, so a month of history collapsed to one day's receipts.
-      const identity = transactionIdentity(row, sourceFingerprint);
+      const identity = transactionIdentity(row, sourceFingerprint, timezone);
       const dedupKey = identity.type === 'dedupKey' ? identity.value : undefined;
 
       let existingQuery = identity.type === 'receiptId'
