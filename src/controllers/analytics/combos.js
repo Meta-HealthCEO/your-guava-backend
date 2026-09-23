@@ -3,6 +3,7 @@
 const mongoose = require('mongoose');
 const Transaction = require('../../models/Transaction.model');
 const { getCafeTimezone, buildDateMatch, analyticsRangeMeta } = require('./range');
+const { activeCafeId } = require('../../utils/tenancy');
 
 const MAX_COMBO_FALLBACK_TRANSACTIONS = 5000;
 const MAX_COMBO_FALLBACK_PAIR_WORK = 100000;
@@ -13,7 +14,7 @@ const MAX_COMBO_FALLBACK_PAIR_WORK = 100000;
  */
 const getCombos = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const timezone = await getCafeTimezone(cafeId);
     const dateMatch = buildDateMatch(req.query, timezone);
 
@@ -82,7 +83,7 @@ const getCombos = async (req, res, next) => {
     // If $sortArray is not available (older MongoDB), fall back to JS-side pair generation
     if (error.message && error.message.includes('sortArray')) {
       try {
-        const cafeId = req.user.cafeId;
+        const cafeId = activeCafeId(req);
         const timezone = await getCafeTimezone(cafeId);
         const dateMatch = buildDateMatch(req.query, timezone);
 

@@ -5,10 +5,11 @@ const mongoose = require('mongoose');
 const InsightChat = require('../models/InsightChat.model');
 const { getCachedInsights, refreshInsights, generateBusinessChatResponse, streamBusinessChatResponse } = require('../services/anthropic.service');
 const { meterGuavaCredits } = require('../services/usage.service');
+const { activeCafeId } = require('../utils/tenancy');
 
 const getInsights = async (req, res, next) => {
   try {
-    const result = await getCachedInsights(req.user.cafeId);
+    const result = await getCachedInsights(activeCafeId(req));
     return res.status(200).json({ success: true, ...result });
   } catch (error) {
     next(error);
@@ -149,7 +150,7 @@ const refreshGeneratedInsights = async (req, res, next) => {
     const idempotencyKey = paidRequestIdempotencyKey(req, res);
     if (!idempotencyKey) return;
     const { result, guavaCredits, replayed, coalesced } = await refreshInsights({
-      cafeId: req.user.cafeId,
+      cafeId: activeCafeId(req),
       orgId: req.user.orgId,
       userId: req.user.id,
       idempotencyKey,
@@ -175,7 +176,7 @@ const refreshGeneratedInsights = async (req, res, next) => {
 const chatInsights = async (req, res, next) => {
   const requestAbort = abortWhenResponseCloses(res);
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const orgId = req.user.orgId;
     const authorizedCafeIds = req.user.role === 'manager' ? req.user.cafeIds : undefined;
     const { chatId, messages, question } = req.body;
@@ -280,7 +281,7 @@ const abortWhenResponseCloses = (res) => {
 const streamChatInsights = async (req, res, next) => {
   const requestAbort = abortWhenResponseCloses(res);
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const orgId = req.user.orgId;
     const authorizedCafeIds = req.user.role === 'manager' ? req.user.cafeIds : undefined;
     const { chatId, messages, question } = req.body;

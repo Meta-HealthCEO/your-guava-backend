@@ -18,6 +18,7 @@ const {
 const { scheduleForecastRefreshAfterMenuChange } = require('../services/forecast.service');
 const { clearApiCache } = require('../middleware/cache.middleware');
 const { creditSnapshot } = require('../services/usage.service');
+const { activeCafeId } = require('../utils/tenancy');
 
 const VALID_CATEGORIES = new Set(['coffee', 'food', 'cold_drink', 'water', 'retail', 'other']);
 const VALID_REVIEW_STATUSES = new Set(['matched', 'needs_review', 'ignored', 'merged']);
@@ -148,7 +149,7 @@ const itemPayload = (body, { creating = false } = {}) => {
 
 const list = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { q, reviewStatus, active } = req.query;
     const filter = { cafeId };
 
@@ -207,7 +208,7 @@ const create = async (req, res, next) => {
     }
 
     const existing = await Item.findOne({
-      cafeId: req.user.cafeId,
+      cafeId: activeCafeId(req),
       normalizedName: payload.normalizedName,
     }).lean();
     if (existing) {
@@ -215,7 +216,7 @@ const create = async (req, res, next) => {
     }
 
     const item = await Item.create({
-      cafeId: req.user.cafeId,
+      cafeId: activeCafeId(req),
       category: 'other',
       ...payload,
     });
@@ -232,7 +233,7 @@ const update = async (req, res, next) => {
     if (validationError) {
       return res.status(400).json({ success: false, message: validationError });
     }
-    const item = await Item.findOne({ _id: req.params.id, cafeId: req.user.cafeId });
+    const item = await Item.findOne({ _id: req.params.id, cafeId: activeCafeId(req) });
     if (!item) return res.status(404).json({ success: false, message: 'Item not found' });
 
     const payload = itemPayload(req.body);
@@ -246,9 +247,9 @@ const update = async (req, res, next) => {
     // 200 was written -- the change looked saved and was gone on reload.
     markManualFields(item, MANUAL_FIELDS.filter((field) => req.body[field] !== undefined));
     await item.save();
-    await updateTransactionMenuItemLinks(req.user.cafeId, item, item);
-    await rebuildItemsForCafe(req.user.cafeId);
-    await scheduleForecastRefreshAfterMenuChange(req.user.cafeId);
+    await updateTransactionMenuItemLinks(activeCafeId(req), item, item);
+    await rebuildItemsForCafe(activeCafeId(req));
+    await scheduleForecastRefreshAfterMenuChange(activeCafeId(req));
     clearApiCache();
 
     return res.status(200).json({ success: true, item });
@@ -259,7 +260,7 @@ const update = async (req, res, next) => {
 
 const reconciliation = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const limit = Math.max(1, Math.min(Number.parseInt(req.query.limit, 10) || 50, MAX_RECONCILIATION_ITEMS));
     const filter = reconciliationFilter(cafeId);
     // Counted against the collection, not against the page. Derived from the
@@ -333,7 +334,7 @@ const generateReconciliationSuggestions = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'itemIds contains an invalid item id' });
     }
 
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const items = await Item.find({
       ...reconciliationFilter(cafeId),
       _id: { $in: itemIds },
@@ -395,8 +396,8 @@ const resolve = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'targetItemId is invalid' });
     }
 
-    const item = await resolveMenuItem(req.user.cafeId, req.params.id, req.body);
-    await scheduleForecastRefreshAfterMenuChange(req.user.cafeId);
+    const item = await resolveMenuItem(activeCafeId(req), req.params.id, req.body);
+    await scheduleForecastRefreshAfterMenuChange(activeCafeId(req));
     clearApiCache();
     return res.status(200).json({ success: true, item });
   } catch (error) {

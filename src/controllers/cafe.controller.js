@@ -4,6 +4,7 @@ const Forecast = require('../models/Forecast.model');
 const { normalizeTradingHours, defaultTradingHours, tradingHoursInputError } = require('../utils/tradingHours');
 const { clearApiCache } = require('../middleware/cache.middleware');
 const { safeTimezone, zonedDayStart } = require('../utils/timezone');
+const { activeCafeId } = require('../utils/tenancy');
 
 const FORECAST_INPUT_PREFIXES = ['location.lat', 'location.lng', 'location.city', 'tradingHours'];
 
@@ -83,7 +84,7 @@ const listCafes = async (req, res, next) => {
 const getMe = async (req, res, next) => {
   try {
     const cafe = await Cafe.findOne({
-      _id: req.user.cafeId,
+      _id: activeCafeId(req),
       orgId: req.user.orgId,
     }).lean();
     if (!cafe) {
@@ -159,7 +160,7 @@ const updateMe = async (req, res, next) => {
     }
 
     const cafe = await Cafe.findOneAndUpdate(
-      { _id: req.user.cafeId, orgId: req.user.orgId },
+      { _id: activeCafeId(req), orgId: req.user.orgId },
       update,
       { new: true, runValidators: true }
     );

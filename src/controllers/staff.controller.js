@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const Staff = require('../models/Staff.model');
 const LeaveBalance = require('../models/LeaveBalance.model');
 const { parseDateOnly } = require('../utils/timezone');
+const { activeCafeId } = require('../utils/tenancy');
 
 // Pay is owner-only information. Managers get the roster without hourlyRate.
 const staffDto = (staff, user) => {
@@ -17,7 +18,7 @@ const optionalDateOnly = (value) => (value == null || value === '' ? undefined :
 const create = async (req, res, next) => {
   const session = await mongoose.startSession();
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { name, email, phone, role, hourlyRate, startDate } = req.body;
     const parsedRate = Number(hourlyRate);
     const parsedStartDate = optionalDateOnly(startDate);
@@ -57,7 +58,7 @@ const create = async (req, res, next) => {
 // GET /api/staff — List all active staff for cafe with leave balances
 const list = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
 
     const staff = await Staff.find({ cafeId, isActive: true }).sort({ name: 1 }).lean();
 
@@ -88,7 +89,7 @@ const list = async (req, res, next) => {
 // GET /api/staff/:id — Get single staff member with leave balance
 const getOne = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { id } = req.params;
 
     const staff = await Staff.findOne({ _id: id, cafeId }).lean();
@@ -110,7 +111,7 @@ const getOne = async (req, res, next) => {
 // PUT /api/staff/:id — Update staff details
 const update = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { id } = req.params;
     const { name, email, phone, role, hourlyRate, startDate, isActive } = req.body;
     const parsedStartDate = startDate !== undefined ? optionalDateOnly(startDate) : undefined;
@@ -152,7 +153,7 @@ const update = async (req, res, next) => {
 // DELETE /api/staff/:id — Soft delete (set isActive: false)
 const remove = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { id } = req.params;
 
     const staff = await Staff.findOneAndUpdate(

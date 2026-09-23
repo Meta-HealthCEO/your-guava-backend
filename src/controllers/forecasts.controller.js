@@ -23,6 +23,7 @@ const {
   zonedDayStart,
   getCafeTimezone,
 } = require('../utils/timezone');
+const { activeCafeId } = require('../utils/tenancy');
 
 const REQUIRED_PLANNING_FACTOR_KEYS = ['weather', 'loadShedding', 'holiday', 'payday', 'events'];
 const HISTORY_BACKFILL_BATCH_SIZE = 14;
@@ -182,7 +183,7 @@ const ensureHistoryForecast = async (cafeId, date) => {
 
 const getToday = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const timezone = await getCafeTimezone(cafeId);
     const today = zonedDayStart(new Date(), timezone);
 
@@ -200,7 +201,7 @@ const getToday = async (req, res, next) => {
 
 const getWeek = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const timezone = await getCafeTimezone(cafeId);
     const today = zonedDayStart(new Date(), timezone);
     const nextWeek = addZonedDays(today, 7, timezone);
@@ -265,7 +266,7 @@ const getWeek = async (req, res, next) => {
 
 const generate = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { date } = req.body;
 
     if (!date) {
@@ -287,7 +288,7 @@ const generate = async (req, res, next) => {
 
 const getFactors = async (req, res, next) => {
   try {
-    const cafe = await Cafe.findById(req.user.cafeId).lean();
+    const cafe = await Cafe.findById(activeCafeId(req)).lean();
     if (!cafe) return res.status(404).json({ success: false, message: 'Cafe not found' });
     const org = await Organization.findById(req.user.orgId).lean();
     const plan = org?.plan || 'starter';
@@ -311,7 +312,7 @@ const getFactors = async (req, res, next) => {
 
 const updateFactors = async (req, res, next) => {
   try {
-    const cafe = await Cafe.findById(req.user.cafeId);
+    const cafe = await Cafe.findById(activeCafeId(req));
     if (!cafe) return res.status(404).json({ success: false, message: 'Cafe not found' });
     const org = await Organization.findById(req.user.orgId).lean();
     const plan = org?.plan || 'starter';
@@ -352,7 +353,7 @@ const updateFactors = async (req, res, next) => {
 
 const getAccuracy = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const timezone = await getCafeTimezone(cafeId);
     const today = zonedDayStart(new Date(), timezone);
     const thirtyDaysAgo = addZonedDays(today, -30, timezone);
@@ -410,7 +411,7 @@ const getAccuracy = async (req, res, next) => {
 
 const getHistory = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const cafeObjectId = new mongoose.Types.ObjectId(String(cafeId));
     const cafe = await Cafe.findOne({ _id: cafeId, orgId: req.user.orgId })
       .select('timezone')
@@ -582,7 +583,7 @@ const getHistory = async (req, res, next) => {
 
 const getTomorrow = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const timezone = await getCafeTimezone(cafeId);
     const tomorrow = addZonedDays(new Date(), 1, timezone);
 
@@ -600,7 +601,7 @@ const getTomorrow = async (req, res, next) => {
 
 const getRecent = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const timezone = await getCafeTimezone(cafeId);
     const today = zonedDayStart(new Date(), timezone);
     const sevenDaysAgo = addZonedDays(today, -7, timezone);

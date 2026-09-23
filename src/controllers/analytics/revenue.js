@@ -5,6 +5,7 @@ const Transaction = require('../../models/Transaction.model');
 const {
   getCafeTimezone, buildDateMatch, dateToString, inclusiveLocalDayCount, localDayBoundaryUtc, analyticsRangeMeta,
 } = require('./range');
+const { activeCafeId } = require('../../utils/tenancy');
 
 /**
  * GET /api/analytics/revenue
@@ -12,7 +13,7 @@ const {
  */
 const getRevenue = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const cafeObjectId = mongoose.Types.ObjectId.createFromHexString(cafeId);
     const timezone = await getCafeTimezone(cafeId);
 

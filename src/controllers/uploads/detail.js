@@ -6,10 +6,11 @@ const r2 = require('../../services/r2.service');
 const { MAX_LIST_PAGE } = require('./shared');
 const { parsingLeaseMs } = require('./lease');
 const { maintenanceMaxAttempts, claimAndRunPostImportMaintenance } = require('./jobs');
+const { activeCafeId } = require('../../utils/tenancy');
 
 const detail = async (req, res, next) => {
   try {
-    const upload = await Upload.findOne({ _id: req.params.id, cafeId: req.user.cafeId })
+    const upload = await Upload.findOne({ _id: req.params.id, cafeId: activeCafeId(req) })
       .populate('uploadedBy', 'name email')
       .lean();
     if (!upload || upload.status === 'deleted') {
@@ -42,7 +43,7 @@ const detail = async (req, res, next) => {
 
 const rows = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const upload = await Upload.findOne({ _id: req.params.id, cafeId }).lean();
     if (!upload || upload.status === 'deleted') {
       return res.status(404).json({ success: false, message: 'Upload not found' });

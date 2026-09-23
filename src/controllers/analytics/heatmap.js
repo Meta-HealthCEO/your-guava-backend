@@ -5,6 +5,7 @@ const Transaction = require('../../models/Transaction.model');
 const Cafe = require('../../models/Cafe.model');
 const { isWeekdayHourOpen } = require('../../utils/tradingHours');
 const { safeTimezone, buildDateMatch, dateToString, analyticsRangeMeta } = require('./range');
+const { activeCafeId } = require('../../utils/tenancy');
 
 /**
  * GET /api/analytics/heatmap
@@ -12,7 +13,7 @@ const { safeTimezone, buildDateMatch, dateToString, analyticsRangeMeta } = requi
  */
 const getHeatmap = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const cafeObjectId = mongoose.Types.ObjectId.createFromHexString(cafeId);
     const cafe = await Cafe.findById(cafeId).select('timezone tradingHours').lean();
     const timezone = safeTimezone(cafe?.timezone);

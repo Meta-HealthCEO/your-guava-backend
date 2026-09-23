@@ -16,6 +16,7 @@ const {
   recoverStaleParsingUpload, snapshotUploadState, lockUploadForParsing, touchParsingLease, commitParsedUpload, restoreUploadAfterFailure,
 } = require('./lease');
 const { schedulePostImportMaintenance } = require('./jobs');
+const { activeCafeId } = require('../../utils/tenancy');
 
 const assertRemapHasImportableRows = async (parsed, cafeId, uploadId, sourceFingerprint, timezone) => {
   const approvedRows = parsed.rows.filter((row) => normaliseTransactionStatus(row.status).status === 'approved');
@@ -40,7 +41,7 @@ const remap = async (req, res, next) => {
   try {
     const { id } = req.params;
     const { columnMapping, itemsMode = 'packed', allowPartialImport = false } = req.body;
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     // Remap deliberately discarded its key, so a retried re-import looked like a
     // fresh one. Record it like confirm does.
     const remapKey = String(req.get?.('Idempotency-Key') || '').trim();

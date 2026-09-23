@@ -8,6 +8,7 @@ const {
 const xeroService = require('../services/integrations/xero.service');
 const quickbooksService = require('../services/integrations/quickbooks.service');
 const sageService = require('../services/integrations/sage.service');
+const { activeCafeId } = require('../utils/tenancy');
 
 const SERVICES = Object.freeze({
   xero: xeroService,
@@ -54,7 +55,7 @@ const unavailable = (res) =>
  */
 const list = async (req, res, next) => {
   try {
-    const cafe = await Cafe.findById(req.user.cafeId).lean();
+    const cafe = await Cafe.findById(activeCafeId(req)).lean();
     const providers = Object.keys(SERVICES);
     const status = {};
     for (const p of providers) {
@@ -90,7 +91,7 @@ const getAuthUrl = async (req, res, _next) => {
     // the live user, cafe and provider prevents tampering, replay and cross-cafe
     // callback confusion.
     const state = await createIntegrationOAuthState({
-      cafeId: req.user.cafeId,
+      cafeId: activeCafeId(req),
       userId: req.user.id,
       provider,
     });
@@ -137,7 +138,7 @@ const callback = async (req, res, _next) => {
 
     const validState = await consumeIntegrationOAuthState({
       state,
-      cafeId: req.user.cafeId,
+      cafeId: activeCafeId(req),
       userId: req.user.id,
       provider,
     });
@@ -162,7 +163,7 @@ const callback = async (req, res, _next) => {
     if (tokens.realmId) update[`accountingIntegrations.${provider}.realmId`] = tokens.realmId;
     if (tokens.businessId) update[`accountingIntegrations.${provider}.businessId`] = tokens.businessId;
 
-    await Cafe.findByIdAndUpdate(req.user.cafeId, { $set: update });
+    await Cafe.findByIdAndUpdate(activeCafeId(req), { $set: update });
     return res.status(200).json({ success: true });
   } catch (error) {
     console.error('[integrations] OAuth callback failed:', error?.message);
@@ -189,7 +190,7 @@ const sync = async (req, res, next) => {
     const service = getService(provider);
     if (!service) return res.status(400).json({ success: false, message: 'Unknown provider' });
 
-    const cafe = await Cafe.findById(req.user.cafeId).select(
+    const cafe = await Cafe.findById(activeCafeId(req)).select(
       `+accountingIntegrations.${provider}.accessToken +accountingIntegrations.${provider}.refreshToken`
     );
     const integ = cafe?.accountingIntegrations?.[provider];
@@ -202,7 +203,7 @@ const sync = async (req, res, next) => {
       try {
         const refreshed = await service.refreshAccessToken(decryptSecret(integ.refreshToken));
         const newExpiresAt = new Date(Date.now() + (refreshed.expiresIn || 1800) * 1000);
-        await Cafe.findByIdAndUpdate(req.user.cafeId, {
+        await Cafe.findByIdAndUpdate(activeCafeId(req), {
           $set: {
             [`accountingIntegrations.${provider}.accessToken`]: encryptSecret(refreshed.accessToken),
             [`accountingIntegrations.${provider}.refreshToken`]:
@@ -224,7 +225,7 @@ const sync = async (req, res, next) => {
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
     const txns = await Transaction.find({
-      cafeId: req.user.cafeId,
+      cafeId: activeCafeId(req),
       status: 'approved',
       date: { $gte: sevenDaysAgo },
     }).lean();
@@ -259,7 +260,7 @@ const sync = async (req, res, next) => {
         ? null
         : result.error || 'Unknown error',
     };
-    await Cafe.findByIdAndUpdate(req.user.cafeId, { $set: updateFields });
+    await Cafe.findByIdAndUpdate(activeCafeId(req), { $set: updateFields });
 
     return res.status(result.ok ? 200 : result.statusCode || 500).json({
       success: result.ok,
@@ -288,7 +289,7 @@ const disconnect = async (req, res, next) => {
     if (!getService(provider)) {
       return res.status(400).json({ success: false, message: 'Unknown provider' });
     }
-    await Cafe.findByIdAndUpdate(req.user.cafeId, {
+    await Cafe.findByIdAndUpdate(activeCafeId(req), {
       $set: {
         [`accountingIntegrations.${provider}.connected`]: false,
         [`accountingIntegrations.${provider}.accessToken`]: null,

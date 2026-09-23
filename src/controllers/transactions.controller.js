@@ -11,6 +11,7 @@ const parser = require('../services/parser.service');
 const { addZonedDays, zonedDayEnd, zonedDayOrdinal, zonedDayStart, getCafeTimezone } = require('../utils/timezone');
 const { proposeColumnMapping } = require('../services/anthropic.service');
 const { canSpendCredits } = require('../middleware/rbac.middleware');
+const { activeCafeId } = require('../utils/tenancy');
 
 const REQUIRED_UPLOAD_MAPPING = ['date', 'items', 'total'];
 const MIN_HEADER_COUNT = 2;
@@ -52,7 +53,7 @@ const upload = async (req, res, next) => {
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const userId = req.user.id;
     filePath = req.file.path;
     const fileName = path.basename(req.file.originalname);
@@ -197,7 +198,7 @@ const upload = async (req, res, next) => {
 
 const getTransactions = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { startDate, endDate, limit = 100, page = 1 } = req.query;
     const timezone = await getCafeTimezone(cafeId);
 
@@ -258,7 +259,7 @@ const getTransactions = async (req, res, next) => {
 
 const getStats = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const cafeObjectId = new mongoose.Types.ObjectId(String(cafeId));
     const timezone = await getCafeTimezone(cafeId);
 
@@ -347,7 +348,7 @@ const getStats = async (req, res, next) => {
 
 const getDataStatus = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const timezone = await getCafeTimezone(cafeId);
 
     // Find the latest transaction date (most recent data the user has)

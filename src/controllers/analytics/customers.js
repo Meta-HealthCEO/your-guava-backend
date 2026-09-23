@@ -3,6 +3,7 @@
 const mongoose = require('mongoose');
 const Transaction = require('../../models/Transaction.model');
 const { getCafeTimezone, buildDateMatch, analyticsRangeMeta } = require('./range');
+const { activeCafeId } = require('../../utils/tenancy');
 
 /**
  * GET /api/analytics/customers
@@ -10,7 +11,7 @@ const { getCafeTimezone, buildDateMatch, analyticsRangeMeta } = require('./range
  */
 const getCustomers = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const cafeObjectId = mongoose.Types.ObjectId.createFromHexString(cafeId);
     const timezone = await getCafeTimezone(cafeId);
 

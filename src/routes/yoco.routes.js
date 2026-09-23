@@ -17,10 +17,11 @@ const {
   verifyWebhookSignature,
 } = require('../services/yoco.service');
 const { encryptSecret } = require('../services/secrets.service');
+const { activeCafeId } = require('../utils/tenancy');
 
 // GET /api/yoco/auth — Get OAuth authorization URL
 router.get('/auth', authMiddleware, ownerOnly, (req, res) => {
-  const state = createOAuthState(req.user.cafeId);
+  const state = createOAuthState(activeCafeId(req));
   const url = getAuthorizationUrl(state);
   res.json({ success: true, url });
 });
@@ -32,14 +33,14 @@ router.post('/callback', authMiddleware, ownerOnly, async (req, res, next) => {
     if (!code) {
       return res.status(400).json({ success: false, message: 'Authorization code required' });
     }
-    if (!verifyOAuthState(state, req.user.cafeId)) {
+    if (!verifyOAuthState(state, activeCafeId(req))) {
       return res.status(400).json({ success: false, message: 'Invalid or expired OAuth state' });
     }
 
     const tokens = await exchangeCode(code);
     const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
 
-    await Cafe.findByIdAndUpdate(req.user.cafeId, {
+    await Cafe.findByIdAndUpdate(activeCafeId(req), {
       $set: {
         yocoConnected: true,
         'yocoTokens.accessToken': encryptSecret(tokens.access_token),
@@ -57,7 +58,7 @@ router.post('/callback', authMiddleware, ownerOnly, async (req, res, next) => {
 // GET /api/yoco/status — Check connection status
 router.get('/status', authMiddleware, async (req, res, next) => {
   try {
-    const cafe = await Cafe.findById(req.user.cafeId).select(
+    const cafe = await Cafe.findById(activeCafeId(req)).select(
       'yocoConnected lastSyncAt yocoTokens.expiresAt'
     );
     res.json({
@@ -74,7 +75,7 @@ router.get('/status', authMiddleware, async (req, res, next) => {
 // POST /api/yoco/sync — Manual full sync (pull all historical orders)
 router.post('/sync', authMiddleware, ownerOnly, async (req, res, next) => {
   try {
-    const cafe = await Cafe.findById(req.user.cafeId).select(
+    const cafe = await Cafe.findById(activeCafeId(req)).select(
       '+yocoTokens.accessToken +yocoTokens.refreshToken'
     );
     if (!cafe?.yocoConnected) {
@@ -128,7 +129,7 @@ router.post('/webhook', async (req, res) => {
 // POST /api/yoco/disconnect — Disconnect Yoco
 router.post('/disconnect', authMiddleware, ownerOnly, async (req, res, next) => {
   try {
-    await Cafe.findByIdAndUpdate(req.user.cafeId, {
+    await Cafe.findByIdAndUpdate(activeCafeId(req), {
       $set: { yocoConnected: false },
       $unset: { yocoTokens: 1, yocoBusinessId: 1 },
     });

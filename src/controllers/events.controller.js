@@ -8,6 +8,7 @@ const {
   DATE_ONLY_RE, TIME_OF_DAY_RE, safeTimezone, getCafeTimezone, zonedDayStart, cafeLocalToday, parseDateOnly,
   formatDateOnly,
 } = require('../utils/timezone');
+const { activeCafeId } = require('../utils/tenancy');
 
 // The throwing, message-bearing wrapper events need over the shared parseDateOnly.
 const requireEventDate = (value, field = 'date') => {
@@ -119,7 +120,7 @@ const getDailySales = async (cafeId, start, end, timezone) => Transaction.aggreg
 
 const eventEffects = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const cafe = await Cafe.findById(cafeId).lean();
     if (!cafe) return res.status(404).json({ success: false, message: 'Cafe not found' });
 
@@ -254,7 +255,7 @@ const eventEffects = async (req, res, next) => {
 
 const list = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { from, to } = req.query;
 
     const filter = { cafeId };
@@ -281,7 +282,7 @@ const list = async (req, res, next) => {
 
 const create = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { name, date, impact, impactPct, notes, recurring, type, closureWindow } = req.body;
 
     if (!name || !date) {
@@ -313,7 +314,7 @@ const create = async (req, res, next) => {
 
 const update = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { id } = req.params;
     const { name, date, impact, impactPct, notes, recurring, type, closureWindow } = req.body;
 
@@ -361,7 +362,7 @@ const update = async (req, res, next) => {
 
 const remove = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { id } = req.params;
 
     const event = await Event.findOneAndDelete({ _id: id, cafeId });

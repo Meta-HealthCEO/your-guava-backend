@@ -1,4 +1,5 @@
 const InsightChat = require('../models/InsightChat.model');
+const { activeCafeId } = require('../utils/tenancy');
 
 const MAX_MESSAGES = 80;
 // One chat can legitimately hold 80 messages of 20000 characters. Nothing here
@@ -62,7 +63,7 @@ const preserveServerRequestKeys = async (req, messages) => {
 const chatScope = (req, extra = {}) => ({
   ...extra,
   userId: req.user.id,
-  cafeId: req.user.cafeId,
+  cafeId: activeCafeId(req),
 });
 
 const list = async (req, res, next) => {
@@ -124,7 +125,7 @@ const create = async (req, res, next) => {
 
     const existingChats = await InsightChat.countDocuments({
       userId: req.user.id,
-      cafeId: req.user.cafeId,
+      cafeId: activeCafeId(req),
     });
     if (existingChats >= MAX_CHATS_PER_USER) {
       return res.status(409).json({
@@ -137,7 +138,7 @@ const create = async (req, res, next) => {
     const messages = sanitizeMessages(req.body.messages);
     const chat = await InsightChat.create({
       userId: req.user.id,
-      cafeId: req.user.cafeId,
+      cafeId: activeCafeId(req),
       orgId: req.user.orgId,
       title: buildTitle(req.body.title, messages),
       messages,

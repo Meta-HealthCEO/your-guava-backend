@@ -11,6 +11,7 @@ const authThrottle = require('../../services/authThrottle.service');
 const { resolveSessionCafeId } = require('../../utils/sessionCafe');
 const { issueSession, generateRefreshToken, refreshTokenExpiry } = require('./tokens');
 const { sha256Hex, generateAccessToken, setRefreshCookie, clearRefreshCookie } = require('../../utils/authPrimitives');
+const { activeCafeId } = require('../../utils/tenancy');
 
 // A lost response on a slow connection is retried well inside this (identity-15).
 const REFRESH_REUSE_GRACE_MS = 2 * 60 * 1000;
@@ -291,7 +292,7 @@ const me = async (req, res, next) => {
       orgId: user.orgId,
       cafeIds: user.cafeIds,
       // The calling token's cafe (identity-2), not the database default.
-      activeCafeId: req.user.cafeId || null,
+      activeCafeId: activeCafeId(req) || null,
       emailVerified: user.emailVerified !== false,
       permissions: {
         canSpendCredits: user.role === 'owner' || Boolean(user.permissions?.canSpendCredits),

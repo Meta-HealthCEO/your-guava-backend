@@ -2,6 +2,7 @@
 // Moved from uploads.controller.js by BE-11-T03; behaviour unchanged.
 const Upload = require('../../models/Upload.model');
 const { MAX_LIST_PAGE } = require('./shared');
+const { activeCafeId } = require('../../utils/tenancy');
 
 // What the history table draws, and nothing else. sampleRows, headers and
 // rowErrors can be megabytes per upload and are served by GET /uploads/:id;
@@ -15,7 +16,7 @@ const UPLOAD_LIST_FIELDS = [
 
 const list = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 50, 200));
     const page = Math.max(1, Math.min(parseInt(req.query.page, 10) || 1, MAX_LIST_PAGE));
     const skip = (page - 1) * limit;

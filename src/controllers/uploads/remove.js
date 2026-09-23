@@ -13,10 +13,11 @@ const { clearApiCache } = require('../../middleware/cache.middleware');
 const { getCafeTimezone, STORAGE_CLEANUP_PENDING } = require('./shared');
 const { recoverStaleParsingUpload } = require('./lease');
 const { fillActualsForRange, invalidateAiInsights } = require('./jobs');
+const { activeCafeId } = require('../../utils/tenancy');
 
 const remove = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     let upload = await Upload.findOne({ _id: req.params.id, cafeId });
     if (!upload || upload.status === 'deleted') {
       return res.status(404).json({ success: false, message: 'Upload not found' });

@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const Improvement = require('../models/Improvement.model');
 const User = require('../models/User.model');
+const { activeCafeId } = require('../utils/tenancy');
 
 const { IMPROVEMENT_TYPES, IMPROVEMENT_AREAS, PRIORITIES, STATUSES } = Improvement;
 
@@ -103,7 +104,7 @@ const create = async (req, res, next) => {
       pageUrl: pageUrl ? String(pageUrl).trim().slice(0, 300) : undefined,
       status: 'open',
       orgId,
-      cafeId: req.user.cafeId || undefined,
+      cafeId: activeCafeId(req) || undefined,
       createdBy: {
         userId: req.user.id,
         name: reporter?.name,

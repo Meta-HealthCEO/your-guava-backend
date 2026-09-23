@@ -3,6 +3,7 @@ const LeaveRequest = require('../models/LeaveRequest.model');
 const LeaveBalance = require('../models/LeaveBalance.model');
 const Staff = require('../models/Staff.model');
 const { parseDateOnly, formatDateOnly, inclusiveDateOnlyDays } = require('../utils/timezone');
+const { activeCafeId } = require('../utils/tenancy');
 
 const MAX_LEAVE_SPAN_DAYS = 366;
 const MAX_CALENDAR_SPAN_DAYS = 93;
@@ -26,7 +27,7 @@ function countWeekdays(start, end) {
 // POST /api/leave — Submit leave request
 const create = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { staffId, type, startDate, endDate, reason } = req.body;
 
     if (!staffId || !type || !startDate || !endDate) {
@@ -97,7 +98,7 @@ const create = async (req, res, next) => {
 // GET /api/leave — List all leave requests
 const list = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { status, staffId } = req.query;
 
     const filter = { cafeId };
@@ -119,7 +120,7 @@ const list = async (req, res, next) => {
 const approve = async (req, res, next) => {
   const session = await mongoose.startSession();
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { id } = req.params;
     let leaveRequest;
 
@@ -180,7 +181,7 @@ const approve = async (req, res, next) => {
 // PUT /api/leave/:id/reject — Reject leave request
 const reject = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { id } = req.params;
 
     const leaveRequest = await LeaveRequest.findOneAndUpdate(
@@ -203,7 +204,7 @@ const reject = async (req, res, next) => {
 // GET /api/leave/calendar — Approved leave for calendar view
 const getCalendar = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     let { startDate, endDate } = req.query;
 
     if (!startDate || !endDate) {
@@ -271,7 +272,7 @@ const getCalendar = async (req, res, next) => {
 // GET /api/leave/balances — All staff leave balances for the cafe
 const getBalances = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
 
     const balances = await LeaveBalance.find({ cafeId })
       .populate('staffId', 'name role isActive')

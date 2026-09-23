@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const { requestLogsEnabled } = require('../config/flags');
+const { activeCafeId } = require('../utils/tenancy');
 
 const REQUEST_ID_HEADER = 'X-Request-Id';
 const REQUEST_ID_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
@@ -46,7 +47,7 @@ const requestLogger = (req, res, next) => {
     };
 
     if (req.user?.id) log.userId = String(req.user.id);
-    if (req.user?.cafeId) log.cafeId = String(req.user.cafeId);
+    if (activeCafeId(req)) log.cafeId = String(activeCafeId(req));
 
     const line = JSON.stringify(log);
     if (res.statusCode >= 500) console.error(line);

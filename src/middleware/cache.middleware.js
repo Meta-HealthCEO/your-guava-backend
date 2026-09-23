@@ -1,4 +1,5 @@
 const { apiCacheEnabled } = require('../config/flags');
+const { activeCafeId } = require('../utils/tenancy');
 const cacheStore = new Map();
 
 const normaliseQuery = (query = {}) =>
@@ -22,7 +23,7 @@ const apiCache = ({ ttlMs = 30000, keyPrefix = 'api', maxEntries = 250 } = {}) =
 
   const scope = [
     req.user?.orgId || 'no-org',
-    req.user?.cafeId || 'no-cafe',
+    activeCafeId(req) || 'no-cafe',
     req.user?.id || 'no-user',
   ].join(':');
   const cacheKey = `${keyPrefix}:${scope}:${req.baseUrl}${req.path}?${normaliseQuery(req.query)}`;

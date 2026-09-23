@@ -12,6 +12,7 @@ const {
   recoverStaleParsingUpload, snapshotUploadState, lockUploadForParsing, touchParsingLease, commitParsedUpload, restoreUploadAfterFailure,
 } = require('./lease');
 const { schedulePostImportMaintenance } = require('./jobs');
+const { activeCafeId } = require('../../utils/tenancy');
 
 const confirm = async (req, res, next) => {
   try {
@@ -21,7 +22,7 @@ const confirm = async (req, res, next) => {
       itemsMode = 'packed',
       allowPartialImport = false,
     } = req.body;
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const idempotencyKey = String(req.get?.('Idempotency-Key') || '').trim();
     if (idempotencyKey.length > CONFIRMATION_KEY_MAX_LENGTH) {
       return res.status(400).json({ success: false, message: 'Idempotency-Key is too long' });

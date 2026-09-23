@@ -1,6 +1,7 @@
 const Shift = require('../models/Shift.model');
 const Staff = require('../models/Staff.model');
 const { parseDateOnly, formatDateOnly, inclusiveDateOnlyDays, TIME_OF_DAY_RE } = require('../utils/timezone');
+const { activeCafeId } = require('../utils/tenancy');
 
 const WEEKLY_HOUR_THRESHOLD = 45; // South African BCEA law
 const MAX_SHIFT_RANGE_DAYS = 93;
@@ -105,7 +106,7 @@ async function getWeeklyHours(cafeId, staffId, date, excludeShiftId = null) {
 // POST /api/shifts — Create a shift
 const create = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { staffId, date, startTime, endTime, status, notes } = req.body;
     const shiftDate = parseDateOnly(date);
 
@@ -165,7 +166,7 @@ const create = async (req, res, next) => {
 // GET /api/shifts — Get shifts for a date range
 const list = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     let { startDate, endDate } = req.query;
 
     // Default to current week Mon-Sun
@@ -208,7 +209,7 @@ const list = async (req, res, next) => {
 // GET /api/shifts/week — Current week's roster grouped by day
 const getWeek = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { monday, sunday } = getWeekBounds(new Date());
 
     const shifts = await Shift.find({
@@ -248,7 +249,7 @@ const getWeek = async (req, res, next) => {
 // GET /api/shifts/summary — Weekly hours summary per staff member
 const getSummary = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     let { startDate, endDate } = req.query;
 
     if (!startDate || !endDate) {
@@ -338,7 +339,7 @@ const getSummary = async (req, res, next) => {
 // PUT /api/shifts/:id — Update shift
 const update = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { id } = req.params;
     const { staffId, date, startTime, endTime, status, notes } = req.body;
 
@@ -413,7 +414,7 @@ const update = async (req, res, next) => {
 // DELETE /api/shifts/:id — Delete shift
 const remove = async (req, res, next) => {
   try {
-    const cafeId = req.user.cafeId;
+    const cafeId = activeCafeId(req);
     const { id } = req.params;
 
     const shift = await Shift.findOneAndDelete({ _id: id, cafeId });
