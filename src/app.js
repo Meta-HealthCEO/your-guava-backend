@@ -5,6 +5,7 @@ const cookieParser = require('cookie-parser');
 const helmet = require('helmet');
 const { globalLimiter } = require('./middleware/rateLimit.middleware');
 const { configureTrustProxy } = require('./config/proxy');
+const { workforceEnabled } = require('./config/flags');
 const {
   requestContext,
   requestLogger,
@@ -76,10 +77,7 @@ if (yocoIntegrationEnabled()) {
 app.use('/api/events', eventsRoutes);
 app.use('/api/team', teamRoutes);
 app.use('/api/analytics', analyticsRoutes);
-const workforceEnabled =
-  process.env.NODE_ENV === 'test' ||
-  String(process.env.WORKFORCE_ENABLED || '').toLowerCase() === 'true';
-if (workforceEnabled) {
+if (workforceEnabled()) {
   app.use('/api/staff', staffRoutes);
   app.use('/api/shifts', shiftsRoutes);
   app.use('/api/leave', leaveRoutes);

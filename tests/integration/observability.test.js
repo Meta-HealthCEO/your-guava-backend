@@ -44,11 +44,10 @@ describe('Observability', () => {
   });
 
   it('logs the mounted request path without the query string', async () => {
-    // Request logs are off under NODE_ENV=test; flip it for one request so the
-    // logger runs, then read the structured line it wrote.
-    const previousNodeEnv = process.env.NODE_ENV;
+    // Request logs are off in tests (tests/env.js); switch them on for one request.
+    const previousRequestLogs = process.env.REQUEST_LOGS_ENABLED;
     const infoSpy = jest.spyOn(console, 'info').mockImplementation(() => {});
-    process.env.NODE_ENV = 'production';
+    process.env.REQUEST_LOGS_ENABLED = 'true';
     let entries;
     try {
       await request.get('/api/auth/me').query({ token: 'should-not-be-logged' });
@@ -63,7 +62,7 @@ describe('Observability', () => {
         })
         .filter((entry) => entry && entry.event === 'http_request');
     } finally {
-      process.env.NODE_ENV = previousNodeEnv;
+      process.env.REQUEST_LOGS_ENABLED = previousRequestLogs;
       infoSpy.mockRestore();
     }
 

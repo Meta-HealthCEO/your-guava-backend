@@ -1,6 +1,10 @@
 const rateLimit = require('express-rate-limit');
 
-const isTest = () => process.env.NODE_ENV === 'test';
+const { rateLimitsEnabled } = require('../config/flags');
+
+// Limiters are on unless RATE_LIMITS_ENABLED=false. Tests set that (tests/env.js); production refuses it
+// (validateEnv). tests/integration/rateLimits.test.js runs with them on.
+const limitsOff = () => !rateLimitsEnabled();
 
 // Loose global limiter — protects against runaway clients and basic scraping.
 const globalLimiter = rateLimit({
@@ -8,7 +12,7 @@ const globalLimiter = rateLimit({
   limit: 600,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skip: isTest,
+  skip: limitsOff,
   message: { success: false, message: 'Too many requests, please slow down' },
 });
 
@@ -31,7 +35,7 @@ const AUTH_LIMIT_MESSAGES = {
   changePassword: 'Too many password change attempts. Please wait 15 minutes.',
 };
 
-const createAuthLimiters = ({ skip = isTest, limits = {} } = {}) => {
+const createAuthLimiters = ({ skip = limitsOff, limits = {} } = {}) => {
   const build = (name, extra = {}) => {
     const config = { ...AUTH_LIMITS[name], ...(limits[name] || {}) };
     return rateLimit({
@@ -66,7 +70,7 @@ const refreshLimiter = rateLimit({
   limit: 100,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skip: isTest,
+  skip: limitsOff,
   message: { success: false, message: 'Too many refresh attempts, please try again later' },
 });
 
@@ -77,7 +81,7 @@ const inviteLimiter = rateLimit({
   limit: 20,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skip: isTest,
+  skip: limitsOff,
   message: { success: false, message: 'Too many invitation attempts, please try again later' },
 });
 
@@ -88,7 +92,7 @@ const writeLimiter = rateLimit({
   limit: 20,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skip: isTest,
+  skip: limitsOff,
   // Always runs after authMiddleware, so req.user.id is the real key; the IP
   // fallback is a safety net only, hence the IP-fallback validation is disabled.
   keyGenerator: (req) => req.user?.id || req.ip,
@@ -104,7 +108,7 @@ const aiLimiter = rateLimit({
   limit: AI_LIMIT,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skip: isTest,
+  skip: limitsOff,
   keyGenerator: (req) => `${req.user?.orgId || 'unknown'}:${req.user?.id || req.ip}`,
   validate: { keyGeneratorIpFallback: false },
   message: {
@@ -125,7 +129,7 @@ const uploadLimiter = rateLimit({
   limit: UPLOAD_LIMIT,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skip: isTest,
+  skip: limitsOff,
   keyGenerator: (req) => req.user?.id || req.ip,
   validate: { keyGeneratorIpFallback: false },
   message: {
@@ -144,7 +148,7 @@ const parseLimiter = rateLimit({
   limit: PARSE_LIMIT,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skip: isTest,
+  skip: limitsOff,
   keyGenerator: (req) => req.user?.id || req.ip,
   validate: { keyGeneratorIpFallback: false },
   message: {
@@ -157,6 +161,7 @@ const parseLimiter = rateLimit({
 // Exposed so tests can assert the budgets stay in the right relationship to each
 // other without reaching into express-rate-limit internals.
 const getLimiterOptions = (name) => {
+  if (name === 'login') return { limit: AUTH_LIMITS.login.limit, windowMs: AUTH_LIMITS.login.windowMs };
   if (name === 'ai') return { limit: AI_LIMIT, windowMs: 60 * 1000 };
   if (name === 'upload') return { limit: UPLOAD_LIMIT, windowMs: 60 * 1000 };
   if (name === 'parse') return { limit: PARSE_LIMIT, windowMs: 60 * 1000 };

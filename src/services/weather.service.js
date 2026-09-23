@@ -112,12 +112,16 @@ const runDedupe = async (pendingKey, fn) => {
  * @param {Date|string} date
  * @returns {Promise<object>}
  */
+let warnedUnconfigured = false;
+
 const getWeatherForecast = async (lat, lng, date) => {
   const apiKey = process.env.WEATHER_API_KEY;
   const baseUrl = process.env.WEATHER_API_URL;
 
   if (!apiKey || !baseUrl) {
-    if (process.env.NODE_ENV !== 'test') {
+    // Log-only, once per process: a missing key is a configuration fact, not a per-request event.
+    if (!warnedUnconfigured) {
+      warnedUnconfigured = true;
       console.warn('[weather] WEATHER_API_KEY or WEATHER_API_URL not set');
     }
     return unavailableWeatherSignal('Weather service is not configured');

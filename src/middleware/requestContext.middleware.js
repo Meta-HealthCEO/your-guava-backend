@@ -1,11 +1,10 @@
 const crypto = require('crypto');
+const { requestLogsEnabled } = require('../config/flags');
 
 const REQUEST_ID_HEADER = 'X-Request-Id';
 const REQUEST_ID_PATTERN = /^[a-zA-Z0-9._:-]{8,128}$/;
 
-const logsEnabled = () =>
-  process.env.NODE_ENV !== 'test' &&
-  String(process.env.REQUEST_LOGS_ENABLED || 'true').toLowerCase() !== 'false';
+const logsEnabled = () => requestLogsEnabled();
 
 const generateRequestId = () => {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();

@@ -9,6 +9,18 @@ const toDateKey = (date) => {
 };
 
 describe('weather service', () => {
+  it('warns once per process, not once per call, when weather is not configured', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    process.env.WEATHER_API_KEY = '';
+    await jest.isolateModulesAsync(async () => {
+      const { getWeatherForecast: fresh } = require('../../src/services/weather.service');
+      await fresh(-33.9, 18.4, new Date());
+      await fresh(-33.9, 18.4, new Date());
+    });
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
   const originalKey = process.env.WEATHER_API_KEY;
   const originalUrl = process.env.WEATHER_API_URL;
 

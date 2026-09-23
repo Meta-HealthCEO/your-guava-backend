@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { backgroundJobsInline } = require('../config/flags');
 const fs = require('fs');
 const crypto = require('crypto');
 const Upload = require('../models/Upload.model');
@@ -684,7 +685,7 @@ const schedulePostImportMaintenance = async (uploadId, cafeId, dateRange, timezo
     dateRange,
     maintenance: { status: 'queued' },
   };
-  if (process.env.NODE_ENV === 'test') {
+  if (backgroundJobsInline()) {
     await claimAndRunPostImportMaintenance(candidate, timezone);
     return;
   }

@@ -30,7 +30,8 @@ const withEnv = async (overrides, fn) => {
 describe('origin checks run in every non-test environment', () => {
   it.each(['development', 'staging', 'production'])('NODE_ENV=%s refuses foreign and missing origins', async (nodeEnv) => {
     jest.spyOn(console, 'info').mockImplementation(() => {});
-    await withEnv({ NODE_ENV: nodeEnv, CLIENT_URL: 'http://localhost:5185' }, async () => {
+    // The test env switches origin checks off (tests/env.js); these cases exist to prove they are on.
+    await withEnv({ NODE_ENV: nodeEnv, CLIENT_URL: 'http://localhost:5185', ORIGIN_CHECKS_ENABLED: 'true' }, async () => {
       const body = { email: 'nobody@yourguava.com', password: 'password123' };
       expect((await request.post('/api/auth/login').set('Origin', 'http://evil.example').send(body)).status).toBe(403);
       expect((await request.post('/api/auth/login').send(body)).status).toBe(403);

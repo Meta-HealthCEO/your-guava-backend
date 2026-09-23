@@ -84,9 +84,7 @@ const computeReadiness = async () => {
   const databaseState = DB_STATES[mongoose.connection.readyState] || 'unknown';
   const database = await databaseCapability();
   const required = requiredEnvNames();
-  const storage = typeof r2.getConfigurationStatus === 'function'
-    ? r2.getConfigurationStatus()
-    : { ok: true, configured: true, mode: 'test-double', missing: [] };
+  const storage = r2.getConfigurationStatus();
   let environmentValid = true;
   try {
     validateEnv();

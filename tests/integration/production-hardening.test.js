@@ -1,3 +1,9 @@
+// The bounded menu-review request must reach the model once (BE-12-T01): test mode no longer disables paid AI.
+const mockAnthropicMessageCreate = jest.fn(() => Promise.reject(new Error('unexpected Anthropic call in production-hardening')));
+jest.mock('@anthropic-ai/sdk', () => jest.fn().mockImplementation(() => ({
+  messages: { create: mockAnthropicMessageCreate },
+})));
+
 const supertest = require('supertest');
 const {
   setup,
@@ -513,7 +519,14 @@ describe('production hardening regressions', () => {
     expect(read.status).toBe(200);
     expect(read.body.meta.paidAiUsed).toBe(false);
     expect(await UsageLedger.countDocuments({})).toBe(0);
+    expect(mockAnthropicMessageCreate).not.toHaveBeenCalled();
 
+    mockAnthropicMessageCreate.mockResolvedValueOnce({
+      id: 'menu-review-request',
+      model: 'test-model',
+      usage: { input_tokens: 20, output_tokens: 10 },
+      content: [{ type: 'text', text: JSON.stringify({ action: 'confirm', category: 'coffee', confidence: 0.8, reason: 'A standalone drink.' }) }],
+    });
     const bounded = await request
       .post('/api/items/reconciliation/suggestions')
       .set('Authorization', `Bearer ${owner.token}`)
@@ -521,9 +534,10 @@ describe('production hardening regressions', () => {
       .send({ itemIds: items.slice(0, 1).map((item) => item._id) });
     expect(bounded.status).toBe(200);
     expect(bounded.body.meta).toEqual(
-      expect.objectContaining({ requested: 1, paidAiUsed: false, paidAiCount: 0 })
+      expect.objectContaining({ requested: 1, paidAiUsed: true, paidAiCount: 1 })
     );
-    expect(await UsageLedger.countDocuments({})).toBe(0);
+    expect(mockAnthropicMessageCreate).toHaveBeenCalledTimes(1);
+    expect(await UsageLedger.countDocuments({ status: 'committed' })).toBe(1);
 
     const oversized = await request
       .post('/api/items/reconciliation/suggestions')
@@ -532,7 +546,8 @@ describe('production hardening regressions', () => {
       .send({ itemIds: items.map((item) => item._id) });
     expect(oversized.status).toBe(400);
     expect(oversized.body.message).toMatch(/maximum of 10/i);
-    expect(await UsageLedger.countDocuments({})).toBe(0);
+    expect(mockAnthropicMessageCreate).toHaveBeenCalledTimes(1);
+    expect(await UsageLedger.countDocuments({ status: 'committed' })).toBe(1);
   });
 
   it('rate limits the upload route with an upload budget, not the much tighter AI budget', () => {

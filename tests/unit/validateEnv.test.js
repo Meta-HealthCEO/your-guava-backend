@@ -1,6 +1,9 @@
 const validateEnv = require('../../src/config/validateEnv');
 
 const KEYS = [
+  'RATE_LIMITS_ENABLED',
+  'BACKGROUND_JOBS_INLINE',
+  'ORIGIN_CHECKS_ENABLED',
   'READINESS_TOKEN',
   'NODE_ENV',
   'JWT_SECRET',
@@ -51,6 +54,11 @@ const restoreEnv = (snapshot) => {
 
 const setProductionBaseEnv = () => {
   process.env.NODE_ENV = 'production';
+  // The test env sets these switches (tests/env.js); a production run starts from the production defaults.
+  delete process.env.RATE_LIMITS_ENABLED;
+  delete process.env.BACKGROUND_JOBS_INLINE;
+  delete process.env.ORIGIN_CHECKS_ENABLED;
+  delete process.env.BCRYPT_ROUNDS;
   process.env.JWT_SECRET = 'x'.repeat(32);
   process.env.JWT_REFRESH_SECRET = 'y'.repeat(32);
   process.env.MONGODB_URI = 'mongodb://localhost:27017/guava-test';
@@ -248,7 +256,7 @@ describe('validateEnv', () => {
     process.env.JWT_SECRET = 'dev-secret';
     process.env.JWT_REFRESH_SECRET = 'dev-refresh-secret';
     process.env.MONGODB_URI = 'mongodb://localhost:27017/guava-dev';
-    expect(() => validateEnv()).toThrow(/CLIENT_URL is required outside tests/);
+    expect(() => validateEnv()).toThrow(/CLIENT_URL is required/);
     process.env.CLIENT_URL = 'http://localhost:5185';
     expect(() => validateEnv()).not.toThrow();
 
@@ -260,5 +268,29 @@ describe('validateEnv', () => {
     process.env.JWT_REFRESH_SECRET = 'y'.repeat(32);
     process.env.TOKEN_ENCRYPTION_KEY = 'z'.repeat(32);
     expect(() => validateEnv()).not.toThrow();
+  });
+
+  it('rejects production startup with rate limits switched off', () => {
+    setProductionBaseEnv();
+    setProductionBillingEnv();
+    process.env.RATE_LIMITS_ENABLED = 'false';
+    expect(() => validateEnv()).toThrow(/RATE_LIMITS_ENABLED cannot be false in production/);
+  });
+
+  it('rejects production startup with background jobs forced inline', () => {
+    setProductionBaseEnv();
+    setProductionBillingEnv();
+    process.env.BACKGROUND_JOBS_INLINE = 'true';
+    expect(() => validateEnv()).toThrow(/BACKGROUND_JOBS_INLINE cannot be true in production/);
+  });
+
+  it('rejects a staging startup with origin checks switched off', () => {
+    setProductionBaseEnv();
+    setProductionBillingEnv();
+    process.env.NODE_ENV = 'staging';
+    process.env.ORIGIN_CHECKS_ENABLED = 'false';
+    expect(() => validateEnv()).toThrow(/ORIGIN_CHECKS_ENABLED cannot be false outside development and test/);
+    process.env.NODE_ENV = 'development';
+    expect(() => validateEnv()).not.toThrow(/ORIGIN_CHECKS_ENABLED/);
   });
 });

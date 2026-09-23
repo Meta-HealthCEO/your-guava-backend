@@ -1,4 +1,4 @@
-const { isTestEnvironment, isRelaxedEnvironment, isHardenedEnvironment, refreshCookieOptions } = require('../../src/config/posture');
+const { isRelaxedEnvironment, isHardenedEnvironment, refreshCookieOptions } = require('../../src/config/posture');
 
 describe('environment posture', () => {
   const original = process.env.NODE_ENV;
@@ -13,7 +13,6 @@ describe('environment posture', () => {
     ['', false, false],
   ])('NODE_ENV=%p: test=%p relaxed=%p', (value, test, relaxed) => {
     process.env.NODE_ENV = value;
-    expect(isTestEnvironment()).toBe(test);
     expect(isRelaxedEnvironment()).toBe(relaxed);
     expect(isHardenedEnvironment()).toBe(!relaxed);
   });

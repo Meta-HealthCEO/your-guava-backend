@@ -7,6 +7,7 @@ jest.mock('../../src/services/r2.service', () => ({
   downloadFile: async (key) => mockR2Files.get(key),
   getSignedDownloadUrl: async (key) => `https://test.r2.local/${key}`,
   deleteFile: async (key) => { mockR2Files.delete(key); },
+  getConfigurationStatus: () => ({ ok: true, configured: false, mode: 'local', missing: [] }),
   _resetClient: () => {},
 }));
 

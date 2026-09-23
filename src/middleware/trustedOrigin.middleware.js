@@ -1,4 +1,4 @@
-const { isTestEnvironment } = require('../config/posture');
+const { originChecksEnabled } = require('../config/flags');
 
 const originOf = (value) => {
   try {
@@ -14,8 +14,8 @@ const originOf = (value) => {
  * reaching the server or setting/rotating a cookie.
  */
 const trustedOrigin = (req, res, next) => {
-  // Every non-test environment checks the origin (platform-18); a missing Origin is refused, as in production.
-  if (isTestEnvironment()) return next();
+  // On everywhere unless the switch is off (tests/env.js turns it off; hardened environments refuse that). A missing Origin is refused.
+  if (!originChecksEnabled()) return next();
 
   const expected = originOf(process.env.CLIENT_URL);
   const received = originOf(req.get('origin'));

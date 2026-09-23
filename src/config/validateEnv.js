@@ -1,5 +1,6 @@
 const { parseTrustProxyHops } = require('./proxy');
-const { isTestEnvironment, isHardenedEnvironment } = require('./posture');
+const { isHardenedEnvironment } = require('./posture');
+const { originChecksEnabled } = require('./flags');
 const PLACEHOLDER_VALUES = new Set([
   'your_jwt_secret_here',
   'your_jwt_refresh_secret_here',
@@ -100,8 +101,11 @@ const validateEnv = () => {
   const proxy = parseTrustProxyHops();
   if (proxy.error) errors.push(proxy.error);
 
-  if (!isTestEnvironment() && !process.env.CLIENT_URL) {
-    errors.push('CLIENT_URL is required outside tests: it is the CORS origin and the only origin trusted for cookie-setting requests');
+  if (!process.env.CLIENT_URL) {
+    errors.push('CLIENT_URL is required: it is the CORS origin and the only origin trusted for cookie-setting requests');
+  }
+  if (isHardenedEnvironment() && !originChecksEnabled()) {
+    errors.push('ORIGIN_CHECKS_ENABLED cannot be false outside development and test');
   }
   const readinessToken = process.env.READINESS_TOKEN;
   if (readinessToken && readinessToken.length < 32) {
@@ -142,6 +146,12 @@ const validateEnv = () => {
     }
     if (enabled('BILLING_MOCK_ENABLED')) {
       errors.push('BILLING_MOCK_ENABLED cannot be true in production');
+    }
+    if (String(process.env.RATE_LIMITS_ENABLED || '').trim().toLowerCase() === 'false') {
+      errors.push('RATE_LIMITS_ENABLED cannot be false in production');
+    }
+    if (enabled('BACKGROUND_JOBS_INLINE')) {
+      errors.push('BACKGROUND_JOBS_INLINE cannot be true in production');
     }
     const paymentProviderName = (process.env.PAYMENT_PROVIDER || '').trim().toLowerCase();
     if (!['paystack', 'onegate'].includes(paymentProviderName)) {

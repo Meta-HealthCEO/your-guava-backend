@@ -6,7 +6,6 @@ const RELAXED_ENVIRONMENTS = new Set(['development', 'test']);
 const REFRESH_COOKIE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 const nodeEnv = () => String(process.env.NODE_ENV || '').trim().toLowerCase();
-const isTestEnvironment = () => nodeEnv() === 'test';
 const isRelaxedEnvironment = () => RELAXED_ENVIRONMENTS.has(nodeEnv());
 const isHardenedEnvironment = () => !isRelaxedEnvironment();
 
@@ -24,7 +23,6 @@ const refreshCookieOptions = ({ clearing = false } = {}) => {
 
 module.exports = {
   REFRESH_COOKIE_MAX_AGE_MS,
-  isTestEnvironment,
   isRelaxedEnvironment,
   isHardenedEnvironment,
   refreshCookieOptions,

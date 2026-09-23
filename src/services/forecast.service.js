@@ -1,4 +1,5 @@
 const Transaction = require('../models/Transaction.model');
+const { backgroundJobsInline } = require('../config/flags');
 const Item = require('../models/Item.model');
 const Forecast = require('../models/Forecast.model');
 const Event = require('../models/Event.model');
@@ -1100,7 +1101,7 @@ const scheduleForecastRefreshAfterMenuChange = async (cafeId) => {
   // Historical actual recomputation is bounded and may finish asynchronously.
   const timezone = await invalidateFutureForecastsAfterMenuChange(cafeId);
   if (!timezone) return;
-  if (process.env.NODE_ENV === 'test') {
+  if (backgroundJobsInline()) {
     await refreshHistoricalActualsAfterMenuChange(cafeId, timezone);
     return;
   }

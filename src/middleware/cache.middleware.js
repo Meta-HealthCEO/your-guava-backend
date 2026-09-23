@@ -1,3 +1,4 @@
+const { apiCacheEnabled } = require('../config/flags');
 const cacheStore = new Map();
 
 const normaliseQuery = (query = {}) =>
@@ -15,7 +16,7 @@ const trimCache = (maxEntries) => {
 };
 
 const apiCache = ({ ttlMs = 30000, keyPrefix = 'api', maxEntries = 250 } = {}) => (req, res, next) => {
-  if (process.env.NODE_ENV === 'test' || req.method !== 'GET' || req.query.refresh === 'true') {
+  if (!apiCacheEnabled() || req.method !== 'GET' || req.query.refresh === 'true') {
     return next();
   }
 

@@ -169,6 +169,7 @@ describe('Refresh token rotation', () => {
 });
 
 describe('Rate limiter CORS ordering', () => {
+  // Limiters are off in tests (RATE_LIMITS_ENABLED=false); tests/integration/rateLimits.test.js proves the 429 carries CORS.
   it('applies CORS before the global rate limiter so 429 responses carry CORS headers', () => {
     // The limiter skips itself under NODE_ENV=test, so ordering is asserted
     // structurally: a 429 short-circuits the stack, and only middleware mounted
@@ -187,8 +188,11 @@ describe('Browser request origin protection', () => {
   it('rejects a cross-site login POST in production', async () => {
     const previousNodeEnv = process.env.NODE_ENV;
     const previousClientUrl = process.env.CLIENT_URL;
+    const previousOriginChecks = process.env.ORIGIN_CHECKS_ENABLED;
     process.env.NODE_ENV = 'production';
     process.env.CLIENT_URL = 'https://portal.yourguava.example';
+    // The test env switches origin checks off (tests/env.js); production runs with them on.
+    process.env.ORIGIN_CHECKS_ENABLED = 'true';
     try {
       const res = await request
         .post('/api/auth/login')
@@ -201,6 +205,8 @@ describe('Browser request origin protection', () => {
       process.env.NODE_ENV = previousNodeEnv;
       if (previousClientUrl === undefined) delete process.env.CLIENT_URL;
       else process.env.CLIENT_URL = previousClientUrl;
+      if (previousOriginChecks === undefined) delete process.env.ORIGIN_CHECKS_ENABLED;
+      else process.env.ORIGIN_CHECKS_ENABLED = previousOriginChecks;
     }
   });
 });

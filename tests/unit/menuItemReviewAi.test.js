@@ -34,20 +34,15 @@ const aiResponse = (suggestion) => ({
 });
 
 describe('menu item AI review hardening', () => {
-  const originalNodeEnv = process.env.NODE_ENV;
   let logSpy;
 
   beforeEach(() => {
-    // The service short-circuits under NODE_ENV=test, so the AI path can only
-    // be exercised by pretending we are not in the test environment.
-    process.env.NODE_ENV = 'development';
     process.env.ANTHROPIC_API_KEY = 'test-key';
     mockAnthropicMessageCreate.mockReset();
     logSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
   });
 
   afterEach(() => {
-    process.env.NODE_ENV = originalNodeEnv;
     delete process.env.ANTHROPIC_API_KEY;
     jest.restoreAllMocks();
   });
@@ -138,5 +133,17 @@ describe('menu item AI review hardening', () => {
     const result = await suggestMenuItemReview('cafe-1', ITEM, [], usageContext);
 
     expect(result.aiUnavailableReason).toBe('insufficient_credits');
+  });
+
+  it('uses the model when a key is configured and AI was asked for, whatever NODE_ENV says', async () => {
+    process.env.NODE_ENV = 'test';
+    mockAnthropicMessageCreate.mockResolvedValue(aiResponse({
+      action: 'confirm', category: 'coffee', confidence: 0.8, reason: 'A standalone drink.',
+    }));
+
+    const result = await suggestMenuItemReview('cafe-1', ITEM, [], usageContext);
+
+    expect(mockAnthropicMessageCreate).toHaveBeenCalledTimes(1);
+    expect(result.source).toBe('ai');
   });
 });
