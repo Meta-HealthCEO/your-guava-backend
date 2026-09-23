@@ -2,12 +2,8 @@ const crypto = require('crypto');
 const mongoose = require('mongoose');
 const Organization = require('../models/Organization.model');
 const UsageLedger = require('../models/UsageLedger.model');
-const {
-  addBillingCycle,
-  addUtcMonthsClamped,
-  getPlan,
-  nextMonthlyAnniversary,
-} = require('./billingPlans.service');
+const { addUtcMonthsClamped, getPlan, nextMonthlyAnniversary } = require('./billingPlans.service');
+const { asDate, billingAccessForOrganization, billingRequiredError, enforceAiUsagePolicy } = require('./usage/policy');
 
 const FEATURE_COSTS = {
   ask_guava_chat: { credits: 3, label: 'Ask Guava answer', provider: 'anthropic' },
@@ -17,126 +13,16 @@ const FEATURE_COSTS = {
   history_backfill_day: { credits: 1, label: 'Historical forecast backfill day', provider: 'weather' },
 };
 
-const DEFAULT_TRIAL_DAYS = 14;
-const DEFAULT_TRIAL_MS = DEFAULT_TRIAL_DAYS * 24 * 60 * 60 * 1000;
 const DEFAULT_USAGE_RESERVATION_LEASE_MS = 5 * 60 * 1000;
 const DEFAULT_USAGE_RECONCILIATION_BATCH_SIZE = 50;
 const USAGE_DIAGNOSTICS_FIELD = '__usageDiagnostics';
-const AI_FEATURE_KEYS = new Set([
-  'ask_guava_chat',
-  'import_column_mapping',
-  'menu_item_ai_review',
-  'insight_refresh',
-]);
 
-const boundedPolicyInteger = (value, fallback, min, max) => {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed)
-    ? Math.max(min, Math.min(max, parsed))
-    : fallback;
-};
 
-const aiUsagePolicy = () => ({
-  userDailyCredits: boundedPolicyInteger(
-    process.env.AI_USER_DAILY_CREDIT_LIMIT,
-    500,
-    10,
-    100_000
-  ),
-  orgDailyCredits: boundedPolicyInteger(
-    process.env.AI_ORG_DAILY_CREDIT_LIMIT,
-    2_000,
-    10,
-    1_000_000
-  ),
-  userConcurrency: boundedPolicyInteger(
-    process.env.AI_USER_CONCURRENCY_LIMIT,
-    2,
-    1,
-    20
-  ),
-  orgConcurrency: boundedPolicyInteger(
-    process.env.AI_ORG_CONCURRENCY_LIMIT,
-    8,
-    1,
-    100
-  ),
-});
 
-const asDate = (value) => {
-  if (!value) return null;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
-};
 
-const inferredTrialEnd = (org) => {
-  const explicit = asDate(org?.trialEndsAt);
-  if (explicit) return explicit;
-  const createdAt = asDate(org?.createdAt || org?.trialStartedAt);
-  return createdAt ? new Date(createdAt.getTime() + DEFAULT_TRIAL_MS) : null;
-};
 
-const inferredCurrentPeriodEnd = (org) => {
-  const explicit = asDate(org?.currentPeriodEnd);
-  if (explicit) return explicit;
-  const startedAt = asDate(org?.subscriptionStartedAt || org?.currentPeriodStart);
-  return startedAt ? addBillingCycle(startedAt, org?.billingCycle) : null;
-};
 
-const billingAccessForOrganization = (org, now = new Date()) => {
-  if (!org) {
-    return { allowed: false, status: 'missing', reason: 'organization_missing', periodEnd: null };
-  }
 
-  const current = asDate(now) || new Date();
-  const status = org.billingStatus || 'past_due';
-  if (status === 'trialing') {
-    const periodEnd = inferredTrialEnd(org);
-    const allowed = Boolean(periodEnd && periodEnd > current);
-    return {
-      allowed,
-      status: allowed ? status : 'past_due',
-      storedStatus: status,
-      reason: allowed ? null : 'trial_expired',
-      periodEnd,
-      trialEndsAt: periodEnd,
-    };
-  }
-
-  if (status === 'active') {
-    const periodEnd = inferredCurrentPeriodEnd(org);
-    const allowed = Boolean(periodEnd && periodEnd > current);
-    return {
-      allowed,
-      status: allowed ? status : 'past_due',
-      storedStatus: status,
-      reason: allowed ? null : 'billing_period_expired',
-      periodEnd,
-      currentPeriodEnd: periodEnd,
-    };
-  }
-
-  return {
-    allowed: false,
-    status,
-    storedStatus: status,
-    reason: status === 'canceled' ? 'subscription_canceled' : 'payment_required',
-    periodEnd: inferredCurrentPeriodEnd(org) || inferredTrialEnd(org),
-  };
-};
-
-const billingRequiredError = (access) => {
-  const err = new Error('An active trial or paid billing period is required');
-  err.statusCode = 402;
-  err.code = 'BILLING_REQUIRED';
-  err.details = {
-    code: err.code,
-    billingStatus: access?.status || 'past_due',
-    reason: access?.reason || 'payment_required',
-    periodEnd: access?.periodEnd || null,
-  };
-  return err;
-};
 
 /**
  * The instant the paid credit window is anchored on: the start of the billing
@@ -564,110 +450,7 @@ const withUsageDiagnostics = (result, providerDiagnostics) => {
   };
 };
 
-const aiPolicyError = (code, message, details) => {
-  const error = new Error(message);
-  error.statusCode = 429;
-  error.code = code;
-  error.details = { code, ...details };
-  return error;
-};
 
-const enforceAiUsagePolicy = async ({ orgId, userId, featureKey, credits }, session) => {
-  if (!AI_FEATURE_KEYS.has(featureKey)) return;
-  const limits = aiUsagePolicy();
-  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const activeStatuses = ['reserved', 'recovering'];
-  const policyOrgId = mongoose.Types.ObjectId.isValid(orgId)
-    ? new mongoose.Types.ObjectId(orgId)
-    : orgId;
-  const policyUserId = mongoose.Types.ObjectId.isValid(userId)
-    ? new mongoose.Types.ObjectId(userId)
-    : userId;
-
-  const [userDaily, orgDaily, userConcurrent, orgConcurrent] = await Promise.all([
-    UsageLedger.aggregate([
-      {
-        $match: {
-          orgId: policyOrgId,
-          userId: policyUserId,
-          featureKey: { $in: [...AI_FEATURE_KEYS] },
-          status: { $in: ['reserved', 'recovering', 'committed'] },
-          // An $expr over a computed field cannot use an index, so this used to
-          // scan every ledger row the organisation had ever written -- inside
-          // the reservation transaction, on every paid AI request. The $or is
-          // the same 24-hour window as an indexable range plus a legacy branch
-          // for rows written before reservedAt existed.
-          $or: [
-            { reservedAt: { $gte: since } },
-            { reservedAt: null, createdAt: { $gte: since } },
-          ],
-        },
-      },
-      { $group: { _id: null, credits: { $sum: '$credits' } } },
-    ]).session(session),
-    UsageLedger.aggregate([
-      {
-        $match: {
-          orgId: policyOrgId,
-          featureKey: { $in: [...AI_FEATURE_KEYS] },
-          status: { $in: ['reserved', 'recovering', 'committed'] },
-          // An $expr over a computed field cannot use an index, so this used to
-          // scan every ledger row the organisation had ever written -- inside
-          // the reservation transaction, on every paid AI request. The $or is
-          // the same 24-hour window as an indexable range plus a legacy branch
-          // for rows written before reservedAt existed.
-          $or: [
-            { reservedAt: { $gte: since } },
-            { reservedAt: null, createdAt: { $gte: since } },
-          ],
-        },
-      },
-      { $group: { _id: null, credits: { $sum: '$credits' } } },
-    ]).session(session),
-    UsageLedger.countDocuments({
-      orgId: policyOrgId,
-      userId: policyUserId,
-      featureKey: { $in: [...AI_FEATURE_KEYS] },
-      status: { $in: activeStatuses },
-    }).session(session),
-    UsageLedger.countDocuments({
-      orgId: policyOrgId,
-      featureKey: { $in: [...AI_FEATURE_KEYS] },
-      status: { $in: activeStatuses },
-    }).session(session),
-  ]);
-
-  const userUsed = Number(userDaily[0]?.credits) || 0;
-  const orgUsed = Number(orgDaily[0]?.credits) || 0;
-  if (userUsed + credits > limits.userDailyCredits) {
-    throw aiPolicyError(
-      'AI_USER_DAILY_BUDGET_REACHED',
-      'Your daily AI credit safety limit has been reached',
-      { limit: limits.userDailyCredits, used: userUsed, required: credits }
-    );
-  }
-  if (orgUsed + credits > limits.orgDailyCredits) {
-    throw aiPolicyError(
-      'AI_ORG_DAILY_BUDGET_REACHED',
-      'The organization daily AI credit safety limit has been reached',
-      { limit: limits.orgDailyCredits, used: orgUsed, required: credits }
-    );
-  }
-  if (userConcurrent >= limits.userConcurrency) {
-    throw aiPolicyError(
-      'AI_USER_CONCURRENCY_LIMIT',
-      'You already have the maximum number of AI requests in progress',
-      { limit: limits.userConcurrency }
-    );
-  }
-  if (orgConcurrent >= limits.orgConcurrency) {
-    throw aiPolicyError(
-      'AI_ORG_CONCURRENCY_LIMIT',
-      'The organization already has the maximum number of AI requests in progress',
-      { limit: limits.orgConcurrency }
-    );
-  }
-};
 
 const createMeteredReservation = async ({ idempotencyKey, credits, ...payload }) => {
   const key = cleanIdempotencyKey(idempotencyKey);
