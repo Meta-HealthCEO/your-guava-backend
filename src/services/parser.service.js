@@ -7,14 +7,11 @@ const {
   addZonedDays, zonedDayOrdinal, zonedDateKey, zonedDayOfWeek, processLocalCalendarDate,
 } = require('../utils/timezone');
 const { parserLimits, createClientInputError, tooManyColumnsError } = require('./parser/limits');
+const { SOURCE_ROW_NUMBERS, sourceRowNumber, setSourceRowNumbers, addRowError } = require('./parser/rowErrors');
 
 const REQUIRED_FIELDS = ['date', 'items', 'total'];
 const UNNAMED_COLUMN_RE = /^_(\d+)$/;
 const VALID_ITEMS_MODES = new Set(['packed', 'line-per-row']);
-const SOURCE_ROW_NUMBERS = '__sourceRowNumbers';
-const MAX_ROW_ERRORS = 50;
-const MAX_ROW_ERROR_COLUMNS = 12;
-const MAX_ROW_ERROR_VALUE_LENGTH = 160;
 // A column name, not a cell. Clipped before anything reads it, so no check
 // downstream (the PII guard, the POS preset, the AI prompt) sees a runaway line.
 const MAX_HEADER_CHARS = 200;
@@ -1330,49 +1327,6 @@ const readRows = (buffer, fileExt) => {
         settled = true;
         resolve(normaliseRows(rows));
       });
-  });
-};
-
-const sourceRowNumber = (raw, fallbackIndex = 0) =>
-  Array.isArray(raw?.[SOURCE_ROW_NUMBERS]) && raw[SOURCE_ROW_NUMBERS][0]
-    ? raw[SOURCE_ROW_NUMBERS][0]
-    : fallbackIndex + 2;
-
-const setSourceRowNumbers = (row, rowNumbers) => {
-  Object.defineProperty(row, SOURCE_ROW_NUMBERS, {
-    value: [...rowNumbers],
-    enumerable: false,
-    configurable: true,
-  });
-  return row;
-};
-
-const serialiseRowErrorValue = (value) => {
-  if (value instanceof Date) return value.toISOString();
-  if (value == null) return '';
-
-  const stringValue = typeof value === 'object'
-    ? JSON.stringify(value)
-    : String(value);
-
-  return stringValue.length > MAX_ROW_ERROR_VALUE_LENGTH
-    ? `${stringValue.slice(0, MAX_ROW_ERROR_VALUE_LENGTH)}...`
-    : stringValue;
-};
-
-const serialiseRowErrorRaw = (raw) =>
-  Object.fromEntries(
-    Object.entries(raw || {})
-      .slice(0, MAX_ROW_ERROR_COLUMNS)
-      .map(([key, value]) => [key, serialiseRowErrorValue(value)])
-  );
-
-const addRowError = (rowErrors, rowNumber, reason, raw) => {
-  if (rowErrors.length >= MAX_ROW_ERRORS) return;
-  rowErrors.push({
-    rowNumber,
-    reason,
-    raw: serialiseRowErrorRaw(raw),
   });
 };
 
