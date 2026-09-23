@@ -2,34 +2,13 @@ const mongoose = require('mongoose');
 const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const jwt = require('jsonwebtoken');
 
-// Set env vars before requiring app
-process.env.JWT_SECRET = 'test-jwt-secret-key-12345';
-process.env.JWT_REFRESH_SECRET = 'test-jwt-refresh-secret-key-12345';
-process.env.JWT_EXPIRES_IN = '15m';
-process.env.JWT_REFRESH_EXPIRES_IN = '7d';
-process.env.NODE_ENV = 'test';
-process.env.BCRYPT_ROUNDS = '4'; // one cost everywhere; cheap in tests only
-// The mock billing path is exercised deliberately by the billing suites, so
-// the test environment opts in explicitly. It is no longer implied by
-// NODE_ENV: a staging deploy that never set this flag was handing out plan
-// upgrades and credit packs for free. See DECISIONS D-010.
-process.env.BILLING_MOCK_ENABLED = 'true';
-process.env.WEATHER_API_KEY = '';
-process.env.WEATHER_API_URL = '';
-delete process.env.YOCO_INTEGRATION_ENABLED;
-delete process.env.RESEND_API_KEY;
-delete process.env.RESEND_FROM_EMAIL;
-delete process.env.RESEND_REPLY_TO;
-delete process.env.PAYMENT_PROVIDER;
-delete process.env.ONEGATE_API_URL;
-delete process.env.ONEGATE_ORGANISATION_ID;
-delete process.env.ONEGATE_ORG_ID;
-delete process.env.ONEGATE_API_SALT;
-delete process.env.API_PUBLIC_URL;
-process.env.R2_ACCOUNT_ID = '';
-process.env.R2_ACCESS_KEY_ID = '';
-process.env.R2_SECRET_ACCESS_KEY = '';
-process.env.R2_BUCKET_NAME = '';
+// The test environment is set in tests/env.js (Jest setupFiles), before any module loads.
+// Do not set env here: by the time a test requires this file, other modules may already have read it.
+// Outbound network is refused by tests/hermetic.js (Jest setupFilesAfterEnv), which patches http/https request and get and
+// global fetch for every test file, including the unit files that never load this helper. Refuse to run without it.
+if (!globalThis.__guavaNetworkGuard) {
+  throw new Error('tests/hermetic.js did not run: jest.config.js must list it in setupFilesAfterEnv (BE-12-T01)');
+}
 
 const app = require('../src/app');
 

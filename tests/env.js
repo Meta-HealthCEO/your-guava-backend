@@ -1,0 +1,70 @@
+/**
+ * Runs before every test file (setupFiles), before any module under test is loaded.
+ * Every variable src reads is deleted, then TEST_ENV is applied, so neither a developer's shell
+ * nor a .env can change what the suite runs. Adding process.env.X to src? Add X here; the
+ * completeness test in tests/unit/testEnvironment.test.js fails until you do.
+ */
+const HERMETIC_ENV_NAMES = [
+  'ACCOUNTING_INTEGRATIONS_ENABLED', 'AI_ORG_CONCURRENCY_LIMIT', 'AI_ORG_DAILY_CREDIT_LIMIT',
+  'AI_USER_CONCURRENCY_LIMIT', 'AI_USER_DAILY_CREDIT_LIMIT', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MAX_RETRIES',
+  'ANTHROPIC_MODEL', 'ANTHROPIC_TIMEOUT_MS', 'API_CACHE_ENABLED', 'API_PUBLIC_URL', 'BACKGROUND_JOBS_INLINE',
+  'BCRYPT_ROUNDS', 'BILLING_MOCK_ENABLED', 'CLIENT_URL', 'DEFAULT_TIMEZONE', 'EMAIL_CONSOLE_LINKS',
+  'EMAIL_DEV_CONSOLE', 'ESKOMSEPUSH_API_KEY', 'EVENT_LOOP_LOG_INTERVAL_MS',
+  'JWT_EXPIRES_IN', 'JWT_REFRESH_EXPIRES_IN', 'JWT_REFRESH_SECRET', 'JWT_SECRET', 'MONGODB_URI',
+  'ONEGATE_API_SALT', 'ONEGATE_API_URL', 'ONEGATE_ORGANISATION_ID', 'ONEGATE_ORG_ID', 'ORIGIN_CHECKS_ENABLED',
+  'PAYMENT_PROVIDER', 'PAYMENT_RECONCILIATION_INTERVAL_MS', 'PAYSTACK_API_URL', 'PAYSTACK_CURRENCY',
+  'PAYSTACK_SECRET_KEY', 'PORT', 'PUBLIC_HOLIDAY_OVERRIDES', 'QUICKBOOKS_CLIENT_ID', 'QUICKBOOKS_CLIENT_SECRET',
+  'QUICKBOOKS_ENV', 'QUICKBOOKS_REDIRECT_URI', 'R2_ACCESS_KEY_ID', 'R2_ACCOUNT_ID', 'R2_BUCKET_NAME',
+  'R2_SECRET_ACCESS_KEY', 'RATE_LIMITS_ENABLED', 'READINESS_TOKEN', 'REQUEST_LOGS_ENABLED', 'RESEND_API_KEY',
+  'RESEND_FROM_EMAIL', 'RESEND_REPLY_TO', 'SAGE_CLIENT_ID', 'SAGE_CLIENT_SECRET', 'SAGE_REDIRECT_URI',
+  'SA_PUBLIC_HOLIDAY_OVERRIDES', 'SA_SCHOOL_TERM_OVERRIDES', 'SCHOOL_CALENDAR_OVERRIDES', 'SCHOOL_TERM_OVERRIDES',
+  'SEED_CAFE_ADDRESS', 'SEED_CAFE_CITY', 'SEED_CAFE_NAME', 'SEED_FORCE', 'SEED_IMPORT_FILE', 'SEED_ORG_NAME',
+  'SEED_USER_EMAIL', 'SEED_USER_NAME', 'SEED_USER_PASSWORD', 'SHUTDOWN_TIMEOUT_MS', 'TEAM_INVITE_TTL_HOURS',
+  'TOKEN_ENCRYPTION_KEY', 'TRUST_PROXY_HOPS', 'UPLOAD_CLEANUP_INTERVAL_MS', 'UPLOAD_MAINTENANCE_MAX_ATTEMPTS',
+  'UPLOAD_MAINTENANCE_RETRY_MS', 'UPLOAD_MAX_ABSOLUTE_AMOUNT', 'UPLOAD_MAX_BYTES', 'UPLOAD_MAX_CELL_CHARS',
+  'UPLOAD_MAX_COLUMNS', 'UPLOAD_MAX_DATE_RANGE_DAYS', 'UPLOAD_MAX_FUTURE_DAYS', 'UPLOAD_MAX_IDENTIFIER_CHARS',
+  'UPLOAD_MAX_ITEMS_PER_TRANSACTION', 'UPLOAD_MAX_ITEM_NAME_CHARS', 'UPLOAD_MAX_ITEM_QUANTITY', 'UPLOAD_MAX_ROWS',
+  'UPLOAD_MAX_ROW_BYTES', 'UPLOAD_MIN_YEAR', 'UPLOAD_PARSING_LEASE_MS', 'UPLOAD_PENDING_RETENTION_MS',
+  'USAGE_RECONCILIATION_INTERVAL_MS', 'WEATHER_API_KEY', 'WEATHER_API_URL', 'WORKFORCE_ENABLED', 'XERO_CLIENT_ID',
+  'XERO_CLIENT_SECRET', 'XERO_REDIRECT_URI', 'XLSX_MAX_COMPRESSION_RATIO', 'XLSX_MAX_ENTRIES',
+  'XLSX_MAX_ENTRY_UNCOMPRESSED_BYTES', 'XLSX_MAX_PART_BYTES', 'XLSX_MAX_TOTAL_UNCOMPRESSED_BYTES', 'YOCO_API_URL',
+  'YOCO_CLIENT_ID', 'YOCO_CLIENT_SECRET', 'YOCO_IAM_URL', 'YOCO_INTEGRATION_ENABLED', 'YOCO_REDIRECT_URI',
+  'YOCO_WEBHOOK_SECRET',
+];
+
+const TEST_ENV = {
+  NODE_ENV: 'test',
+  JWT_SECRET: 'test-jwt-secret-key-12345',
+  JWT_REFRESH_SECRET: 'test-jwt-refresh-secret-key-12345',
+  JWT_EXPIRES_IN: '15m',
+  JWT_REFRESH_EXPIRES_IN: '7d',
+  // One bcrypt cost everywhere (BE-02-T07); cheap in tests only.
+  BCRYPT_ROUNDS: '4',
+  // D-010: the billing suites exercise mock checkout deliberately, so the test env opts in explicitly.
+  BILLING_MOCK_ENABLED: 'true',
+  // The switches that replaced the test branch on NODE_ENV (src/config/flags.js). A test that needs the
+  // production behaviour sets the switch back at the top of its file, before requiring ../setup.
+  WORKFORCE_ENABLED: 'true',
+  API_CACHE_ENABLED: 'false',
+  RATE_LIMITS_ENABLED: 'false',
+  REQUEST_LOGS_ENABLED: 'false',
+  BACKGROUND_JOBS_INLINE: 'true',
+  // Origin checks are on everywhere but tests (tests/integration/rateLimits.test.js and BE-02-T06's posture tests turn them on).
+  ORIGIN_CHECKS_ENABLED: 'false',
+  // validateEnv requires CLIENT_URL everywhere. This is the fallback the email and payment links already used, so no link changes.
+  CLIENT_URL: 'http://localhost:5173',
+  // External services: off. A test that wants one sets a key and mocks the client at the service boundary.
+  ANTHROPIC_API_KEY: '',
+  ESKOMSEPUSH_API_KEY: '',
+  WEATHER_API_KEY: '',
+  WEATHER_API_URL: '',
+  R2_ACCOUNT_ID: '',
+  R2_ACCESS_KEY_ID: '',
+  R2_SECRET_ACCESS_KEY: '',
+  R2_BUCKET_NAME: '',
+};
+
+for (const name of HERMETIC_ENV_NAMES) delete process.env[name];
+Object.assign(process.env, TEST_ENV);
+
+module.exports = { HERMETIC_ENV_NAMES, TEST_ENV };
