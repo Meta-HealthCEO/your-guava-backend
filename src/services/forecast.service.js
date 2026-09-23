@@ -1,29 +1,30 @@
-const {
-  MIN_HISTORY_WEEKS, requiredHistoryWeeks, forecastConfidence, groupByWeekAndItem, buildHistoryWeights, weightedAverage,
-} = require('./forecast/history');
-const { computeSuggestedStockFromPairs } = require('./forecast/stock');
-const {
-  FORECAST_MODEL_VERSION, MAX_STORED_FORECAST_ITEMS, getTradingAvailability, describeClosedDay, generateForecast, generateWeekForecast,
-} = require('./forecast/generate');
-const { updateForecastActuals, refreshForecastsAfterMenuChange, scheduleForecastRefreshAfterMenuChange } = require('./forecast/actuals');
+/**
+ * Re-export barrel (BE-11-T04). Generation lives in ./forecast/generate.js,
+ * calibration in calibration.js, the history window in history.js, suggested
+ * stock in stock.js, actuals and menu-change refresh in actuals.js.
+ */
+const history = require('./forecast/history');
+const stock = require('./forecast/stock');
+const generate = require('./forecast/generate');
+const actuals = require('./forecast/actuals');
 
 module.exports = {
-  FORECAST_MODEL_VERSION,
-  MIN_HISTORY_WEEKS,
-  MAX_STORED_FORECAST_ITEMS,
-  generateForecast,
-  generateWeekForecast,
-  updateForecastActuals,
-  refreshForecastsAfterMenuChange,
-  scheduleForecastRefreshAfterMenuChange,
+  FORECAST_MODEL_VERSION: generate.FORECAST_MODEL_VERSION,
+  MIN_HISTORY_WEEKS: history.MIN_HISTORY_WEEKS,
+  MAX_STORED_FORECAST_ITEMS: generate.MAX_STORED_FORECAST_ITEMS,
+  generateForecast: generate.generateForecast,
+  generateWeekForecast: generate.generateWeekForecast,
+  updateForecastActuals: actuals.updateForecastActuals,
+  refreshForecastsAfterMenuChange: actuals.refreshForecastsAfterMenuChange,
+  scheduleForecastRefreshAfterMenuChange: actuals.scheduleForecastRefreshAfterMenuChange,
   _test: {
-    buildHistoryWeights,
-    groupByWeekAndItem,
-    weightedAverage,
-    getTradingAvailability,
-    describeClosedDay,
-    forecastConfidence,
-    computeSuggestedStockFromPairs,
-    requiredHistoryWeeks,
+    buildHistoryWeights: history.buildHistoryWeights,
+    groupByWeekAndItem: history.groupByWeekAndItem,
+    weightedAverage: history.weightedAverage,
+    getTradingAvailability: generate.getTradingAvailability,
+    describeClosedDay: generate.describeClosedDay,
+    forecastConfidence: history.forecastConfidence,
+    computeSuggestedStockFromPairs: stock.computeSuggestedStockFromPairs,
+    requiredHistoryWeeks: history.requiredHistoryWeeks,
   },
 };
