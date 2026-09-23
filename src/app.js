@@ -5,6 +5,7 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const helmet = require('helmet');
 const { globalLimiter } = require('./middleware/rateLimit.middleware');
+const { configureTrustProxy } = require('./config/proxy');
 const {
   requestContext,
   requestLogger,
@@ -34,8 +35,8 @@ const app = express();
 const yocoIntegrationEnabled = () =>
   String(process.env.YOCO_INTEGRATION_ENABLED || '').toLowerCase() === 'true';
 
-// Behind one reverse proxy (Render/Railway/etc.) — needed for correct client IPs in rate limiting
-app.set('trust proxy', 1);
+// TRUST_PROXY_HOPS (default 1): how many reverse proxies sit in front of the API.
+configureTrustProxy(app);
 
 app.use(requestContext);
 app.use(requestLogger);

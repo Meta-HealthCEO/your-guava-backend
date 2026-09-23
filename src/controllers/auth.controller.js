@@ -14,6 +14,7 @@ const emailService = require('../services/email.service');
 const { isValidEmail } = require('../utils/email');
 const { passwordTooLong, passwordInputError, dummyPasswordHash } = require('../utils/password');
 const { runAfterResponse } = require('../utils/afterResponse');
+const authThrottle = require('../services/authThrottle.service');
 
 const COOKIE_OPTIONS = {
   httpOnly: true,
@@ -211,6 +212,13 @@ const register = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Organization name must be between 2 and 120 characters' });
     }
 
+    // Over the recipient quota, answer exactly as usual but send nothing and leave any pending signup untouched, so a flood of
+    // registers can neither mail-bomb the address nor keep replacing its link.
+    const quota = await authThrottle.consumeRecipientQuota('signup', normalizedEmail);
+    if (!quota.allowed) {
+      return respondToRegistration(res, { sent: true }, normalizedEmail);
+    }
+
     const existingUser = await User.findOne({ email: normalizedEmail }).select('_id').lean();
     if (existingUser) {
       // Identity-4: same status, body and work as a new address: one bcrypt hash, one email.
@@ -243,6 +251,8 @@ const register = async (req, res, next) => {
 
 // Runs after the response (identity-4): rotating and emailing must not decide how long the answer takes.
 const rotateVerification = async (normalizedEmail) => {
+  // Over quota nothing rotates, so the last link sent keeps working.
+  if (!(await authThrottle.consumeRecipientQuota('signup', normalizedEmail)).allowed) return;
   const verificationToken = generateActionToken();
   const tokenHash = hashActionToken(verificationToken);
   const expiresAt = new Date(Date.now() + VERIFICATION_TTL_MS);
@@ -437,17 +447,34 @@ const login = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
+    // Per-account throttle (platform-3, security-9): after five failures the address is blocked whatever the IP, and a
+    // refused attempt costs no lookup and no bcrypt.
+    const gate = await authThrottle.loginGate(normalizedEmail);
+    if (!gate.allowed) {
+      const minutes = Math.ceil(gate.retryAfterSeconds / 60);
+      res.set('Retry-After', String(gate.retryAfterSeconds));
+      return res.status(429).json({
+        success: false,
+        code: 'LOGIN_THROTTLED',
+        retryAfterSeconds: gate.retryAfterSeconds,
+        message: `Too many failed sign-in attempts for this account. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+      });
+    }
+
     const user = await User.findOne({ email: normalizedEmail }).select('+password');
     if (!user) {
       // Identity-4: an unknown address costs the same bcrypt compare as a wrong password for a real one.
       await bcrypt.compare(password, await dummyPasswordHash());
+      await authThrottle.recordLoginFailure(normalizedEmail);
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
     const isMatch = await user.comparePassword(password);
     if (!isMatch) {
+      await authThrottle.recordLoginFailure(normalizedEmail);
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
+    await authThrottle.clearLoginFailures(normalizedEmail);
 
     if (user.emailVerified === false) {
       return res.status(403).json({
@@ -675,6 +702,8 @@ const FORGOT_PASSWORD_RESPONSE = {
 
 // Runs after the response, so its duration cannot tell anyone whether the account exists (identity-4).
 const deliverPasswordReset = async (normalizedEmail) => {
+  // The recipient quota is consumed before the lookup, so an unknown address costs exactly what a real one does.
+  if (!(await authThrottle.consumeRecipientQuota('password_reset', normalizedEmail)).allowed) return;
   const user = await User.findOne({ email: normalizedEmail }).select('_id email name').lean();
   if (!user) return;
   await PasswordResetToken.updateMany(

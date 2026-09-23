@@ -1,3 +1,4 @@
+const { parseTrustProxyHops } = require('./proxy');
 const PLACEHOLDER_VALUES = new Set([
   'your_jwt_secret_here',
   'your_jwt_refresh_secret_here',
@@ -93,6 +94,10 @@ const validateEnv = () => {
       }
     }
   }
+
+  // TRUST_PROXY_HOPS: a whole number from 0 to 5 (src/config/proxy.js); a bad value stops boot instead of trusting a guess.
+  const proxy = parseTrustProxyHops();
+  if (proxy.error) errors.push(proxy.error);
 
   if (isProduction) {
     if ((process.env.JWT_SECRET || '').length < 32) {

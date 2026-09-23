@@ -4,6 +4,7 @@ const emailService = require('../../src/services/email.service');
 const User = require('../../src/models/User.model');
 const TeamInvitation = require('../../src/models/TeamInvitation.model');
 const PendingRegistration = require('../../src/models/PendingRegistration.model');
+const AuthThrottle = require('../../src/models/AuthThrottle.model');
 const { settleAfterResponse } = require('../../src/utils/afterResponse');
 
 const request = supertest(app);
@@ -134,10 +135,12 @@ describe('resend is capped', () => {
     const tokens = captureVerificationTokens();
     await register();
     for (let i = 0; i < 7; i += 1) {
+      // Isolates the per-registration cap from the 3-per-hour recipient quota (BE-02-T03).
+      await AuthThrottle.deleteMany({ bucket: 'email_signup' });
       const res = await request.post('/api/auth/resend-verification').send({ email: 'victim@cafe.co.za' });
       expect(res.status).toBe(200);
+      await settleAfterResponse();
     }
-    await settleAfterResponse();
     // One email from register plus five resends; the sixth and seventh change nothing and send nothing.
     expect(tokens).toHaveLength(6);
     const pending = await PendingRegistration.findOne({ email: 'victim@cafe.co.za' }).lean();

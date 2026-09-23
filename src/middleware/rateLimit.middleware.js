@@ -12,15 +12,52 @@ const globalLimiter = rateLimit({
   message: { success: false, message: 'Too many requests, please slow down' },
 });
 
-// Strict limiter for credential endpoints (login/register) — brute-force protection.
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 30,
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  skip: isTest,
-  message: { success: false, message: 'Too many attempts, please try again later' },
-});
+// One bucket per auth action (identity-14): staff sharing one address can mistype a password without locking out resets and
+// signups, and each budget fits its action. Per-IP and in memory, which D-005 accepts; the per-account and per-recipient
+// limits that must survive a restart live in services/authThrottle.service.js.
+const AUTH_LIMITS = {
+  login: { windowMs: 15 * 60 * 1000, limit: 20 },
+  register: { windowMs: 60 * 60 * 1000, limit: 10 },
+  passwordReset: { windowMs: 15 * 60 * 1000, limit: 10 },
+  verification: { windowMs: 15 * 60 * 1000, limit: 20 },
+  changePassword: { windowMs: 15 * 60 * 1000, limit: 10 },
+};
+
+const AUTH_LIMIT_MESSAGES = {
+  login: 'Too many sign-in attempts from this network. Please wait 15 minutes.',
+  register: 'Too many sign-ups from this network. Please wait an hour.',
+  passwordReset: 'Too many password reset requests. Please wait 15 minutes.',
+  verification: 'Too many verification attempts. Please wait 15 minutes.',
+  changePassword: 'Too many password change attempts. Please wait 15 minutes.',
+};
+
+const createAuthLimiters = ({ skip = isTest, limits = {} } = {}) => {
+  const build = (name, extra = {}) => {
+    const config = { ...AUTH_LIMITS[name], ...(limits[name] || {}) };
+    return rateLimit({
+      windowMs: config.windowMs,
+      limit: config.limit,
+      standardHeaders: 'draft-7',
+      legacyHeaders: false,
+      skip,
+      message: { success: false, code: 'AUTH_RATE_LIMITED', message: AUTH_LIMIT_MESSAGES[name] },
+      ...extra,
+    });
+  };
+  return {
+    login: build('login'),
+    register: build('register'),
+    passwordReset: build('passwordReset'),
+    verification: build('verification'),
+    // Runs after authMiddleware, so the user id is the key (same pattern as writeLimiter).
+    changePassword: build('changePassword', {
+      keyGenerator: (req) => req.user?.id || req.ip,
+      validate: { keyGeneratorIpFallback: false },
+    }),
+  };
+};
+
+const authLimiters = createAuthLimiters();
 
 // Moderate limiter for token refresh — legitimately called on a timer by active
 // sessions (~4/hr each), so more generous than login but still bounded per IP.
@@ -132,7 +169,9 @@ module.exports = {
   parseLimiter,
   getLimiterOptions,
   globalLimiter,
-  authLimiter,
+  authLimiters,
+  createAuthLimiters,
+  AUTH_LIMITS,
   refreshLimiter,
   inviteLimiter,
   writeLimiter,
