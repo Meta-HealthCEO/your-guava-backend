@@ -107,7 +107,7 @@ const createTestUser = async (overrides = {}) => {
 
     const verification = await request
       .post('/api/auth/verify-email')
-      .send({ token: verificationToken });
+      .send({ token: verificationToken, password: data.password });
     if (verification.status !== 201) {
       throw new Error(
         `Test email verification failed (${verification.status}): ${JSON.stringify(verification.body)}`

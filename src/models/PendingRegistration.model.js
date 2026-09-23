@@ -20,6 +20,10 @@ const pendingRegistrationSchema = new mongoose.Schema(
     orgName: { type: String, required: true, trim: true, minlength: 2, maxlength: 120 },
     tokenHash: { type: String, required: true, unique: true, select: false },
     expiresAt: { type: Date, required: true },
+    // Rotations left for this submission (BE-02-T01); a new register resets it.
+    resendCount: { type: Number, default: 0, min: 0 },
+    // Wrong passwords at the verify step; the 5th deletes the record (BE-02-T01).
+    verifyAttempts: { type: Number, default: 0, min: 0 },
   },
   { timestamps: true }
 );

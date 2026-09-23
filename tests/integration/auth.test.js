@@ -87,7 +87,7 @@ describe('Auth API', () => {
 
       const verified = await request
         .post('/api/auth/verify-email')
-        .send({ token: verificationToken });
+        .send({ token: verificationToken, password: 'password123' });
       expect(verified.status).toBe(201);
       expect(verified.headers['cache-control']).toBe('no-store');
       expect(verified.body.accessToken).toBeUndefined();
@@ -112,7 +112,7 @@ describe('Auth API', () => {
 
       const replay = await request
         .post('/api/auth/verify-email')
-        .send({ token: verificationToken });
+        .send({ token: verificationToken, password: 'password123' });
       expect(replay.status).toBe(404);
 
       const login = await request.post('/api/auth/login').send({
@@ -122,37 +122,6 @@ describe('Auth API', () => {
       expect(login.status).toBe(200);
       expect(login.body.accessToken).toBeDefined();
       expect(login.body.user.permissions).toEqual({ canSpendCredits: true });
-    });
-
-    it('does not let a second signup replace the password of a pending registration', async () => {
-      const first = await submitRegistration({
-        email: 'pending@yourguava.com',
-        password: 'original-password',
-      });
-      first.verificationSpy.mockRestore();
-
-      const second = await request.post('/api/auth/register').send(
-        registrationPayload({
-          email: 'pending@yourguava.com',
-          password: 'attacker-password',
-        })
-      );
-      expect(second.status).toBe(409);
-      expect(second.body.code).toBe('REGISTRATION_PENDING');
-
-      await request
-        .post('/api/auth/verify-email')
-        .send({ token: first.verificationToken });
-      const originalLogin = await request.post('/api/auth/login').send({
-        email: 'pending@yourguava.com',
-        password: 'original-password',
-      });
-      const attackerLogin = await request.post('/api/auth/login').send({
-        email: 'pending@yourguava.com',
-        password: 'attacker-password',
-      });
-      expect(originalLogin.status).toBe(200);
-      expect(attackerLogin.status).toBe(401);
     });
 
     it('retains the pending registration when verification delivery fails', async () => {
@@ -198,11 +167,11 @@ describe('Auth API', () => {
 
       const stale = await request
         .post('/api/auth/verify-email')
-        .send({ token: initial.verificationToken });
+        .send({ token: initial.verificationToken, password: 'password123' });
       expect(stale.status).toBe(404);
       const accepted = await request
         .post('/api/auth/verify-email')
-        .send({ token: replacementToken });
+        .send({ token: replacementToken, password: 'password123' });
       expect(accepted.status).toBe(201);
     });
 
@@ -216,7 +185,7 @@ describe('Auth API', () => {
       });
       const verified = await request
         .post('/api/auth/verify-email')
-        .send({ token: verificationToken });
+        .send({ token: verificationToken, password: 'password123' });
       expect(verified.status).toBe(201);
       expect(warnSpy).toHaveBeenCalledWith(
         '[auth] Welcome email failed after verification:',

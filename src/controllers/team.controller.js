@@ -5,7 +5,6 @@ const User = require('../models/User.model');
 const Cafe = require('../models/Cafe.model');
 const Organization = require('../models/Organization.model');
 const TeamInvitation = require('../models/TeamInvitation.model');
-const PendingRegistration = require('../models/PendingRegistration.model');
 const AuthSession = require('../models/AuthSession.model');
 const AccessAuditEvent = require('../models/AccessAuditEvent.model');
 const { getPlan } = require('../services/billingPlans.service');
@@ -301,19 +300,6 @@ const inviteManager = async (req, res, next) => {
         seats: updatedSeats,
       });
     }
-
-    // Only discard an unfinished public signup once the owner-directed
-    // invitation is deliverable. A failed invite must leave the existing
-    // signup verification link usable.
-    await PendingRegistration.deleteOne({ email: normalizedEmail }).catch((error) => {
-      // The active invitation blocks public verification for this address, so
-      // cleanup can safely retry through TTL expiry without turning a delivered
-      // invitation into an ambiguous 500 response.
-      console.error(
-        `[team] delivered invitation ${invitation._id} could not clean up pending registration:`,
-        error.code || error.name
-      );
-    });
 
     const updatedSeats = await buildSeatSummary(owner.orgId);
 

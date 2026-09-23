@@ -179,12 +179,12 @@ describe('Team API', () => {
 
       const verified = await request
         .post('/api/auth/verify-email')
-        .send({ token: verificationToken });
+        .send({ token: verificationToken, password: 'password123' });
       expect(verified.status).toBe(201);
       expect(verified.body.email).toBe('pending-owner@yourguava.com');
     });
 
-    it('removes an existing signup only after the invitation email is delivered', async () => {
+    it('keeps an existing signup when the invitation email is delivered', async () => {
       jest.spyOn(emailService, 'sendVerificationEmail').mockResolvedValue({ sent: true });
       const pendingSignup = await request
         .post('/api/auth/register')
@@ -213,7 +213,7 @@ describe('Team API', () => {
       expect(invite.status).toBe(201);
       expect(await PendingRegistration.countDocuments({
         email: 'invited-owner@yourguava.com',
-      })).toBe(0);
+      })).toBe(1);
       expect((await TeamInvitation.findOne({
         email: 'invited-owner@yourguava.com',
       })).status).toBe('pending');

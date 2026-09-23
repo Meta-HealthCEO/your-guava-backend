@@ -28,6 +28,42 @@ const ACTION_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
 const REFRESH_REUSE_GRACE_MS = 5 * 1000;
+const MAX_VERIFICATION_RESENDS = 5;
+const MAX_VERIFY_PASSWORD_ATTEMPTS = 5;
+const INVALID_VERIFICATION_MESSAGE = 'This verification link is invalid or has expired';
+// One answer for every address that is accepted, so the page cannot tell a pending signup from a new one (and, after
+// BE-02-T02, from an existing account).
+const REGISTER_ACCEPTED_MESSAGE =
+  'Check your inbox for the next step. If this email can start a new account, the link to finish signing up is there. ' +
+  'If it already has an account, we have sent sign-in help instead.';
+
+// Identity-1: a new submission replaces a pending one (password, names, token), so the old link dies. Two simultaneous
+// submissions race on the unique email index; the loser retries once and then updates the winner's document.
+const upsertPendingRegistration = async (fields) => {
+  const write = () => PendingRegistration.findOneAndUpdate(
+    { email: fields.email },
+    {
+      $set: {
+        passwordHash: fields.passwordHash,
+        name: fields.name,
+        cafeName: fields.cafeName,
+        orgName: fields.orgName,
+        tokenHash: fields.tokenHash,
+        expiresAt: fields.expiresAt,
+        resendCount: 0,
+        verifyAttempts: 0,
+      },
+      $setOnInsert: { email: fields.email },
+    },
+    { upsert: true, new: true, runValidators: true, setDefaultsOnInsert: true }
+  );
+  try {
+    return await write();
+  } catch (error) {
+    if (error?.code === 11000 && error?.keyPattern?.email) return write();
+    throw error;
+  }
+};
 
 const passwordTooLong = (password) =>
   Buffer.byteLength(String(password), 'utf8') > MAX_PASSWORD_BYTES;
@@ -166,50 +202,21 @@ const register = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Organization name must be between 2 and 120 characters' });
     }
 
-    const now = new Date();
-    const [existingUser, activeInvitation, existingRegistration] = await Promise.all([
-      User.findOne({ email: normalizedEmail }).select('_id').lean(),
-      TeamInvitation.findOne({
-        email: normalizedEmail,
-        status: 'pending',
-        expiresAt: { $gt: new Date() },
-      }).select('_id').lean(),
-      PendingRegistration.findOne({ email: normalizedEmail }).select('_id expiresAt').lean(),
-    ]);
+    const existingUser = await User.findOne({ email: normalizedEmail }).select('_id').lean();
     if (existingUser) {
+      // BE-02-T02 replaces this 409 with the uniform 202 and an "account exists" email.
       return res.status(409).json({ success: false, message: 'Email already registered' });
     }
-    if (activeInvitation) {
-      return res.status(409).json({
-        success: false,
-        code: 'TEAM_INVITATION_PENDING',
-        message: 'A team invitation is pending for this email. Use the link in that email.',
-      });
-    }
-    if (existingRegistration && existingRegistration.expiresAt > now) {
-      return res.status(409).json({
-        success: false,
-        code: 'REGISTRATION_PENDING',
-        message: 'Registration is already pending for this email. Resend the verification link instead.',
-      });
-    }
-    if (existingRegistration) {
-      await PendingRegistration.deleteOne({
-        _id: existingRegistration._id,
-        expiresAt: { $lte: now },
-      });
-    }
 
+    // Identity-3: a pending team invitation in any org no longer blocks a public signup.
     const verificationToken = generateActionToken();
-    const tokenHash = hashActionToken(verificationToken);
-    const passwordHash = await bcrypt.hash(String(password), 10);
-    const registration = await PendingRegistration.create({
+    const registration = await upsertPendingRegistration({
       email: normalizedEmail,
-      passwordHash,
+      passwordHash: await bcrypt.hash(String(password), 10),
       name: normalizedName,
       cafeName: normalizedCafeName,
       orgName: normalizedOrgName,
-      tokenHash,
+      tokenHash: hashActionToken(verificationToken),
       expiresAt: new Date(Date.now() + VERIFICATION_TTL_MS),
     });
 
@@ -234,16 +241,9 @@ const register = async (req, res, next) => {
       success: true,
       verificationRequired: true,
       email: normalizedEmail,
-      message: 'Check your email to verify your address and finish creating the account.',
+      message: REGISTER_ACCEPTED_MESSAGE,
     });
   } catch (error) {
-    if (error?.code === 11000 && error?.keyPattern?.email) {
-      return res.status(409).json({
-        success: false,
-        code: 'REGISTRATION_PENDING',
-        message: 'Registration is already pending for this email. Resend the verification link instead.',
-      });
-    }
     next(error);
   }
 };
@@ -264,13 +264,13 @@ const resendVerification = async (req, res, next) => {
     const tokenHash = hashActionToken(verificationToken);
     const expiresAt = new Date(Date.now() + VERIFICATION_TTL_MS);
     const previousRegistration = await PendingRegistration.findOneAndUpdate(
-      { email: normalizedEmail },
       {
-        $set: {
-          tokenHash,
-          expiresAt,
-        },
+        email: normalizedEmail,
+        expiresAt: { $gt: new Date() },
+        // $not also matches records written before this field existed.
+        resendCount: { $not: { $gte: MAX_VERIFICATION_RESENDS } },
       },
+      { $set: { tokenHash, expiresAt }, $inc: { resendCount: 1 } },
       { new: false, runValidators: true }
     ).select('+tokenHash');
     if (previousRegistration) {
@@ -308,7 +308,43 @@ const verifyEmail = async (req, res, next) => {
     res.set('Cache-Control', 'no-store');
     const token = normalizedActionToken(req.body?.token);
     if (!token) {
-      return res.status(404).json({ success: false, message: 'This verification link is invalid or has expired' });
+      return res.status(404).json({ success: false, message: INVALID_VERIFICATION_MESSAGE });
+    }
+    const password = req.body?.password;
+    if (typeof password !== 'string' || password.length === 0) {
+      return res.status(400).json({
+        success: false,
+        code: 'PASSWORD_REQUIRED',
+        message: 'Enter the password you chose when you signed up.',
+      });
+    }
+
+    const tokenHash = hashActionToken(token);
+    const candidate = await PendingRegistration.findOne({ tokenHash, expiresAt: { $gt: new Date() } })
+      .select('+passwordHash');
+    if (!candidate) {
+      return res.status(404).json({ success: false, message: INVALID_VERIFICATION_MESSAGE });
+    }
+
+    // Identity-1: never complete a sign-up with credentials the person holding the link did not supply.
+    const matches = !passwordTooLong(password) && await bcrypt.compare(password, candidate.passwordHash);
+    if (!matches) {
+      const counted = await PendingRegistration.findOneAndUpdate(
+        { _id: candidate._id, tokenHash },
+        { $inc: { verifyAttempts: 1 } },
+        { new: true }
+      ).lean();
+      const attempts = counted ? counted.verifyAttempts : MAX_VERIFY_PASSWORD_ATTEMPTS;
+      if (attempts >= MAX_VERIFY_PASSWORD_ATTEMPTS) {
+        await PendingRegistration.deleteOne({ _id: candidate._id, tokenHash });
+        return res.status(404).json({ success: false, message: INVALID_VERIFICATION_MESSAGE });
+      }
+      return res.status(401).json({
+        success: false,
+        code: 'VERIFICATION_PASSWORD_MISMATCH',
+        attemptsRemaining: MAX_VERIFY_PASSWORD_ATTEMPTS - attempts,
+        message: 'That is not the password used for this sign-up. If you did not sign up, you can ignore the email.',
+      });
     }
 
     let user;
@@ -316,33 +352,23 @@ const verifyEmail = async (req, res, next) => {
     let cafe;
     session = await mongoose.startSession();
     await session.withTransaction(async () => {
+      // Consume exactly the record whose password was checked: a register that replaced it in between changed the
+      // tokenHash, so this finds nothing and the newer submission wins.
       const registration = await PendingRegistration.findOneAndDelete({
-        tokenHash: hashActionToken(token),
+        _id: candidate._id,
+        tokenHash,
         expiresAt: { $gt: new Date() },
       })
         .select('+passwordHash')
         .session(session);
       if (!registration) {
-        const error = new Error('This verification link is invalid or has expired');
+        const error = new Error(INVALID_VERIFICATION_MESSAGE);
         error.statusCode = 404;
         throw error;
       }
-
-      const [existingUser, activeInvitation] = await Promise.all([
-        User.findOne({ email: registration.email }).session(session),
-        TeamInvitation.findOne({
-          email: registration.email,
-          status: 'pending',
-          expiresAt: { $gt: new Date() },
-        }).session(session),
-      ]);
+      const existingUser = await User.findOne({ email: registration.email }).session(session);
       if (existingUser) {
         const error = new Error('Email already registered');
-        error.statusCode = 409;
-        throw error;
-      }
-      if (activeInvitation) {
-        const error = new Error('A team invitation is pending for this email. Use the invitation link instead.');
         error.statusCode = 409;
         throw error;
       }
@@ -374,6 +400,13 @@ const verifyEmail = async (req, res, next) => {
       user.orgId = org._id;
       user.cafeIds = [cafe._id];
       user.activeCafeId = cafe._id;
+
+      // Identity-3: the self-registration wins. Invitations to this address stop holding a seat and can no longer be accepted.
+      await TeamInvitation.updateMany(
+        { email: registration.email, status: 'pending' },
+        { $set: { status: 'expired', expiresAt: new Date() } },
+        { session }
+      );
     });
 
     emailService.sendWelcomeEmail({ user, org, cafe }).catch((error) => {
