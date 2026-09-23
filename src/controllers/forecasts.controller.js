@@ -21,7 +21,8 @@ const {
   safeTimezone,
   zonedDateKey,
   zonedDayStart,
-} = require('../services/parser.service');
+  getCafeTimezone,
+} = require('../utils/timezone');
 
 const REQUIRED_PLANNING_FACTOR_KEYS = ['weather', 'loadShedding', 'holiday', 'payday', 'events'];
 const HISTORY_BACKFILL_BATCH_SIZE = 14;
@@ -34,11 +35,6 @@ const clampHistoryDays = (value) => {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed)) return 90;
   return Math.max(1, Math.min(366, parsed));
-};
-
-const getCafeTimezone = async (cafeId) => {
-  const cafe = await Cafe.findById(cafeId).select('timezone').lean();
-  return safeTimezone(cafe?.timezone);
 };
 
 const parseRequestedDay = (value, timezone) => {

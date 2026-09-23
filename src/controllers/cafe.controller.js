@@ -3,7 +3,7 @@ const User = require('../models/User.model');
 const Forecast = require('../models/Forecast.model');
 const { normalizeTradingHours, defaultTradingHours, tradingHoursInputError } = require('../utils/tradingHours');
 const { clearApiCache } = require('../middleware/cache.middleware');
-const { safeTimezone, zonedDayStart } = require('../services/parser.service');
+const { safeTimezone, zonedDayStart } = require('../utils/timezone');
 
 const FORECAST_INPUT_PREFIXES = ['location.lat', 'location.lng', 'location.city', 'tradingHours'];
 

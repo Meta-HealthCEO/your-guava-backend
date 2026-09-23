@@ -11,9 +11,8 @@ const {
   readWorkbook,
   assertSupportedFileBuffer,
   parserLimits,
-  zonedDateKey,
-  safeTimezone,
 } = require('./parser.service');
+const { zonedDateKey, safeTimezone } = require('../utils/timezone');
 const { computeDedupKey } = require('../utils/dedupKey');
 const {
   normaliseTransactionStatus,

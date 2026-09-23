@@ -7,7 +7,7 @@ const Cafe = require('../../models/Cafe.model');
 const Forecast = require('../../models/Forecast.model');
 const GeneratedInsight = require('../../models/GeneratedInsight.model');
 const ingestion = require('../../services/ingestion.service');
-const parser = require('../../services/parser.service');
+const { zonedDateKey, zonedDayStart } = require('../../utils/timezone');
 const {
   boundedInteger, ABANDONED_CLEANUP_CLAIM, sanitizeRowErrors, sha256, assertImportableResult, confirmationMappingHash,
 } = require('./shared');
@@ -210,10 +210,10 @@ const commitParsedUpload = async ({
             dateRange: {
               ...result.dateRange,
               firstDateKey: result.dateRange?.firstDate
-                ? parser.zonedDateKey(result.dateRange.firstDate, timezone)
+                ? zonedDateKey(result.dateRange.firstDate, timezone)
                 : undefined,
               lastDateKey: result.dateRange?.lastDate
-                ? parser.zonedDateKey(result.dateRange.lastDate, timezone)
+                ? zonedDateKey(result.dateRange.lastDate, timezone)
                 : undefined,
             },
             rowErrors: sanitizeRowErrors(result.rowErrors || parsed.rowErrors),
@@ -256,7 +256,7 @@ const commitParsedUpload = async ({
       // Readers must never observe forecasts or generated insights based on
       // the pre-import dataset, even if the asynchronous regeneration worker
       // starts later or this process exits immediately after commit.
-      const today = parser.zonedDayStart(new Date(), timezone);
+      const today = zonedDayStart(new Date(), timezone);
       await Forecast.deleteMany({ cafeId, date: { $gte: today } }).session(session);
       await GeneratedInsight.updateOne(
         { cafeId },

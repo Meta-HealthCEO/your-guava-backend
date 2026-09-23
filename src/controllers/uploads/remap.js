@@ -4,6 +4,7 @@ const Upload = require('../../models/Upload.model');
 const Transaction = require('../../models/Transaction.model');
 const r2 = require('../../services/r2.service');
 const parser = require('../../services/parser.service');
+const { zonedDateKey } = require('../../utils/timezone');
 const { normaliseTransactionStatus } = require('../../utils/transactionStatus');
 const { computeDedupKey } = require('../../utils/dedupKey');
 const { clearApiCache } = require('../../middleware/cache.middleware');
@@ -27,7 +28,7 @@ const duplicateIdentityForRow = (row, sourceFingerprint, timezone) => {
   if (row.receiptId) {
     return {
       receiptId: row.receiptId,
-      dayKey: row.dateKey || parser.zonedDateKey(row.date, timezone),
+      dayKey: row.dateKey || zonedDateKey(row.date, timezone),
     };
   }
 
@@ -76,7 +77,7 @@ const assertRemapHasImportableRows = async (parsed, cafeId, uploadId, sourceFing
       // the cafe's timezone, as the write path does.
       if (existing.receiptId) {
         existingIdentities.add(
-          receiptIdentityKey(existing.receiptId, parser.zonedDateKey(existing.date, timezone))
+          receiptIdentityKey(existing.receiptId, zonedDateKey(existing.date, timezone))
         );
       }
       if (existing.dedupKey) existingIdentities.add(`dedupKey:${existing.dedupKey}`);

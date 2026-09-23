@@ -3,7 +3,7 @@
 const { backgroundJobsInline } = require('../../config/flags');
 const Upload = require('../../models/Upload.model');
 const Forecast = require('../../models/Forecast.model');
-const parser = require('../../services/parser.service');
+const { zonedDayEnd, zonedDayStart } = require('../../utils/timezone');
 const { updateForecastActuals, generateWeekForecast } = require('../../services/forecast.service');
 const { clearApiCache } = require('../../middleware/cache.middleware');
 const { boundedInteger, getCafeTimezone } = require('./shared');
@@ -36,15 +36,15 @@ const maintenanceRetryDelayMs = (attempts) => {
 };
 
 const invalidatePlanningForecasts = async (cafeId, timezone) => {
-  const today = parser.zonedDayStart(new Date(), timezone || await getCafeTimezone(cafeId));
+  const today = zonedDayStart(new Date(), timezone || await getCafeTimezone(cafeId));
   await Forecast.deleteMany({ cafeId, date: { $gte: today } });
 };
 
 const fillActualsForRange = async (cafeId, dateRange, timezone) => {
   if (!dateRange?.firstDate || !dateRange?.lastDate) return;
   const resolvedTimezone = timezone || await getCafeTimezone(cafeId);
-  const start = parser.zonedDayStart(dateRange.firstDate, resolvedTimezone);
-  const end = parser.zonedDayEnd(dateRange.lastDate, resolvedTimezone);
+  const start = zonedDayStart(dateRange.firstDate, resolvedTimezone);
+  const end = zonedDayEnd(dateRange.lastDate, resolvedTimezone);
   const forecasts = await Forecast.find({ cafeId, date: { $gte: start, $lte: end } })
     .select('date')
     .sort({ date: -1 })

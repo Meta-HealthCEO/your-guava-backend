@@ -8,7 +8,7 @@ const Forecast = require('../../models/Forecast.model');
 const GeneratedInsight = require('../../models/GeneratedInsight.model');
 const r2 = require('../../services/r2.service');
 const ingestion = require('../../services/ingestion.service');
-const parser = require('../../services/parser.service');
+const { zonedDayStart } = require('../../utils/timezone');
 const { clearApiCache } = require('../../middleware/cache.middleware');
 const { getCafeTimezone, STORAGE_CLEANUP_PENDING } = require('./shared');
 const { recoverStaleParsingUpload } = require('./lease');
@@ -25,7 +25,7 @@ const remove = async (req, res, next) => {
 
     const dateRange = upload.dateRange;
     const timezone = await getCafeTimezone(cafeId);
-    const today = parser.zonedDayStart(new Date(), timezone);
+    const today = zonedDayStart(new Date(), timezone);
     const session = await mongoose.startSession();
     try {
       await session.withTransaction(async () => {

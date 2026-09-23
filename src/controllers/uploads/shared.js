@@ -1,8 +1,7 @@
 // Constants and helpers every uploads handler shares: mapping validation, importability checks, response shapes.
 // Moved from uploads.controller.js by BE-11-T03; behaviour unchanged.
 const crypto = require('crypto');
-const Cafe = require('../../models/Cafe.model');
-const parser = require('../../services/parser.service');
+const { getCafeTimezone } = require('../../utils/timezone');
 const { normaliseTransactionStatus } = require('../../utils/transactionStatus');
 
 const REQUIRED = ['date', 'items', 'total'];
@@ -141,11 +140,6 @@ const assertParsedRowsImportable = (parsed, { allowSeverePartial = false } = {})
     };
     throw err;
   }
-};
-
-const getCafeTimezone = async (cafeId) => {
-  const cafe = await Cafe.findById(cafeId).select('timezone').lean();
-  return parser.safeTimezone(cafe?.timezone);
 };
 
 module.exports = {

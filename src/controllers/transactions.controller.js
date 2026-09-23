@@ -8,6 +8,7 @@ const Upload = require('../models/Upload.model');
 const r2 = require('../services/r2.service');
 const ingestion = require('../services/ingestion.service');
 const parser = require('../services/parser.service');
+const { addZonedDays, zonedDayEnd, zonedDayOrdinal, zonedDayStart, getCafeTimezone } = require('../utils/timezone');
 const { proposeColumnMapping } = require('../services/anthropic.service');
 const { canSpendCredits } = require('../middleware/rbac.middleware');
 
@@ -15,11 +16,6 @@ const REQUIRED_UPLOAD_MAPPING = ['date', 'items', 'total'];
 const MIN_HEADER_COUNT = 2;
 const MAX_TRANSACTION_QUERY_RANGE_DAYS = 5 * 366;
 const MAX_TRANSACTION_PAGE = 10000;
-
-const getCafeTimezone = async (cafeId) => {
-  const cafe = await Cafe.findById(cafeId).select('timezone').lean();
-  return parser.safeTimezone(cafe?.timezone);
-};
 
 const requiredUploadMappingForMode = (itemsMode = 'packed') =>
   itemsMode === 'line-per-row'
@@ -215,14 +211,14 @@ const getTransactions = async (req, res, next) => {
         });
       }
       query.date = {};
-      if (startDate) query.date.$gte = parser.zonedDayStart(startDate, timezone);
-      if (endDate) query.date.$lte = parser.zonedDayEnd(endDate, timezone);
+      if (startDate) query.date.$gte = zonedDayStart(startDate, timezone);
+      if (endDate) query.date.$lte = zonedDayEnd(endDate, timezone);
       if ((startDate && !query.date.$gte) || (endDate && !query.date.$lte)) {
         return res.status(400).json({ success: false, message: 'Invalid transaction date range' });
       }
       if (query.date.$gte && query.date.$lte) {
-        const rangeDays = parser.zonedDayOrdinal(query.date.$lte, timezone) -
-          parser.zonedDayOrdinal(query.date.$gte, timezone) + 1;
+        const rangeDays = zonedDayOrdinal(query.date.$lte, timezone) -
+          zonedDayOrdinal(query.date.$gte, timezone) + 1;
         if (rangeDays <= 0 || rangeDays > MAX_TRANSACTION_QUERY_RANGE_DAYS) {
           return res.status(400).json({
             success: false,
@@ -328,7 +324,7 @@ const getStats = async (req, res, next) => {
     const firstDate = totals.firstDate;
     const lastDate = totals.lastDate;
     const dayCount = Math.max(
-      parser.zonedDayOrdinal(lastDate, timezone) - parser.zonedDayOrdinal(firstDate, timezone) + 1,
+      zonedDayOrdinal(lastDate, timezone) - zonedDayOrdinal(firstDate, timezone) + 1,
       1
     );
     const avgDailyRevenue = totalRevenue / dayCount;
@@ -364,7 +360,7 @@ const getDataStatus = async (req, res, next) => {
     // not sold anything yet this morning has left no gap, and counting it as one
     // reported a hole the owner could do nothing about. Thirty-one days back so
     // the oldest completed day the strip draws is still inside this window.
-    const thirtyDaysAgo = parser.addZonedDays(new Date(), -30, timezone);
+    const thirtyDaysAgo = addZonedDays(new Date(), -30, timezone);
 
     const coverage = await Transaction.aggregate([
       { $match: { cafeId: new mongoose.Types.ObjectId(String(cafeId)), date: { $gte: thirtyDaysAgo } } },
@@ -384,8 +380,8 @@ const getDataStatus = async (req, res, next) => {
     if (latest) {
       daysSinceLatest = Math.max(
         0,
-        parser.zonedDayOrdinal(new Date(), timezone) -
-          parser.zonedDayOrdinal(latest.date, timezone)
+        zonedDayOrdinal(new Date(), timezone) -
+          zonedDayOrdinal(latest.date, timezone)
       );
     }
 
