@@ -41,6 +41,13 @@ const DEFAULT_XLSX_MAX_ENTRY_UNCOMPRESSED_BYTES = 20 * 1024 * 1024;
 const HARD_XLSX_MAX_ENTRY_UNCOMPRESSED_BYTES = 100 * 1024 * 1024;
 const DEFAULT_XLSX_MAX_COMPRESSION_RATIO = 200;
 const HARD_XLSX_MAX_COMPRESSION_RATIO = 1000;
+const DEFAULT_MAX_ROW_BYTES = 128 * 1024;
+const HARD_MAX_ROW_BYTES = 1024 * 1024;
+// A column name, not a cell. Clipped before anything reads it, so no check
+// downstream (the PII guard, the POS preset, the AI prompt) sees a runaway line.
+const MAX_HEADER_CHARS = 200;
+// csv-parser's own wording for a line longer than maxRowBytes.
+const CSV_ROW_TOO_LONG_MESSAGE = 'Row exceeds the maximum size';
 
 const boundedInteger = (value, fallback, min, max) => {
   const parsed = Number.parseInt(value, 10);
@@ -50,6 +57,7 @@ const boundedInteger = (value, fallback, min, max) => {
 
 const parserLimits = () => ({
   maxRows: boundedInteger(process.env.UPLOAD_MAX_ROWS, DEFAULT_MAX_ROWS, 1, HARD_MAX_ROWS),
+  maxRowBytes: boundedInteger(process.env.UPLOAD_MAX_ROW_BYTES, DEFAULT_MAX_ROW_BYTES, 4096, HARD_MAX_ROW_BYTES),
   maxColumns: boundedInteger(process.env.UPLOAD_MAX_COLUMNS, DEFAULT_MAX_COLUMNS, 2, HARD_MAX_COLUMNS),
   maxCellChars: boundedInteger(
     process.env.UPLOAD_MAX_CELL_CHARS,
@@ -130,6 +138,28 @@ const createClientInputError = (message) => {
   const error = new Error(message);
   error.statusCode = 400;
   return error;
+};
+
+/** The longest line any CSV reader buffers before refusing the file. */
+const csvMaxRowBytes = (limits = parserLimits()) => limits.maxRowBytes;
+
+const tooManyColumnsError = (limits = parserLimits()) =>
+  createClientInputError(`File exceeds the ${limits.maxColumns} column limit`);
+
+/**
+ * csv-parser reports an over-long line as a bare Error with no status, and
+ * confirm passed it straight to the error middleware as a 500. Say what is
+ * wrong and what to do; leave every other error as it was.
+ */
+const csvReadError = (error, limits = parserLimits()) => {
+  if (error?.message !== CSV_ROW_TOO_LONG_MESSAGE) return error;
+  const tooLong = createClientInputError(
+    `A line in this file is longer than ${Math.round(limits.maxRowBytes / 1024)} KB. A sales export keeps each sale on `
+    + 'its own short line, so this is usually one runaway cell or the wrong separator. Export the report again, or save '
+    + 'it from Excel as "CSV UTF-8 (Comma delimited)", and upload that.'
+  );
+  tooLong.code = 'CSV_ROW_TOO_LONG';
+  return tooLong;
 };
 
 const safeTimezone = (timezone) => {
@@ -285,7 +315,7 @@ const requiredFieldsForMode = (itemsMode = 'packed') =>
     : REQUIRED_FIELDS;
 
 const normaliseHeader = (header, index = 0) => {
-  const value = String(header ?? '').replace(/^\uFEFF/, '').trim();
+  const value = String(header ?? '').replace(/^\uFEFF/, '').trim().slice(0, MAX_HEADER_CHARS);
   return value || `Column ${index + 1}`;
 };
 
@@ -315,11 +345,13 @@ const headerDeduper = () => {
 // in a column the owner never intended to import. Clip it instead: the mapped
 // fields have their own length bounds, so a truncated item name or receipt ID
 // still becomes an honest row error while the rest of the file lands.
-const normaliseCell = (value) => {
+// A reader passes the limits it already holds: parserLimits() reads the
+// environment about fifteen times, and a 128 KB line of separators is 131
+// thousand cells.
+const normaliseCell = (value, limits = parserLimits()) => {
   if (typeof value !== 'string') return value;
   const trimmed = value.trim();
-  const { maxCellChars } = parserLimits();
-  return trimmed.length > maxCellChars ? trimmed.slice(0, maxCellChars) : trimmed;
+  return trimmed.length > limits.maxCellChars ? trimmed.slice(0, limits.maxCellChars) : trimmed;
 };
 
 const normaliseRow = (row) => {
@@ -878,14 +910,17 @@ const detectCsvSeparator = (buffer) => {
  * once, with one column's money, while the import read the other column.
  * Returns the csv-parser stream; the source is piped in already.
  */
-const readCsvStream = (buffer) => {
+const readCsvStream = (buffer, limits = parserLimits()) => {
   const dedupeHeader = headerDeduper();
   // Stripped before parsing; left in place the directive becomes the header
   // row and every real column disappears behind it.
   return Readable.from(stripCsvSeparatorDirective(buffer)).pipe(csv({
     separator: detectCsvSeparator(buffer),
+    // csv-parser buffers a whole line before it splits it; without a cap one
+    // line of separators became a row object with one key per separator.
+    maxRowBytes: csvMaxRowBytes(limits),
     mapHeaders: ({ header, index }) => dedupeHeader(header, index),
-    mapValues: ({ value }) => normaliseCell(value),
+    mapValues: ({ value }) => normaliseCell(value, limits),
   }));
 };
 
@@ -1116,13 +1151,15 @@ const readRows = (buffer, fileExt) => {
       settled = true;
       reject(error);
     };
-    const parserStream = readCsvStream(buffer);
+    const parserStream = readCsvStream(buffer, limits);
     parserStream
+      .on('headers', (headers) => {
+        if (headers.length > limits.maxColumns) parserStream.destroy(tooManyColumnsError(limits));
+      })
       .on('data', (row) => {
         if (settled) return;
         if (Object.keys(row).length > limits.maxColumns) {
-          const error = createClientInputError(`File exceeds the ${limits.maxColumns} column limit`);
-          parserStream.destroy(error);
+          parserStream.destroy(tooManyColumnsError(limits));
           return;
         }
         if (rows.length >= limits.maxRows) {
@@ -1138,7 +1175,7 @@ const readRows = (buffer, fileExt) => {
         });
         rows.push(row);
       })
-      .on('error', fail)
+      .on('error', (error) => fail(csvReadError(error, limits)))
       .on('end', () => {
         if (settled) return;
         settled = true;
@@ -1845,6 +1882,10 @@ module.exports = {
   csvSeparatorDirective,
   detectCsvSeparator,
   readCsvStream,
+  csvMaxRowBytes,
+  csvReadError,
+  tooManyColumnsError,
+  MAX_HEADER_CHARS,
   stripCsvSeparatorDirective,
   assertSupportedFileBuffer,
   readWorkbookRows,

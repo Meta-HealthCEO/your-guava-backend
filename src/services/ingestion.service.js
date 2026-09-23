@@ -5,6 +5,8 @@ const {
   parseBuffer,
   normaliseRow,
   readCsvStream,
+  csvReadError,
+  tooManyColumnsError,
   readWorkbookRows,
   readWorkbook,
   assertSupportedFileBuffer,
@@ -83,7 +85,7 @@ const extractHeaders = async (buffer, fileExt = 'csv') => {
       resolve(h);
       stream.destroy();
     });
-    stream.on('error', reject);
+    stream.on('error', (error) => reject(csvReadError(error)));
     stream.on('end', () => {
       if (!captured) resolve([]);
     });
@@ -106,17 +108,23 @@ const previewBuffer = async (buffer, fileExt = 'csv') => {
     const rows = [];
     let headers = [];
     let settled = false;
-    const parserStream = readCsvStream(buffer);
+    const parserStream = readCsvStream(buffer, limits);
     parserStream
       .on('headers', (h) => {
         if (h.length > limits.maxColumns) {
-          parserStream.destroy(new Error(`File exceeds the ${limits.maxColumns} column limit`));
+          parserStream.destroy(tooManyColumnsError(limits));
           return;
         }
         headers = h;
       })
       .on('data', (row) => {
         if (settled) return;
+        // Preview used to copy a row of any width; one line of separators was a
+        // ten-million-key object before anything looked at it.
+        if (Object.keys(row).length > limits.maxColumns) {
+          parserStream.destroy(tooManyColumnsError(limits));
+          return;
+        }
         if (rows.length < 5) rows.push(normaliseRow(row));
         if (rows.length === 5) {
           settled = true;
@@ -127,8 +135,9 @@ const previewBuffer = async (buffer, fileExt = 'csv') => {
       .on('error', (error) => {
         if (settled) return;
         settled = true;
-        if (!error.statusCode) error.statusCode = 400;
-        reject(error);
+        const mapped = csvReadError(error, limits);
+        if (!mapped.statusCode) mapped.statusCode = 400;
+        reject(mapped);
       })
       .on('end', () => {
         if (settled) return;

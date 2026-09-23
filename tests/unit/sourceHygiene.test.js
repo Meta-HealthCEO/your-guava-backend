@@ -76,4 +76,25 @@ describe('source hygiene', () => {
       .map((file) => path.relative(SRC_ROOT, file));
     expect(copies).toEqual([]);
   });
+
+  it('gives every csv-parser a row byte limit', () => {
+    const sites = [];
+    for (const file of files) {
+      const source = fs.readFileSync(file, 'utf8');
+      for (const match of source.matchAll(/\bcsv\(\{/g)) {
+        let depth = 0;
+        let end = match.index + 'csv('.length;
+        for (; end < source.length; end += 1) {
+          if (source[end] === '{') depth += 1;
+          if (source[end] === '}' && --depth === 0) break;
+        }
+        sites.push({
+          where: `${path.relative(SRC_ROOT, file)}:${lineOf(source, match.index)}`,
+          options: source.slice(match.index, end + 1),
+        });
+      }
+    }
+    expect(sites.length).toBeGreaterThan(0);
+    expect(sites.filter((site) => !/maxRowBytes\s*:/.test(site.options)).map((site) => site.where)).toEqual([]);
+  });
 });
