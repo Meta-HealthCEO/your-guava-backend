@@ -18,7 +18,7 @@ const getPlanCapacity = async (orgId, planId, { session } = {}) => {
       }),
       session
     ),
-    withSession(Cafe.countDocuments({ orgId }), session),
+    withSession(Cafe.countDocuments({ orgId, archivedAt: null }), session),
   ]);
   const seats = activeSeats + pendingSeats;
 

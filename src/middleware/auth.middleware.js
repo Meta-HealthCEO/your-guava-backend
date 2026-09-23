@@ -3,14 +3,26 @@ const User = require('../models/User.model');
 const Organization = require('../models/Organization.model');
 const { billingAccessForOrganization } = require('../services/usage.service');
 
-const BILLING_EXEMPT_PATHS = ['/api/account', '/api/auth'];
+const BILLING_EXEMPT_PREFIXES = ['/api/account', '/api/auth'];
+const OBJECT_ID = '[a-f0-9]{24}';
+// A lapsed organisation must still be able to shrink to a smaller plan, or checkout refuses the downgrade it needs (identity-7).
+// Only routes that read, or reduce seats and locations, are exempt; nothing that adds data or spends credits.
+const BILLING_EXEMPT_ROUTES = [
+  ['GET', /^\/api\/team\/?$/],
+  ['DELETE', new RegExp(`^/api/team/${OBJECT_ID}$`, 'i')],
+  ['DELETE', new RegExp(`^/api/team/invitations/${OBJECT_ID}$`, 'i')],
+  ['POST', new RegExp(`^/api/team/cafes/${OBJECT_ID}/archive$`, 'i')],
+  ['POST', /^\/api\/team\/switch-cafe$/],
+  ['GET', /^\/api\/cafe\/list$/],
+];
 
 const sessionExpired = (res) =>
   res.status(401).json({ success: false, message: 'Session expired. Please sign in again' });
 
 const isBillingExempt = (req) => {
   const path = String(req.originalUrl || '').split('?')[0];
-  return BILLING_EXEMPT_PATHS.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
+  if (BILLING_EXEMPT_PREFIXES.some((prefix) => path === prefix || path.startsWith(`${prefix}/`))) return true;
+  return BILLING_EXEMPT_ROUTES.some(([method, pattern]) => req.method === method && pattern.test(path));
 };
 
 const authMiddleware = async (req, res, next) => {

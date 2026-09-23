@@ -84,6 +84,9 @@ const cafeSchema = new mongoose.Schema(
     lastSyncAt: {
       type: Date,
     },
+    // Archived locations keep all their data but leave quotas, lists and access (identity-8). Null means active.
+    archivedAt: { type: Date, default: null },
+    archivedByUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     accountingIntegrations: {
       xero: {
         connected: { type: Boolean, default: false },
@@ -124,5 +127,6 @@ const cafeSchema = new mongoose.Schema(
 );
 
 cafeSchema.index({ orgId: 1, createdAt: 1 });
+cafeSchema.index({ orgId: 1, archivedAt: 1 });
 
 module.exports = mongoose.model('Cafe', cafeSchema);

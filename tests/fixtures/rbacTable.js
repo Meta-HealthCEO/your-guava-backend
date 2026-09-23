@@ -58,6 +58,8 @@ const RBAC_TABLE = [
   ['PUT', '/api/team/:userId/cafes', 'owner', 'team administration'],
   ['POST', '/api/team/transfer-ownership', 'owner', 'team administration'],
   ['POST', '/api/team/add-cafe', 'owner', 'locations are billed'],
+  ['POST', '/api/team/cafes/:cafeId/archive', 'owner', 'locations are billed; data is kept (identity-8)'],
+  ['POST', '/api/team/cafes/:cafeId/restore', 'owner', 'locations are billed'],
   ['GET', '/api/analytics/revenue', 'member', 'read'],
   ['GET', '/api/analytics/items', 'member', 'read'],
   ['GET', '/api/analytics/heatmap', 'member', 'read'],

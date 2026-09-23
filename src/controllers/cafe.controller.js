@@ -61,16 +61,17 @@ const listCafes = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
+    const includeArchived = user.role === 'owner' && req.query.includeArchived === 'true';
     let cafes;
     if (user.role === 'owner') {
-      // Owners see all cafes in their org
-      cafes = await Cafe.find({ orgId: user.orgId }).select('name location').lean();
+      // Owners see every active cafe in their org; Team asks for archived ones too so it can offer Restore.
+      cafes = await Cafe.find({ orgId: user.orgId, ...(includeArchived ? {} : { archivedAt: null }) })
+        .select('name location archivedAt')
+        .lean();
     } else {
-      // Managers only see assigned cafes
-      cafes = await Cafe.find({
-        _id: { $in: user.cafeIds },
-        orgId: user.orgId,
-      }).select('name location').lean();
+      cafes = await Cafe.find({ _id: { $in: user.cafeIds }, orgId: user.orgId, archivedAt: null })
+        .select('name location')
+        .lean();
     }
 
     return res.status(200).json({ success: true, cafes });

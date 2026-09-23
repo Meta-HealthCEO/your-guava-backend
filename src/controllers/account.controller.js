@@ -122,7 +122,7 @@ const buildAccountPayload = async (userId) => {
       status: 'pending',
       expiresAt: { $gt: new Date() },
     }),
-    Cafe.countDocuments({ orgId: org._id }),
+    Cafe.countDocuments({ orgId: org._id, archivedAt: null }),
   ]);
   const seatCount = activeSeatCount + pendingSeatCount;
 

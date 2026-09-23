@@ -8,6 +8,7 @@ const TeamInvitation = require('../models/TeamInvitation.model');
 const AuthSession = require('../models/AuthSession.model');
 const AccessAuditEvent = require('../models/AccessAuditEvent.model');
 const { getPlan } = require('../services/billingPlans.service');
+const { getPlanCapacity } = require('../services/planCapacity.service');
 const emailService = require('../services/email.service');
 const { refreshCookieOptions } = require('../config/posture');
 const { isValidEmail } = require('../utils/email');
@@ -126,7 +127,7 @@ const buildSeatSummary = async (orgId) => {
 
 const validateCafeAccess = async (orgId, cafeIds = [], session = null) => {
   const requestedIds = [...new Set((Array.isArray(cafeIds) ? cafeIds : []).map(String))];
-  const query = Cafe.find({ orgId, _id: { $in: requestedIds } }).select('_id');
+  const query = Cafe.find({ orgId, _id: { $in: requestedIds }, archivedAt: null }).select('_id');
   if (session) query.session(session);
   const orgCafes = await query;
   const orgCafeIds = orgCafes.map((cafe) => cafe._id.toString());
@@ -983,7 +984,7 @@ const transferOwnership = async (req, res, next) => {
         error.statusCode = 409;
         throw error;
       }
-      const cafes = await Cafe.find({ orgId: org._id }).select('_id').session(session);
+      const cafes = await Cafe.find({ orgId: org._id, archivedAt: null }).select('_id').session(session);
       const allCafeIds = cafes.map((cafe) => cafe._id);
       if (allCafeIds.length === 0) {
         const error = new Error('An organization must have at least one cafe');
@@ -1155,7 +1156,7 @@ const addCafe = async (req, res, next) => {
       }
 
       const plan = getPlan(org.plan);
-      const locationCount = await Cafe.countDocuments({ orgId: owner.orgId }).session(session);
+      const locationCount = await Cafe.countDocuments({ orgId: owner.orgId, archivedAt: null }).session(session);
       if (locationCount >= plan.includedLocations) {
         const error = new Error(
           `Location limit reached on the ${plan.name} plan. Upgrade your plan to add more cafes.`
@@ -1209,6 +1210,149 @@ const addCafe = async (req, res, next) => {
   }
 };
 
+const CAFE_ID_RE = /^[a-f0-9]{24}$/i;
+
+const httpError = (statusCode, message, extra = {}) => Object.assign(new Error(message), { statusCode, ...extra });
+
+// POST /api/team/cafes/:cafeId/archive - Owner archives a location. Its data is kept; it leaves quotas and access (identity-8).
+const archiveCafe = async (req, res, next) => {
+  let session;
+  try {
+    const { cafeId } = req.params;
+    if (!CAFE_ID_RE.test(String(cafeId))) return res.status(404).json({ success: false, message: 'Location not found' });
+    let archived;
+    let plan;
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      // Touching the organization serialises location changes for this tenant, as addCafe does.
+      const org = await Organization.findOneAndUpdate(
+        { _id: req.user.orgId },
+        { $set: { updatedAt: new Date() }, $inc: { __v: 1 } },
+        { new: true, session }
+      );
+      if (!org) throw httpError(404, 'Organization not found');
+      plan = org.plan;
+      const cafe = await Cafe.findOne({ _id: cafeId, orgId: req.user.orgId, archivedAt: null }).session(session);
+      if (!cafe) throw httpError(404, 'Location not found');
+      const activeCount = await Cafe.countDocuments({ orgId: req.user.orgId, archivedAt: null }).session(session);
+      if (activeCount <= 1) {
+        throw httpError(409, 'An organisation needs at least one active location.', { code: 'LAST_LOCATION' });
+      }
+      const stranded = await User.find({ orgId: req.user.orgId, role: 'manager', cafeIds: cafe._id, 'cafeIds.1': { $exists: false } })
+        .select('name')
+        .session(session);
+      if (stranded.length > 0) {
+        throw httpError(
+          409,
+          `Give these managers another location or remove them first: ${stranded.map((member) => member.name).join(', ')}.`,
+          { code: 'LOCATION_HAS_MEMBERS', members: stranded.map((member) => ({ id: member._id, name: member.name })) }
+        );
+      }
+
+      cafe.archivedAt = new Date();
+      cafe.archivedByUserId = req.user.id;
+      await cafe.save({ session });
+      await User.updateMany({ orgId: req.user.orgId, cafeIds: cafe._id }, { $pull: { cafeIds: cafe._id } }, { session });
+      // Anyone whose default was this cafe moves to their first remaining one; their tabs reload onto it (BE-02-T04).
+      const moved = await User.find({ orgId: req.user.orgId, activeCafeId: cafe._id }).select('cafeIds').session(session);
+      for (const member of moved) {
+        await User.updateOne({ _id: member._id }, { $set: { activeCafeId: member.cafeIds[0] || null } }, { session });
+      }
+      await TeamInvitation.updateMany(
+        { orgId: req.user.orgId, status: 'pending', cafeIds: cafe._id },
+        { $pull: { cafeIds: cafe._id } },
+        { session }
+      );
+      await TeamInvitation.updateMany(
+        { orgId: req.user.orgId, status: 'pending', cafeIds: { $size: 0 } },
+        { $set: { status: 'revoked', revokedAt: new Date() } },
+        { session }
+      );
+      await recordAccessAudit({
+        orgId: req.user.orgId,
+        actorUserId: req.user.id,
+        action: 'location.archived',
+        details: { cafeId: cafe._id, name: cafe.name },
+        requestId: req.id,
+        session,
+      });
+      archived = cafe;
+    });
+
+    const capacity = await getPlanCapacity(req.user.orgId, plan);
+    return res.status(200).json({
+      success: true,
+      cafe: { _id: archived._id, name: archived.name, archivedAt: archived.archivedAt },
+      locations: capacity.locations,
+    });
+  } catch (error) {
+    if (error?.statusCode && error.statusCode < 500) {
+      return res.status(error.statusCode).json({
+        success: false,
+        message: error.message,
+        ...(error.code ? { code: error.code } : {}),
+        ...(error.members ? { members: error.members } : {}),
+      });
+    }
+    return next(error);
+  } finally {
+    if (session) await session.endSession();
+  }
+};
+
+// POST /api/team/cafes/:cafeId/restore - Owner brings an archived location back if the plan has room.
+const restoreCafe = async (req, res, next) => {
+  let session;
+  try {
+    const { cafeId } = req.params;
+    if (!CAFE_ID_RE.test(String(cafeId))) return res.status(404).json({ success: false, message: 'Location not found' });
+    let restored;
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      const org = await Organization.findOneAndUpdate(
+        { _id: req.user.orgId },
+        { $set: { updatedAt: new Date() }, $inc: { __v: 1 } },
+        { new: true, session }
+      );
+      if (!org) throw httpError(404, 'Organization not found');
+      const cafe = await Cafe.findOne({ _id: cafeId, orgId: req.user.orgId, archivedAt: { $ne: null } }).session(session);
+      if (!cafe) throw httpError(404, 'Location not found');
+      const plan = getPlan(org.plan);
+      const activeCount = await Cafe.countDocuments({ orgId: req.user.orgId, archivedAt: null }).session(session);
+      if (activeCount >= plan.includedLocations) {
+        throw httpError(402, `Location limit reached on the ${plan.name} plan. Archive another location or upgrade first.`, {
+          locations: { used: activeCount, included: plan.includedLocations, remaining: 0 },
+        });
+      }
+      cafe.archivedAt = null;
+      cafe.archivedByUserId = undefined;
+      await cafe.save({ session });
+      await User.updateOne({ _id: org.ownerId, orgId: org._id }, { $addToSet: { cafeIds: cafe._id } }, { session });
+      await recordAccessAudit({
+        orgId: req.user.orgId,
+        actorUserId: req.user.id,
+        action: 'location.restored',
+        details: { cafeId: cafe._id, name: cafe.name },
+        requestId: req.id,
+        session,
+      });
+      restored = cafe;
+    });
+    return res.status(200).json({ success: true, cafe: { _id: restored._id, name: restored.name, archivedAt: null } });
+  } catch (error) {
+    if (error?.statusCode && error.statusCode < 500) {
+      return res.status(error.statusCode).json({
+        success: false,
+        message: error.message,
+        ...(error.locations ? { locations: error.locations } : {}),
+      });
+    }
+    return next(error);
+  } finally {
+    if (session) await session.endSession();
+  }
+};
+
 module.exports = {
   inviteManager,
   previewInvitation,
@@ -1223,4 +1367,6 @@ module.exports = {
   transferOwnership,
   switchCafe,
   addCafe,
+  archiveCafe,
+  restoreCafe,
 };

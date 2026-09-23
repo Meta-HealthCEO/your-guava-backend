@@ -35,6 +35,8 @@ const accessAuditEventSchema = new mongoose.Schema(
         'session.reuse_detected',
         'org.renamed',
         'org.billing_email_changed',
+        'location.archived',
+        'location.restored',
       ],
       index: true,
     },
