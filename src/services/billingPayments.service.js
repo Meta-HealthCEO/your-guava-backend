@@ -1,14 +1,12 @@
 const crypto = require('crypto');
-const Cafe = require('../models/Cafe.model');
-const Forecast = require('../models/Forecast.model');
 const Organization = require('../models/Organization.model');
 const PaymentSession = require('../models/PaymentSession.model');
-const { addBillingCycle, getPlan, nextMonthlyAnniversary } = require('./billingPlans.service');
+const { getPlan, nextMonthlyAnniversary } = require('./billingPlans.service');
 const paymentProvider = require('./paymentProvider.service');
 const User = require('../models/User.model');
 const { getPlanCapacity } = require('./planCapacity.service');
 const { bonusUsedForCredits } = require('./usage.service');
-const { safeTimezone, zonedDayStart } = require('./parser.service');
+const { invalidateFutureForecastsForOrg, billingPeriodForPayment } = require('./billing/periods');
 
 const PROCESSING_LEASE_MS = 2 * 60 * 1000;
 const INITIALIZATION_LEASE_MS = 60 * 1000;
@@ -66,19 +64,6 @@ const generateReference = (kind = 'plan') => {
   return `GG${marker}${Date.now().toString(36).toUpperCase()}${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
 };
 
-const invalidateFutureForecastsForOrg = async (orgId) => {
-  const cafes = await Cafe.find({ orgId }).select('_id timezone').lean();
-  if (cafes.length === 0) return;
-
-  const now = new Date();
-
-  await Forecast.deleteMany({
-    $or: cafes.map((cafe) => ({
-      cafeId: cafe._id,
-      date: { $gte: zonedDayStart(now, safeTimezone(cafe.timezone)) },
-    })),
-  });
-};
 
 const cardDetailsFromTransaction = (transaction) => {
   // Paystack reports the card under `authorization` with discrete fields.
@@ -112,24 +97,6 @@ const cardDetailsFromTransaction = (transaction) => {
   };
 };
 
-const billingPeriodForPayment = (org, billingCycle = 'monthly', now = new Date()) => {
-  const cycle = billingCycle === 'annual' ? 'annual' : 'monthly';
-  const existingEnd = org?.currentPeriodEnd ? new Date(org.currentPeriodEnd) : null;
-  const isRenewal =
-    org?.billingStatus === 'active' &&
-    org?.billingCycle === cycle &&
-    existingEnd &&
-    existingEnd > now;
-  const extensionStart = isRenewal ? existingEnd : now;
-
-  return {
-    billingCycle: cycle,
-    currentPeriodStart: isRenewal && org.currentPeriodStart
-      ? new Date(org.currentPeriodStart)
-      : new Date(now),
-    currentPeriodEnd: addBillingCycle(extensionStart, cycle),
-  };
-};
 
 const appliedReferences = (org) => (org?.fulfilledPaymentReferences || []).map(String);
 
