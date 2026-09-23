@@ -15,6 +15,7 @@ const { isValidEmail } = require('../utils/email');
 const { passwordTooLong, passwordInputError, dummyPasswordHash } = require('../utils/password');
 const { runAfterResponse } = require('../utils/afterResponse');
 const authThrottle = require('../services/authThrottle.service');
+const { resolveSessionCafeId } = require('../utils/sessionCafe');
 
 const COOKIE_OPTIONS = {
   httpOnly: true,
@@ -154,7 +155,7 @@ const pruneAuthSessions = async (userId) => {
   }
 };
 
-const issueSession = async (user) => {
+const issueSession = async (user, { cafeId: requestedCafeId } = {}) => {
   const familyId = crypto.randomUUID();
   const refreshToken = generateRefreshToken(user._id, familyId);
   await AuthSession.create({
@@ -165,15 +166,11 @@ const issueSession = async (user) => {
   });
   await pruneAuthSessions(user._id);
 
+  const cafeId = resolveSessionCafeId(user, requestedCafeId);
   return {
-    accessToken: generateAccessToken(
-      user._id,
-      user.activeCafeId,
-      user.role,
-      user.orgId,
-      user.tokenVersion
-    ),
+    accessToken: generateAccessToken(user._id, cafeId, user.role, user.orgId, user.tokenVersion),
     refreshToken,
+    cafeId,
   };
 };
 
@@ -484,7 +481,7 @@ const login = async (req, res, next) => {
       });
     }
 
-    const { accessToken, refreshToken } = await issueSession(user);
+    const { accessToken, refreshToken, cafeId } = await issueSession(user);
 
     const cookieOptions = {
       ...COOKIE_OPTIONS,
@@ -503,7 +500,7 @@ const login = async (req, res, next) => {
         role: user.role,
         orgId: user.orgId,
         cafeIds: user.cafeIds,
-        activeCafeId: user.activeCafeId,
+        activeCafeId: cafeId,
         permissions: {
           canSpendCredits: user.role === 'owner' || Boolean(user.permissions?.canSpendCredits),
         },
@@ -516,6 +513,7 @@ const login = async (req, res, next) => {
 
 const refresh = async (req, res, next) => {
   try {
+    const requestedCafeId = req.body?.cafeId;
     const token = req.cookies?.refreshToken;
 
     if (!token) {
@@ -624,20 +622,16 @@ const refresh = async (req, res, next) => {
       if (!user) {
         return res.status(401).json({ success: false, message: 'Invalid or expired refresh token' });
       }
-      const issued = await issueSession(user);
+      const issued = await issueSession(user, { cafeId: requestedCafeId });
       newRefreshToken = issued.refreshToken;
     }
 
-    const accessToken = generateAccessToken(
-      user._id,
-      user.activeCafeId,
-      user.role,
-      user.orgId,
-      user.tokenVersion
-    );
+    // Identity-2: the tab says which cafe it is showing; the user record only supplies the default for a tab that has none.
+    const cafeId = resolveSessionCafeId(user, requestedCafeId);
+    const accessToken = generateAccessToken(user._id, cafeId, user.role, user.orgId, user.tokenVersion);
     res.cookie('refreshToken', newRefreshToken, COOKIE_OPTIONS);
 
-    return res.status(200).json({ success: true, accessToken });
+    return res.status(200).json({ success: true, accessToken, cafeId });
   } catch (error) {
     if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
       return res.status(401).json({ success: false, message: 'Invalid or expired refresh token' });
@@ -915,7 +909,8 @@ const me = async (req, res, next) => {
       role: user.role,
       orgId: user.orgId,
       cafeIds: user.cafeIds,
-      activeCafeId: user.activeCafeId,
+      // The calling token's cafe (identity-2), not the database default.
+      activeCafeId: req.user.cafeId || null,
       emailVerified: user.emailVerified !== false,
       permissions: {
         canSpendCredits: user.role === 'owner' || Boolean(user.permissions?.canSpendCredits),

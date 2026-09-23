@@ -51,6 +51,17 @@ const authMiddleware = async (req, res, next) => {
       return sessionExpired(res);
     }
 
+    // Identity-2: a tab states which cafe it is showing. A token for another cafe must not act for it, whatever produced the token.
+    const tabCafeId = req.get('x-cafe-id');
+    if (tabCafeId !== undefined && tabCafeId !== '' && String(tabCafeId).toLowerCase() !== (tokenCafeId || '').toLowerCase()) {
+      return res.status(409).json({
+        success: false,
+        code: 'CAFE_CONTEXT_MISMATCH',
+        cafeId: tokenCafeId,
+        message: 'This tab is showing a different cafe. Reload the page to continue.',
+      });
+    }
+
     const organization = await Organization.findById(liveOrgId).lean();
     if (!organization) return sessionExpired(res);
 
