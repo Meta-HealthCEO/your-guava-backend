@@ -923,6 +923,12 @@ describe('xlsx workbook reading', () => {
         extraRowsXml: '<row r="1048576"><c r="Z1048576" t="inlineStr"><is><t>x</t></is></c></row>',
       }],
       ['a declared size with no column letters (A1:1000000000)', { dimension: 'A1:1000000000' }],
+      // The reader builds one array per row, so a thin sheet costs by its rows:
+      // ten million rows of one column is ~640 MB, though only 10M "cells".
+      ['a declared ten million rows of one column (A1:A10000000)', { dimension: 'A1:A10000000' }],
+      ['one real cell at A10000000 and no declared size', {
+        extraRowsXml: '<row r="10000000"><c r="A10000000" t="inlineStr"><is><t>x</t></is></c></row>',
+      }],
     ])('refuses %s with a 400, and the API keeps its memory', async (_label, options) => {
       const bomb = xlsxWith(SALES, options);
       expect(bomb.length).toBeLessThan(4096);
@@ -942,6 +948,15 @@ describe('xlsx workbook reading', () => {
         secondSheetXml: '<dimension ref="A1:XFD1048576"/><sheetData><row r="1048576"><c r="XFD1048576" t="inlineStr"><is><t>note</t></is></c></row></sheetData>',
       });
       expect(await readWorkbookRows(workbook)).toHaveLength(1);
+    });
+
+    it("borrows the reader's internal steps from the version they were taken from", () => {
+      // readFirstSheet calls read-excel-file 9.2.0's own internal modules. 9.3
+      // moved them (it parses with saxen), and package.json allows ^9.2.0 - so a
+      // lockfile refresh must fail here, loudly, before it reaches production.
+      const root = path.join(path.dirname(require.resolve('read-excel-file/node')), '..');
+      const { version } = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+      expect(version).toBe('9.2.0');
     });
 
     it('still reads a workbook whose declared size overshoots its data', async () => {
