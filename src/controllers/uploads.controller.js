@@ -1,7 +1,6 @@
 const mongoose = require('mongoose');
 const { backgroundJobsInline } = require('../config/flags');
 const fs = require('fs');
-const crypto = require('crypto');
 const Upload = require('../models/Upload.model');
 const Transaction = require('../models/Transaction.model');
 const Cafe = require('../models/Cafe.model');
@@ -14,9 +13,12 @@ const { normaliseTransactionStatus } = require('../utils/transactionStatus');
 const { updateForecastActuals, generateWeekForecast } = require('../services/forecast.service');
 const { computeDedupKey } = require('../utils/dedupKey');
 const { clearApiCache } = require('../middleware/cache.middleware');
+const {
+  MAX_LIST_PAGE, STORAGE_CLEANUP_PENDING, ABANDONED_CLEANUP_CLAIM, CONFIRMATION_KEY_MAX_LENGTH, sha256, confirmationMappingHash,
+  sanitizeRowErrors, confirmationResponse, boundedInteger, validateMapping, assertImportableResult, assertParsedRowsImportable,
+  getCafeTimezone,
+} = require('./uploads/shared');
 
-const REQUIRED = ['date', 'items', 'total'];
-const VALID_ITEMS_MODES = new Set(['packed', 'line-per-row']);
 const DEFAULT_PARSING_LEASE_MS = 15 * 60 * 1000;
 const MAX_PARSING_LEASE_MS = 60 * 60 * 1000;
 const DEFAULT_PENDING_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -25,48 +27,6 @@ const MAX_MAINTENANCE_RETRY_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_MAINTENANCE_MAX_ATTEMPTS = 5;
 const MAX_CLEANUP_BATCH = 100;
 const MAX_ACTUALS_REFRESH_FORECASTS = 366;
-const MAX_LIST_PAGE = 10000;
-const STORAGE_CLEANUP_PENDING = 'Stored file cleanup pending; background cleanup will retry.';
-const ABANDONED_CLEANUP_CLAIM = 'Removing an abandoned unconfirmed upload.';
-const SEVERE_PARTIAL_MIN_ERRORS = 10;
-const SEVERE_PARTIAL_ERROR_RATIO = 0.25;
-const CONFIRMATION_KEY_MAX_LENGTH = 160;
-const MAPPING_FIELDS = [
-  'receiptId', 'date', 'time', 'items', 'total', 'tip', 'discount',
-  'paymentMethod', 'status', 'quantity',
-];
-
-const sha256 = (value) =>
-  crypto.createHash('sha256').update(String(value)).digest('hex');
-
-const confirmationMappingHash = (columnMapping, itemsMode) => sha256(JSON.stringify({
-  itemsMode,
-  columnMapping: Object.fromEntries(
-    MAPPING_FIELDS.map((field) => [field, columnMapping?.[field] || null])
-  ),
-}));
-
-const sanitizeRowErrors = (rowErrors) =>
-  (Array.isArray(rowErrors) ? rowErrors : []).slice(0, 50).map((rowError) => ({
-    rowNumber: rowError?.rowNumber,
-    reason: String(rowError?.reason || 'Could not import row').slice(0, 500),
-  }));
-
-const confirmationResponse = (upload, { replayed = false } = {}) => ({
-  success: true,
-  uploadId: upload._id,
-  stats: upload.stats,
-  dateRange: upload.dateRange,
-  rowErrors: sanitizeRowErrors(upload.rowErrors),
-  maintenance: upload.maintenance || { status: 'queued' },
-  replayed,
-});
-
-const boundedInteger = (value, fallback, min, max) => {
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(min, Math.min(parsed, max));
-};
 
 const parsingLeaseMs = () => boundedInteger(
   process.env.UPLOAD_PARSING_LEASE_MS,
@@ -100,98 +60,6 @@ const maintenanceRetryDelayMs = (attempts) => {
     MAX_MAINTENANCE_RETRY_MS,
     baseDelay * (2 ** Math.max(0, Number(attempts || 1) - 1))
   );
-};
-
-const validateMapping = (upload, columnMapping, itemsMode) => {
-  const mode = itemsMode || 'packed';
-  if (!VALID_ITEMS_MODES.has(mode)) {
-    return `Invalid itemsMode: ${itemsMode}`;
-  }
-
-  const required = mode === 'line-per-row' ? [...REQUIRED, 'receiptId'] : REQUIRED;
-  const missing = required.filter((f) => !columnMapping?.[f]);
-  if (missing.length > 0) {
-    return `Missing required mapping: ${missing.join(', ')}`;
-  }
-
-  const headers = Array.isArray(upload?.headers) ? upload.headers : [];
-  if (headers.length > 0) {
-    const invalid = Object.entries(columnMapping || {})
-      .filter(([, value]) => value != null && value !== '' && (typeof value !== 'string' || !headers.includes(value)))
-      .map(([field, value]) => `${field} -> ${value}`);
-    if (invalid.length > 0) {
-      return `Mapped columns are not in this file: ${invalid.join(', ')}`;
-    }
-  }
-
-  return null;
-};
-
-const assertImportableResult = (result) => {
-  if (result.totalRows === 0) {
-    const err = new Error('No transaction rows found in this upload');
-    err.statusCode = 400;
-    throw err;
-  }
-
-  if (result.approvedRows === 0) {
-    const err = new Error('No approved transaction rows could be imported with this mapping');
-    err.statusCode = 400;
-    throw err;
-  }
-
-  if (result.imported === 0 && result.duplicateRows >= result.approvedRows) {
-    const err = new Error('No new transactions were imported; every valid row already exists');
-    err.statusCode = 409;
-    throw err;
-  }
-
-  if (result.imported === 0 && result.errors > 0 && result.errors >= result.totalRows) {
-    const err = new Error('No valid transaction rows could be imported with this mapping');
-    err.statusCode = 400;
-    throw err;
-  }
-};
-
-const assertParsedRowsImportable = (parsed, { allowSeverePartial = false } = {}) => {
-  if (parsed.totalRows === 0) {
-    const err = new Error('No transaction rows found in this upload');
-    err.statusCode = 400;
-    throw err;
-  }
-
-  if (parsed.rows.length === 0 && parsed.errors > 0 && parsed.errors >= parsed.totalRows) {
-    const err = new Error('No valid transaction rows could be imported with this mapping');
-    err.statusCode = 400;
-    throw err;
-  }
-
-  const approvedRows = parsed.rows.filter((row) => normaliseTransactionStatus(row.status).status === 'approved');
-  if (approvedRows.length === 0) {
-    const err = new Error('No approved transaction rows could be imported with this mapping');
-    err.statusCode = 400;
-    throw err;
-  }
-
-  const errorRatio = parsed.totalRows > 0 ? parsed.errors / parsed.totalRows : 0;
-  if (
-    !allowSeverePartial &&
-    parsed.errors >= SEVERE_PARTIAL_MIN_ERRORS &&
-    errorRatio >= SEVERE_PARTIAL_ERROR_RATIO
-  ) {
-    const err = new Error(
-      `${parsed.errors} of ${parsed.totalRows} rows could not be parsed. Fix the mapping or explicitly allow a partial import.`
-    );
-    err.statusCode = 422;
-    err.code = 'SEVERE_PARTIAL_IMPORT';
-    err.details = {
-      errors: parsed.errors,
-      totalRows: parsed.totalRows,
-      errorRatio: Number(errorRatio.toFixed(4)),
-      rowErrors: sanitizeRowErrors(parsed.rowErrors),
-    };
-    throw err;
-  }
 };
 
 const recoverStaleParsingUpload = async (upload, cafeId) => {
@@ -348,11 +216,6 @@ const assertRemapHasImportableRows = async (parsed, cafeId, uploadId, sourceFing
     err.statusCode = 409;
     throw err;
   }
-};
-
-const getCafeTimezone = async (cafeId) => {
-  const cafe = await Cafe.findById(cafeId).select('timezone').lean();
-  return parser.safeTimezone(cafe?.timezone);
 };
 
 const invalidatePlanningForecasts = async (cafeId, timezone) => {
