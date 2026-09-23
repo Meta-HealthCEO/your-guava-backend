@@ -2,6 +2,18 @@
 // Moved from anthropic.service.js by BE-11-T02; behaviour unchanged.
 const { modelId } = require('./prompts');
 
+// Every text block, in order. A response that leads with a thinking or tool block, or splits
+// its answer across two text blocks, still yields the whole answer (analytics-ai-10).
+const joinTextBlocks = (message) => (message?.content || [])
+  .map((part) => (part?.type === 'text' ? part.text : ''))
+  .join('')
+  .trim();
+
+// The column mapper's read: block 0 only. Kept, named, so BE-05-T03 can retire it with a test.
+const firstBlockText = (message) => message.content[0]?.text || '';
+
+const stripJsonFences = (text) => text.replace(/```json|```/g, '').trim();
+
 const providerDiagnostics = (response, startedAt, operation) => ({
   operation,
   model: response?.model || modelId(),
@@ -39,5 +51,5 @@ const validatedInsightStrings = (value) => {
 };
 
 module.exports = {
-  providerDiagnostics, validatedInsightStrings,
+  joinTextBlocks, firstBlockText, stripJsonFences, providerDiagnostics, validatedInsightStrings,
 };

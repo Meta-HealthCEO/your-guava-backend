@@ -5,7 +5,7 @@ const { withUsageDiagnostics, meterGuavaCredits } = require('../usage.service');
 const { createAnthropicClient, withAnthropicErrors } = require('../anthropicClient.service');
 const { isValidEmail } = require('../../utils/email');
 const { modelId, COLUMN_MAPPING_SYSTEM_PROMPT, columnMappingUserPrompt } = require('./prompts');
-const { providerDiagnostics } = require('./json');
+const { firstBlockText, stripJsonFences, providerDiagnostics } = require('./json');
 const { headersLookHeaderless, summarizeMappingSamples } = require('./pii');
 
 const MAPPING_CACHE_TTL_MS = 60 * 60 * 1000;
@@ -73,7 +73,7 @@ const proposeColumnMappingWithClaude = async (headers, sampleSummary) => {
     system: COLUMN_MAPPING_SYSTEM_PROMPT,
     messages: [{ role: 'user', content: columnMappingUserPrompt(headers, sampleSummary) }],
   }), 'proposeColumnMapping');
-  const text = (message.content[0]?.text || '').replace(/```json|```/g, '').trim();
+  const text = stripJsonFences(firstBlockText(message));
   let parsed;
   try {
     parsed = JSON.parse(text);

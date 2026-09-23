@@ -13,7 +13,7 @@ const {
   modelId, missingInsightsKeyResponse, buildSummaryStats, MAX_FORECAST_ITEMS_IN_PROMPT, insufficientInsightDataResponse,
   INSIGHTS_SYSTEM_PROMPT, insightsUserPrompt,
 } = require('./prompts');
-const { validatedInsightStrings, providerDiagnostics } = require('./json');
+const { joinTextBlocks, stripJsonFences, validatedInsightStrings, providerDiagnostics } = require('./json');
 const { insightDatasetIsTooThin } = require('./context');
 const { throwIfAborted, waitWithAbort } = require('./stream');
 
@@ -147,15 +147,12 @@ const generateInsights = async (cafeId, { signal } = {}) => {
   // block 0 turned any response that led with a non-text block — or split the
   // JSON array across two text blocks — into a 502 the owner sees as a provider
   // outage, when the provider had in fact answered.
-  const content = (message?.content || [])
-    .map((part) => (part?.type === 'text' ? part.text : ''))
-    .join('')
-    .trim() || '[]';
+  const content = joinTextBlocks(message) || '[]';
 
   let parsed;
   try {
     // Strip any accidental markdown code fences
-    const cleaned = content.replace(/```json|```/g, '').trim();
+    const cleaned = stripJsonFences(content);
     parsed = JSON.parse(cleaned);
   } catch {
     parsed = null;
