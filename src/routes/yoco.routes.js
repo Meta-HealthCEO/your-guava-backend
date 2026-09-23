@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth.middleware');
+// Connecting, syncing and disconnecting the POS are owner-only, like the accounting integrations (billing-5).
+const { ownerOnly } = require('../middleware/rbac.middleware');
 const Cafe = require('../models/Cafe.model');
 const {
   getAuthorizationUrl,
@@ -17,14 +19,14 @@ const {
 const { encryptSecret } = require('../services/secrets.service');
 
 // GET /api/yoco/auth — Get OAuth authorization URL
-router.get('/auth', authMiddleware, (req, res) => {
+router.get('/auth', authMiddleware, ownerOnly, (req, res) => {
   const state = createOAuthState(req.user.cafeId);
   const url = getAuthorizationUrl(state);
   res.json({ success: true, url });
 });
 
 // POST /api/yoco/callback — Exchange OAuth code for tokens
-router.post('/callback', authMiddleware, async (req, res, next) => {
+router.post('/callback', authMiddleware, ownerOnly, async (req, res, next) => {
   try {
     const { code, state } = req.body;
     if (!code) {
@@ -70,7 +72,7 @@ router.get('/status', authMiddleware, async (req, res, next) => {
 });
 
 // POST /api/yoco/sync — Manual full sync (pull all historical orders)
-router.post('/sync', authMiddleware, async (req, res, next) => {
+router.post('/sync', authMiddleware, ownerOnly, async (req, res, next) => {
   try {
     const cafe = await Cafe.findById(req.user.cafeId).select(
       '+yocoTokens.accessToken +yocoTokens.refreshToken'
@@ -124,7 +126,7 @@ router.post('/webhook', async (req, res) => {
 });
 
 // POST /api/yoco/disconnect — Disconnect Yoco
-router.post('/disconnect', authMiddleware, async (req, res, next) => {
+router.post('/disconnect', authMiddleware, ownerOnly, async (req, res, next) => {
   try {
     await Cafe.findByIdAndUpdate(req.user.cafeId, {
       $set: { yocoConnected: false },

@@ -11,7 +11,8 @@ router.get('/', authMiddleware, uploads.list);
 router.get('/:id/rows', authMiddleware, uploads.rows);
 router.get('/:id', authMiddleware, uploads.detail);
 router.post('/:id/confirm', authMiddleware, parseLimiter, uploads.confirm);
-router.patch('/:id/mapping', authMiddleware, parseLimiter, uploads.remap);
+// Re-mapping deletes and re-imports the upload: owner-only, like DELETE (security-4, WS-07-T02).
+router.patch('/:id/mapping', authMiddleware, ownerOnly, parseLimiter, uploads.remap);
 router.delete('/:id', authMiddleware, ownerOnly, uploads.remove);
 
 module.exports = router;

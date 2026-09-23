@@ -2,9 +2,11 @@ const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth.middleware');
 const { apiCache } = require('../middleware/cache.middleware');
+const { requireActiveCafe } = require('../middleware/requireCafe.middleware');
 const analytics = require('../controllers/analytics.controller');
 
 router.use(authMiddleware);
+router.use(requireActiveCafe);
 
 const analyticsCache = apiCache({ ttlMs: 60000, keyPrefix: 'analytics' });
 

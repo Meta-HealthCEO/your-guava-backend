@@ -2,6 +2,7 @@ const mockHistoryCache = jest.fn((_req, _res, next) => next());
 
 jest.mock('../../src/middleware/auth.middleware', () => (_req, _res, next) => next());
 jest.mock('../../src/middleware/rbac.middleware', () => ({
+  ownerOnly: (_req, _res, next) => next(),
   requireCreditSpend: (_req, _res, next) => next(),
 }));
 jest.mock('../../src/middleware/rateLimit.middleware', () => ({

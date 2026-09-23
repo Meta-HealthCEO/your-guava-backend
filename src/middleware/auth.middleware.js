@@ -46,7 +46,8 @@ const authMiddleware = async (req, res, next) => {
       !liveOrgId ||
       tokenOrgId !== liveOrgId ||
       decoded.role !== user.role ||
-      (tokenCafeId && !liveCafeIds.includes(tokenCafeId))
+      // WS-07-T04: a token must name a cafe the user can open; only a user with no cafes may carry none.
+      (tokenCafeId ? !liveCafeIds.includes(tokenCafeId) : liveCafeIds.length > 0)
     ) {
       return sessionExpired(res);
     }

@@ -8,8 +8,7 @@ router.use(authMiddleware);
 
 router.get('/list', listCafes);
 router.get('/me', getMe);
-// Name, location and trading hours are forecast inputs; editing them wipes
-// future forecasts, so only the owner may do it.
+// Owner-only: configuration and destructive re-processing (tests/fixtures/rbacTable.js states the whole policy).
 router.put('/me', ownerOnly, updateMe);
 
 module.exports = router;
