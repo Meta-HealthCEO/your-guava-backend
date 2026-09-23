@@ -218,6 +218,35 @@ const sendVerificationEmail = async ({ registration, verificationToken }) => {
   });
 };
 
+// Register answers an existing address exactly like a new one (identity-4); the real owner learns about the attempt here.
+const sendAccountExistsEmail = async ({ user }) => {
+  const loginUrl = `${appUrl()}/login`;
+  const resetUrl = `${appUrl()}/forgot-password`;
+  const html = baseHtml({
+    title: 'You already have a Your Guava account',
+    intro: 'Someone just tried to create a new account with this email address.',
+    ctaLabel: 'Sign in',
+    ctaUrl: loginUrl,
+    children: `
+      <p style="margin:0 0 14px;">If it was you, sign in instead. Forgotten your password? Reset it at <a href="${escapeHtml(resetUrl)}" style="color:#6b8e3a;">${escapeHtml(resetUrl)}</a>.</p>
+      <p style="margin:0;color:#b8b8b8;">If it was not you, you do not need to do anything. Your account has not changed.</p>
+    `,
+  });
+  const text = plainLines([
+    'Someone just tried to create a new Your Guava account with this email address.',
+    `If it was you, sign in: ${loginUrl}`,
+    `Forgotten your password? ${resetUrl}`,
+    'If it was not you, you do not need to do anything. Your account has not changed.',
+  ]);
+  return sendEmail({
+    to: user.email,
+    subject: 'You already have a Your Guava account',
+    html,
+    text,
+    tags: [{ name: 'email_type', value: 'account_exists' }],
+  });
+};
+
 const sendPasswordResetEmail = async ({ user, resetToken, expiresAt }) => {
   if (!resetToken) throw new Error('Password reset token is required');
   const resetUrl = `${appUrl()}/reset-password#token=${encodeURIComponent(resetToken)}`;
@@ -301,6 +330,7 @@ const _resetClient = () => {
 module.exports = {
   sendWelcomeEmail,
   sendVerificationEmail,
+  sendAccountExistsEmail,
   sendPasswordResetEmail,
   sendTeamInviteEmail,
   sendEmail,

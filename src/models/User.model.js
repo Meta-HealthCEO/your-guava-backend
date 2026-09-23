@@ -93,7 +93,9 @@ userSchema.pre('save', async function (next) {
 });
 
 userSchema.methods.comparePassword = async function (candidatePassword) {
-  return Boolean(this.password) && bcrypt.compare(candidatePassword, this.password);
+  // A non-string reaching bcrypt throws, which used to turn a login into a 500 only for real accounts (identity-12).
+  if (typeof candidatePassword !== 'string' || !this.password) return false;
+  return bcrypt.compare(candidatePassword, this.password);
 };
 
 module.exports = mongoose.model('User', userSchema);

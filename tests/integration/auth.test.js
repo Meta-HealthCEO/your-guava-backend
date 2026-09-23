@@ -12,6 +12,7 @@ const Cafe = require('../../src/models/Cafe.model');
 const Organization = require('../../src/models/Organization.model');
 const PendingRegistration = require('../../src/models/PendingRegistration.model');
 const PasswordResetToken = require('../../src/models/PasswordResetToken.model');
+const { settleAfterResponse } = require('../../src/utils/afterResponse');
 const AuthSession = require('../../src/models/AuthSession.model');
 const AccessAuditEvent = require('../../src/models/AccessAuditEvent.model');
 
@@ -160,6 +161,7 @@ describe('Auth API', () => {
       const unknown = await request
         .post('/api/auth/resend-verification')
         .send({ email: 'unknown@yourguava.com' });
+      await settleAfterResponse();
       expect(resent.status).toBe(200);
       expect(unknown.status).toBe(200);
       expect(unknown.body.message).toBe(resent.body.message);
@@ -364,6 +366,7 @@ describe('Auth API', () => {
       const unknown = await request
         .post('/api/auth/forgot-password')
         .send({ email: 'unknown@yourguava.com' });
+      await settleAfterResponse();
       expect(known.status).toBe(200);
       expect(known.body.message).toBe(unknown.body.message);
       expect(JSON.stringify(known.body)).not.toContain(resetToken);

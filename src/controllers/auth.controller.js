@@ -12,6 +12,8 @@ const AuthSession = require('../models/AuthSession.model');
 const AccessAuditEvent = require('../models/AccessAuditEvent.model');
 const emailService = require('../services/email.service');
 const { isValidEmail } = require('../utils/email');
+const { passwordTooLong, passwordInputError, dummyPasswordHash } = require('../utils/password');
+const { runAfterResponse } = require('../utils/afterResponse');
 
 const COOKIE_OPTIONS = {
   httpOnly: true,
@@ -23,7 +25,6 @@ const COOKIE_OPTIONS = {
 
 // Max active refresh-token families per user (roughly one per device).
 const MAX_REFRESH_TOKENS = 10;
-const MAX_PASSWORD_BYTES = 72;
 const ACTION_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
@@ -36,6 +37,23 @@ const INVALID_VERIFICATION_MESSAGE = 'This verification link is invalid or has e
 const REGISTER_ACCEPTED_MESSAGE =
   'Check your inbox for the next step. If this email can start a new account, the link to finish signing up is there. ' +
   'If it already has an account, we have sent sign-in help instead.';
+
+// New, pending and existing addresses leave register through this one function, so their answers cannot drift apart.
+const respondToRegistration = (res, emailResult, email) => {
+  if (!emailResult?.sent) {
+    console.error(
+      '[auth] Registration email could not be sent:',
+      emailResult?.error?.message || emailResult?.reason || 'unknown error'
+    );
+    return res.status(emailResult?.skipped ? 503 : 502).json({
+      success: false,
+      verificationRequired: true,
+      code: 'VERIFICATION_EMAIL_FAILED',
+      message: 'Your registration is saved, but the verification email could not be sent. Try resending it.',
+    });
+  }
+  return res.status(202).json({ success: true, verificationRequired: true, email, message: REGISTER_ACCEPTED_MESSAGE });
+};
 
 // Identity-1: a new submission replaces a pending one (password, names, token), so the old link dies. Two simultaneous
 // submissions race on the unique email index; the loser retries once and then updates the winner's document.
@@ -64,9 +82,6 @@ const upsertPendingRegistration = async (fields) => {
     throw error;
   }
 };
-
-const passwordTooLong = (password) =>
-  Buffer.byteLength(String(password), 'utf8') > MAX_PASSWORD_BYTES;
 
 const hashRefreshToken = (token) =>
   crypto.createHash('sha256').update(String(token)).digest('hex');
@@ -171,15 +186,9 @@ const register = async (req, res, next) => {
         .json({ success: false, message: 'Email, password, and name are required' });
     }
 
-    if (String(password).length < 8) {
-      return res
-        .status(400)
-        .json({ success: false, message: 'Password must be at least 8 characters' });
-    }
-    if (passwordTooLong(password)) {
-      return res
-        .status(400)
-        .json({ success: false, message: `Password cannot exceed ${MAX_PASSWORD_BYTES} UTF-8 bytes` });
+    const passwordError = passwordInputError(password);
+    if (passwordError) {
+      return res.status(400).json({ success: false, message: passwordError });
     }
 
     const normalizedEmail = String(email).toLowerCase().trim();
@@ -204,15 +213,17 @@ const register = async (req, res, next) => {
 
     const existingUser = await User.findOne({ email: normalizedEmail }).select('_id').lean();
     if (existingUser) {
-      // BE-02-T02 replaces this 409 with the uniform 202 and an "account exists" email.
-      return res.status(409).json({ success: false, message: 'Email already registered' });
+      // Identity-4: same status, body and work as a new address: one bcrypt hash, one email.
+      await bcrypt.hash(password, 10);
+      const notice = await emailService.sendAccountExistsEmail({ user: { email: normalizedEmail } });
+      return respondToRegistration(res, notice, normalizedEmail);
     }
 
     // Identity-3: a pending team invitation in any org no longer blocks a public signup.
     const verificationToken = generateActionToken();
     const registration = await upsertPendingRegistration({
       email: normalizedEmail,
-      passwordHash: await bcrypt.hash(String(password), 10),
+      passwordHash: await bcrypt.hash(password, 10),
       name: normalizedName,
       cafeName: normalizedCafeName,
       orgName: normalizedOrgName,
@@ -224,27 +235,48 @@ const register = async (req, res, next) => {
       registration,
       verificationToken,
     });
-    if (!emailResult?.sent) {
-      console.error(
-        '[auth] Verification email could not be sent:',
-        emailResult?.error?.message || emailResult?.reason || 'unknown error'
-      );
-      return res.status(emailResult?.skipped ? 503 : 502).json({
-        success: false,
-        verificationRequired: true,
-        code: 'VERIFICATION_EMAIL_FAILED',
-        message: 'Your registration is saved, but the verification email could not be sent. Try resending it.',
-      });
-    }
-
-    return res.status(202).json({
-      success: true,
-      verificationRequired: true,
-      email: normalizedEmail,
-      message: REGISTER_ACCEPTED_MESSAGE,
-    });
+    return respondToRegistration(res, emailResult, normalizedEmail);
   } catch (error) {
     next(error);
+  }
+};
+
+// Runs after the response (identity-4): rotating and emailing must not decide how long the answer takes.
+const rotateVerification = async (normalizedEmail) => {
+  const verificationToken = generateActionToken();
+  const tokenHash = hashActionToken(verificationToken);
+  const expiresAt = new Date(Date.now() + VERIFICATION_TTL_MS);
+  const previousRegistration = await PendingRegistration.findOneAndUpdate(
+    {
+      email: normalizedEmail,
+      expiresAt: { $gt: new Date() },
+      // $not also matches records written before this field existed.
+      resendCount: { $not: { $gte: MAX_VERIFICATION_RESENDS } },
+    },
+    { $set: { tokenHash, expiresAt }, $inc: { resendCount: 1 } },
+    { new: false, runValidators: true }
+  ).select('+tokenHash');
+  if (!previousRegistration) return;
+  const registration = {
+    ...previousRegistration.toObject(),
+    tokenHash: undefined,
+    expiresAt,
+  };
+  const result = await emailService.sendVerificationEmail({ registration, verificationToken });
+  if (!result?.sent) {
+    await PendingRegistration.updateOne(
+      { _id: previousRegistration._id, tokenHash },
+      {
+        $set: {
+          tokenHash: previousRegistration.tokenHash,
+          expiresAt: previousRegistration.expiresAt,
+        },
+      }
+    );
+    console.error(
+      '[auth] Verification resend failed:',
+      result?.error?.message || result?.reason || 'unknown error'
+    );
   }
 };
 
@@ -256,45 +288,8 @@ const resendVerification = async (req, res, next) => {
       success: true,
       message: 'If a pending registration exists, a new verification email has been sent.',
     };
-    if (!isValidEmail(normalizedEmail)) {
-      return res.status(200).json(genericResponse);
-    }
-
-    const verificationToken = generateActionToken();
-    const tokenHash = hashActionToken(verificationToken);
-    const expiresAt = new Date(Date.now() + VERIFICATION_TTL_MS);
-    const previousRegistration = await PendingRegistration.findOneAndUpdate(
-      {
-        email: normalizedEmail,
-        expiresAt: { $gt: new Date() },
-        // $not also matches records written before this field existed.
-        resendCount: { $not: { $gte: MAX_VERIFICATION_RESENDS } },
-      },
-      { $set: { tokenHash, expiresAt }, $inc: { resendCount: 1 } },
-      { new: false, runValidators: true }
-    ).select('+tokenHash');
-    if (previousRegistration) {
-      const registration = {
-        ...previousRegistration.toObject(),
-        tokenHash: undefined,
-        expiresAt,
-      };
-      const result = await emailService.sendVerificationEmail({ registration, verificationToken });
-      if (!result?.sent) {
-        await PendingRegistration.updateOne(
-          { _id: previousRegistration._id, tokenHash },
-          {
-            $set: {
-              tokenHash: previousRegistration.tokenHash,
-              expiresAt: previousRegistration.expiresAt,
-            },
-          }
-        );
-        console.error(
-          '[auth] Verification resend failed:',
-          result?.error?.message || result?.reason || 'unknown error'
-        );
-      }
+    if (isValidEmail(normalizedEmail)) {
+      runAfterResponse('verification resend', () => rotateVerification(normalizedEmail));
     }
     return res.status(200).json(genericResponse);
   } catch (error) {
@@ -432,12 +427,9 @@ const verifyEmail = async (req, res, next) => {
 
 const login = async (req, res, next) => {
   try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res
-        .status(400)
-        .json({ success: false, message: 'Email and password are required' });
+    const { email, password } = req.body || {};
+    if (!email || typeof password !== 'string' || password.length === 0) {
+      return res.status(400).json({ success: false, message: 'Email and password are required' });
     }
 
     const normalizedEmail = String(email).toLowerCase().trim();
@@ -447,6 +439,8 @@ const login = async (req, res, next) => {
 
     const user = await User.findOne({ email: normalizedEmail }).select('+password');
     if (!user) {
+      // Identity-4: an unknown address costs the same bcrypt compare as a wrong password for a real one.
+      await bcrypt.compare(password, await dummyPasswordHash());
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
@@ -674,47 +668,42 @@ const logout = async (req, res, next) => {
   }
 };
 
-const forgotPassword = async (req, res, next) => {
-  try {
-    const normalizedEmail =
-      typeof req.body?.email === 'string' ? req.body.email.toLowerCase().trim() : '';
-    const response = {
-      success: true,
-      message: 'If an account exists for that email, a password reset link has been sent.',
-    };
-    if (!isValidEmail(normalizedEmail)) {
-      return res.status(200).json(response);
-    }
+const FORGOT_PASSWORD_RESPONSE = {
+  success: true,
+  message: 'If an account exists for that email, a password reset link has been sent.',
+};
 
-    const user = await User.findOne({ email: normalizedEmail }).select('_id email name').lean();
-    if (!user) return res.status(200).json(response);
-
-    await PasswordResetToken.updateMany(
-      { userId: user._id, status: 'pending' },
+// Runs after the response, so its duration cannot tell anyone whether the account exists (identity-4).
+const deliverPasswordReset = async (normalizedEmail) => {
+  const user = await User.findOne({ email: normalizedEmail }).select('_id email name').lean();
+  if (!user) return;
+  await PasswordResetToken.updateMany(
+    { userId: user._id, status: 'pending' },
+    { $set: { status: 'revoked', revokedAt: new Date() } }
+  );
+  const resetToken = generateActionToken();
+  const record = await PasswordResetToken.create({
+    userId: user._id,
+    tokenHash: hashActionToken(resetToken),
+    expiresAt: new Date(Date.now() + PASSWORD_RESET_TTL_MS),
+  });
+  const result = await emailService.sendPasswordResetEmail({ user, resetToken, expiresAt: record.expiresAt });
+  if (!result?.sent) {
+    await PasswordResetToken.updateOne(
+      { _id: record._id, status: 'pending' },
       { $set: { status: 'revoked', revokedAt: new Date() } }
     );
-    const resetToken = generateActionToken();
-    const record = await PasswordResetToken.create({
-      userId: user._id,
-      tokenHash: hashActionToken(resetToken),
-      expiresAt: new Date(Date.now() + PASSWORD_RESET_TTL_MS),
-    });
-    const result = await emailService.sendPasswordResetEmail({
-      user,
-      resetToken,
-      expiresAt: record.expiresAt,
-    });
-    if (!result?.sent) {
-      await PasswordResetToken.updateOne(
-        { _id: record._id, status: 'pending' },
-        { $set: { status: 'revoked', revokedAt: new Date() } }
-      );
-      console.error(
-        '[auth] Password reset email failed:',
-        result?.error?.message || result?.reason || 'unknown error'
-      );
+    console.error('[auth] Password reset email failed:', result?.error?.message || result?.reason || 'unknown error');
+  }
+};
+
+const forgotPassword = async (req, res, next) => {
+  try {
+    const normalizedEmail = typeof req.body?.email === 'string' ? req.body.email.toLowerCase().trim() : '';
+    if (isValidEmail(normalizedEmail)) {
+      runAfterResponse('password reset delivery', () => deliverPasswordReset(normalizedEmail));
     }
-    return res.status(200).json(response);
+    return res.status(200).json(FORGOT_PASSWORD_RESPONSE);
   } catch (error) {
     return next(error);
   }
@@ -729,14 +718,9 @@ const resetPassword = async (req, res, next) => {
     if (!token) {
       return res.status(404).json({ success: false, message: 'This reset link is invalid or has expired' });
     }
-    if (typeof newPassword !== 'string' || newPassword.length < 8) {
-      return res.status(400).json({ success: false, message: 'Password must be at least 8 characters' });
-    }
-    if (passwordTooLong(newPassword)) {
-      return res.status(400).json({
-        success: false,
-        message: `Password cannot exceed ${MAX_PASSWORD_BYTES} UTF-8 bytes`,
-      });
+    const newPasswordError = passwordInputError(newPassword);
+    if (newPasswordError) {
+      return res.status(400).json({ success: false, message: newPasswordError });
     }
 
     session = await mongoose.startSession();
@@ -813,23 +797,17 @@ const resetPassword = async (req, res, next) => {
 const changePassword = async (req, res, next) => {
   let session;
   try {
-    const { currentPassword, newPassword } = req.body;
-
-    if (!currentPassword || !newPassword) {
-      return res
-        .status(400)
-        .json({ success: false, message: 'Current password and new password are required' });
+    const { currentPassword, newPassword } = req.body || {};
+    if (typeof currentPassword !== 'string' || !currentPassword || typeof newPassword !== 'string' || !newPassword) {
+      return res.status(400).json({ success: false, message: 'Current password and new password are required' });
     }
-
-    if (String(newPassword).length < 8) {
-      return res
-        .status(400)
-        .json({ success: false, message: 'New password must be at least 8 characters' });
+    const newPasswordError = passwordInputError(newPassword, { label: 'New password' });
+    if (newPasswordError) {
+      return res.status(400).json({ success: false, message: newPasswordError });
     }
-    if (passwordTooLong(newPassword)) {
-      return res
-        .status(400)
-        .json({ success: false, message: `New password cannot exceed ${MAX_PASSWORD_BYTES} UTF-8 bytes` });
+    // bcrypt reads 72 bytes, so an over-long "current password" could match on its prefix. It can never be the real one.
+    if (passwordTooLong(currentPassword)) {
+      return res.status(401).json({ success: false, message: 'Current password is incorrect' });
     }
 
     session = await mongoose.startSession();

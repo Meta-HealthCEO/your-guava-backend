@@ -4,6 +4,7 @@ const emailService = require('../../src/services/email.service');
 const User = require('../../src/models/User.model');
 const TeamInvitation = require('../../src/models/TeamInvitation.model');
 const PendingRegistration = require('../../src/models/PendingRegistration.model');
+const { settleAfterResponse } = require('../../src/utils/afterResponse');
 
 const request = supertest(app);
 
@@ -136,6 +137,7 @@ describe('resend is capped', () => {
       const res = await request.post('/api/auth/resend-verification').send({ email: 'victim@cafe.co.za' });
       expect(res.status).toBe(200);
     }
+    await settleAfterResponse();
     // One email from register plus five resends; the sixth and seventh change nothing and send nothing.
     expect(tokens).toHaveLength(6);
     const pending = await PendingRegistration.findOne({ email: 'victim@cafe.co.za' }).lean();
@@ -149,6 +151,7 @@ describe('resend is capped', () => {
     await PendingRegistration.updateOne({ email: 'victim@cafe.co.za' }, { $set: { resendCount: 5 } });
     await register();
     await request.post('/api/auth/resend-verification').send({ email: 'victim@cafe.co.za' });
+    await settleAfterResponse();
     expect(tokens).toHaveLength(3);
   });
 });

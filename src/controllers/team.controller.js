@@ -10,8 +10,8 @@ const AccessAuditEvent = require('../models/AccessAuditEvent.model');
 const { getPlan } = require('../services/billingPlans.service');
 const emailService = require('../services/email.service');
 const { isValidEmail } = require('../utils/email');
+const { passwordInputError, passwordTooLong } = require('../utils/password');
 
-const MAX_PASSWORD_BYTES = 72;
 const DEFAULT_INVITE_TTL_HOURS = 48;
 const MIN_INVITE_TTL_HOURS = 1;
 const MAX_INVITE_TTL_HOURS = 168;
@@ -185,13 +185,6 @@ const inviteManager = async (req, res, next) => {
 
       await expirePendingInvitations(owner.orgId, session);
 
-      const existing = await User.findOne({ email: normalizedEmail }).session(session);
-      if (existing) {
-        const error = new Error('Email already registered');
-        error.statusCode = 409;
-        throw error;
-      }
-
       const existingInvitation = await TeamInvitation.findOne({
         orgId: owner.orgId,
         email: normalizedEmail,
@@ -232,6 +225,15 @@ const inviteManager = async (req, res, next) => {
           included: plan.includedSeats,
           remaining: 0,
         };
+        throw error;
+      }
+
+      // Identity-4: checked last, after cafe access and seats, and answered without naming the reason.
+      const existing = await User.findOne({ email: normalizedEmail }).select('_id').session(session);
+      if (existing) {
+        const error = new Error('This email address cannot be invited. Check it, or ask the person for a different address.');
+        error.statusCode = 409;
+        error.code = 'INVITE_NOT_POSSIBLE';
         throw error;
       }
 
@@ -322,6 +324,9 @@ const inviteManager = async (req, res, next) => {
         success: false,
         message: 'An invitation is already pending for this email',
       });
+    }
+    if (error?.code === 'INVITE_NOT_POSSIBLE') {
+      return res.status(409).json({ success: false, code: error.code, message: error.message });
     }
     if (error?.statusCode && error.statusCode < 500) {
       return res.status(error.statusCode).json({ success: false, message: error.message });
@@ -460,17 +465,9 @@ const acceptInvitation = async (req, res, next) => {
     const token = normalizedInvitationToken(req.body?.token);
     const password = req.body?.password;
     if (!token) throw invitationError();
-    if (typeof password !== 'string' || password.length < 8) {
-      return res.status(400).json({
-        success: false,
-        message: 'Password must be at least 8 characters',
-      });
-    }
-    if (Buffer.byteLength(password, 'utf8') > MAX_PASSWORD_BYTES) {
-      return res.status(400).json({
-        success: false,
-        message: `Password cannot exceed ${MAX_PASSWORD_BYTES} UTF-8 bytes`,
-      });
+    const passwordError = passwordInputError(password);
+    if (passwordError) {
+      return res.status(400).json({ success: false, message: passwordError });
     }
 
     const tokenHash = hashInvitationToken(token);
@@ -938,7 +935,7 @@ const transferOwnership = async (req, res, next) => {
     if (typeof currentPassword !== 'string' || !currentPassword) {
       return res.status(400).json({ success: false, message: 'Current password is required' });
     }
-    if (Buffer.byteLength(currentPassword, 'utf8') > MAX_PASSWORD_BYTES) {
+    if (passwordTooLong(currentPassword)) {
       return res.status(401).json({ success: false, message: 'Current password is incorrect' });
     }
 
