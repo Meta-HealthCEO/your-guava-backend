@@ -9,13 +9,12 @@ const {
 const { parserLimits, createClientInputError, tooManyColumnsError } = require('./parser/limits');
 const { SOURCE_ROW_NUMBERS, sourceRowNumber, setSourceRowNumbers, addRowError } = require('./parser/rowErrors');
 const { parseBoundedAmount, parseOptionalAmount, parseQuantity } = require('./parser/numbers');
+const {
+  UNNAMED_COLUMN_RE, MAX_HEADER_CHARS, requiredFieldsForMode, normaliseHeader, headerDeduper, normaliseCell,
+  normaliseRow, normaliseRows, validateMapping,
+} = require('./parser/headers');
 
-const REQUIRED_FIELDS = ['date', 'items', 'total'];
-const UNNAMED_COLUMN_RE = /^_(\d+)$/;
 const VALID_ITEMS_MODES = new Set(['packed', 'line-per-row']);
-// A column name, not a cell. Clipped before anything reads it, so no check
-// downstream (the PII guard, the POS preset, the AI prompt) sees a runaway line.
-const MAX_HEADER_CHARS = 200;
 // csv-parser's own wording for a line longer than maxRowBytes.
 const CSV_ROW_TOO_LONG_MESSAGE = 'Row exceeds the maximum size';
 
@@ -37,69 +36,6 @@ const csvReadError = (error, limits = parserLimits()) => {
   tooLong.code = 'CSV_ROW_TOO_LONG';
   return tooLong;
 };
-
-const requiredFieldsForMode = (itemsMode = 'packed') =>
-  itemsMode === 'line-per-row'
-    ? [...REQUIRED_FIELDS, 'receiptId']
-    : REQUIRED_FIELDS;
-
-const normaliseHeader = (header, index = 0) => {
-  const value = String(header ?? '').replace(/^\uFEFF/, '').trim().slice(0, MAX_HEADER_CHARS);
-  return value || `Column ${index + 1}`;
-};
-
-/**
- * POS exports do repeat column names -- "Amount" for gross and net, "Total" for
- * the line and the receipt, "Date" for the sale and the settlement. Collapsed
- * into one key the last column silently won, so the owner mapped a column they
- * had never seen and the money came out wrong with no warning at any stage.
- *
- * Suffixing repeats keeps every column addressable, and because the preview and
- * the parse run the same deterministic pass, the column the owner picks is the
- * column that is read.
- */
-const headerDeduper = () => {
-  const seen = new Map();
-  return (header, index) => {
-    const base = normaliseHeader(header, index);
-    const occurrence = (seen.get(base) || 0) + 1;
-    seen.set(base, occurrence);
-    return occurrence === 1 ? base : `${base} (${occurrence})`;
-  };
-};
-
-// One runaway cell -- a pasted note, an escaped-quote bug in the till's own
-// export that ran several lines together -- used to throw out of the parser and
-// abort a 10,000-row import, naming neither the row nor the column, and often
-// in a column the owner never intended to import. Clip it instead: the mapped
-// fields have their own length bounds, so a truncated item name or receipt ID
-// still becomes an honest row error while the rest of the file lands.
-// A reader passes the limits it already holds: parserLimits() reads the
-// environment about fifteen times, and a 128 KB line of separators is 131
-// thousand cells.
-const normaliseCell = (value, limits = parserLimits()) => {
-  if (typeof value !== 'string') return value;
-  const trimmed = value.trim();
-  return trimmed.length > limits.maxCellChars ? trimmed.slice(0, limits.maxCellChars) : trimmed;
-};
-
-const normaliseRow = (row) => {
-  const normalised = {};
-  Object.entries(row || {}).forEach(([key, value], index) => {
-    const normalisedKey = UNNAMED_COLUMN_RE.test(key) ? key : normaliseHeader(key, index);
-    normalised[normalisedKey] = normaliseCell(value);
-  });
-  if (row?.[SOURCE_ROW_NUMBERS]) {
-    Object.defineProperty(normalised, SOURCE_ROW_NUMBERS, {
-      value: row[SOURCE_ROW_NUMBERS],
-      enumerable: false,
-      configurable: true,
-    });
-  }
-  return normalised;
-};
-
-const normaliseRows = (rows) => rows.map(normaliseRow);
 
 const excelSerialDateToDate = (serial, timezone = DEFAULT_TIMEZONE) => {
   if (!Number.isFinite(serial) || serial <= 0) return null;
@@ -1142,10 +1078,6 @@ const parsePackedItems = (str) => {
     .filter((item) => item && item.name && item.quantity != null && item.quantity !== 0);
 };
 
-
-
-
-
 const extraColumnIndex = (key) => {
   const match = String(key).match(UNNAMED_COLUMN_RE);
   return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
@@ -1240,13 +1172,6 @@ const readRows = (buffer, fileExt) => {
         resolve(normaliseRows(rows));
       });
   });
-};
-
-const validateMapping = (mapping, itemsMode = 'packed') => {
-  const missing = requiredFieldsForMode(itemsMode).filter((f) => !mapping?.[f]);
-  if (missing.length > 0) {
-    throw new Error(`Mapping missing required fields: ${missing.join(', ')}`);
-  }
 };
 
 const parseTimeParts = (timeStr) => {
