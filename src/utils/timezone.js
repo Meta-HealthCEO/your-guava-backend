@@ -1,5 +1,5 @@
-// Cafe-local date arithmetic: the one home of the zoned helpers (BE-11-T05 moves every caller onto it).
-// Moved from parser.service.js by BE-11-T01; behaviour unchanged.
+// Cafe-local date arithmetic: the one home of the zoned and date-only helpers (BE-11-T01, BE-11-T05).
+// Every caller outside the parser imports these from here.
 
 const DEFAULT_TIMEZONE = 'Africa/Johannesburg';
 const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -151,7 +151,43 @@ const processLocalCalendarDate = (value, timezone = DEFAULT_TIMEZONE) => {
   return new Date(parts.year, parts.month - 1, parts.day, 12, 0, 0, 0);
 };
 
+// A date-only value (a shift date, a leave day, an event day, an analytics bound) is stored
+// as UTC midnight of its calendar day. These helpers are the only code that builds or reads
+// that shape; the five controller copies they replace disagreed about empty input.
+const TIME_OF_DAY_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+const parseDateOnly = (value) => {
+  const match = String(value || '').match(DATE_ONLY_RE);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+    ? date
+    : null;
+};
+
+const formatDateOnly = (date) => new Date(date).toISOString().slice(0, 10);
+
+const inclusiveDateOnlyDays = (start, end) => Math.floor((end - start) / 86400000) + 1;
+
+/** The cafe-local calendar day of `now`, as a date-only value. */
+const cafeLocalToday = (timezone, now = new Date()) => parseDateOnly(zonedDateKey(now, timezone));
+
+/**
+ * The cafe's IANA zone, or the default when the cafe or its field is missing.
+ * Cafe is required here, not at the top: the parser loads this module and must not
+ * load mongoose models.
+ */
+const getCafeTimezone = async (cafeId) => {
+  const Cafe = require('../models/Cafe.model');
+  const cafe = await Cafe.findById(cafeId).select('timezone').lean();
+  return safeTimezone(cafe?.timezone);
+};
+
 module.exports = {
-  DEFAULT_TIMEZONE, safeTimezone, zonedDateTimeToUtc, getZonedDateParts, zonedDayStart, zonedDayEnd,
-  addZonedDays, zonedDayOrdinal, zonedDateKey, zonedDayOfWeek, processLocalCalendarDate,
+  DEFAULT_TIMEZONE, DATE_ONLY_RE, TIME_OF_DAY_RE, safeTimezone, zonedDateTimeToUtc, getZonedDateParts, zonedDayStart,
+  zonedDayEnd, addZonedDays, zonedDayOrdinal, zonedDateKey, zonedDayOfWeek, processLocalCalendarDate,
+  parseDateOnly, formatDateOnly, inclusiveDateOnlyDays, cafeLocalToday, getCafeTimezone,
 };
