@@ -18,6 +18,7 @@ const {
   MAX_FORECAST_ITEMS_IN_PROMPT, TRUNCATED_ANSWER_MARKER, fencedJson, missingInsightsKeyResponse, insufficientInsightDataResponse, buildSummaryStats,
   dayNames, weekdayForKey, relativeDayLabel, roundMoney, zonedDateTimeLabel, missingChatKeyResponse,
 } = require('./ai/prompts');
+const { providerDiagnostics, validatedInsightStrings } = require('./ai/json');
 
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const REFRESH_DEDUPE_MS = 30 * 1000;
@@ -30,7 +31,6 @@ const MAX_CHAT_MESSAGE_CHARS = 4000;
 // provider call so nothing is billed: buildSummaryStats has nothing to report,
 // and an insight generated from that sentence is filler dressed up as analysis.
 const MIN_INSIGHT_TRANSACTIONS = 1;
-
 
 const throwIfAborted = (signal) => {
   if (!signal?.aborted) return;
@@ -64,22 +64,6 @@ const waitWithAbort = (durationMs, signal) =>
     };
     signal?.addEventListener('abort', onAbort, { once: true });
   });
-
-
-const providerDiagnostics = (response, startedAt, operation) => ({
-  operation,
-  model: response?.model || process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001',
-  providerRequestId: response?.id,
-  inputTokens: Number(response?.usage?.input_tokens) || 0,
-  outputTokens: Number(response?.usage?.output_tokens) || 0,
-  // Without these two, a regression that drops the cache hit rate to zero —
-  // the whole business context re-billed at full input price on every turn —
-  // is invisible in the ledger.
-  cacheCreationInputTokens: Number(response?.usage?.cache_creation_input_tokens) || 0,
-  cacheReadInputTokens: Number(response?.usage?.cache_read_input_tokens) || 0,
-  stopReason: response?.stop_reason,
-  latencyMs: Math.max(0, Date.now() - startedAt),
-});
 
 const cachedInsightEntry = (cafeId) =>
   GeneratedInsight.findOne({ cafeId }).lean();
@@ -118,27 +102,6 @@ const invalidateInsights = async (cafeId) => {
     { cafeId },
     { $set: { invalidatedAt: new Date() } }
   );
-};
-
-/**
- * Reduces a parsed provider response to the insight strings we will store.
- *
- * The equality check this replaced (`insights.length !== value.length`) fired
- * on exactly the cases the `slice` exists to handle: eleven perfectly usable
- * insights, or nine good ones plus a stray object, were both rejected whole and
- * shown to the owner as an AI failure. Drop what we cannot store and keep what
- * we can; only a response with nothing usable, or one carrying a string longer
- * than the schema allows, is a real failure.
- */
-const validatedInsightStrings = (value) => {
-  if (!Array.isArray(value)) return null;
-  const insights = value
-    .filter((entry) => typeof entry === 'string')
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  if (insights.length < 1) return null;
-  if (insights.some((entry) => entry.length > 4000)) return null;
-  return insights.slice(0, 10);
 };
 
 /**
@@ -274,7 +237,6 @@ const currentCreditSnapshot = async (orgId) => {
   const org = await Organization.findById(orgId);
   return org ? creditSnapshot(org) : null;
 };
-
 
 /**
  * True when the cafe has too little recent trade for an insight run to mean
@@ -486,13 +448,6 @@ const refreshInsights = async (options) => {
     ).catch(() => null);
   }
 };
-
-
-
-
-
-
-
 
 const buildBusinessContext = async ({ cafeId, orgId, authorizedCafeIds }) => {
   const scopedCafeIds = Array.isArray(authorizedCafeIds)
@@ -872,7 +827,6 @@ const sanitizeMessages = (messages = []) => {
     truncatedMessages,
   };
 };
-
 
 const buildContextStats = (context) => ({
   transactionCount: context.dataset.transactionCount,
