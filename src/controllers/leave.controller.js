@@ -2,31 +2,17 @@ const mongoose = require('mongoose');
 const LeaveRequest = require('../models/LeaveRequest.model');
 const LeaveBalance = require('../models/LeaveBalance.model');
 const Staff = require('../models/Staff.model');
+const { parseDateOnly, formatDateOnly, inclusiveDateOnlyDays } = require('../utils/timezone');
 
-const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const MAX_LEAVE_SPAN_DAYS = 366;
 const MAX_CALENDAR_SPAN_DAYS = 93;
 const LEAVE_TYPES = new Set(['annual', 'sick', 'family', 'unpaid']);
-
-const parseDateOnly = (value) => {
-  const match = String(value || '').match(DATE_ONLY_RE);
-  if (!match) return null;
-  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
-  return date.getUTCFullYear() === Number(match[1]) &&
-    date.getUTCMonth() === Number(match[2]) - 1 &&
-    date.getUTCDate() === Number(match[3])
-    ? date
-    : null;
-};
-
-const formatDateOnly = (date) => new Date(date).toISOString().slice(0, 10);
-const inclusiveDays = (start, end) => Math.floor((end - start) / 86400000) + 1;
 
 /**
  * Count weekdays between two dates (inclusive).
  */
 function countWeekdays(start, end) {
-  const totalDays = inclusiveDays(start, end);
+  const totalDays = inclusiveDateOnlyDays(start, end);
   const completeWeeks = Math.floor(totalDays / 7);
   let count = completeWeeks * 5;
   const remainingDays = totalDays % 7;
@@ -62,7 +48,7 @@ const create = async (req, res, next) => {
     if (!start || !end || end < start) {
       return res.status(400).json({ success: false, message: 'startDate and endDate must be a valid YYYY-MM-DD range' });
     }
-    if (inclusiveDays(start, end) > MAX_LEAVE_SPAN_DAYS) {
+    if (inclusiveDateOnlyDays(start, end) > MAX_LEAVE_SPAN_DAYS) {
       return res.status(400).json({ success: false, message: `Leave periods cannot exceed ${MAX_LEAVE_SPAN_DAYS} days` });
     }
 
@@ -235,7 +221,7 @@ const getCalendar = async (req, res, next) => {
         });
       }
     }
-    if (inclusiveDays(startDate, endDate) > MAX_CALENDAR_SPAN_DAYS) {
+    if (inclusiveDateOnlyDays(startDate, endDate) > MAX_CALENDAR_SPAN_DAYS) {
       return res.status(400).json({
         success: false,
         message: `Calendar ranges cannot exceed ${MAX_CALENDAR_SPAN_DAYS} days`,

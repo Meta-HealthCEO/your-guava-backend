@@ -1,4 +1,4 @@
-const HOURS_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const { TIME_OF_DAY_RE } = require('./timezone');
 
 const DEFAULT_WEEKDAY = { isOpen: true, openTime: '07:00', closeTime: '17:00' };
 const DEFAULT_SATURDAY = { isOpen: true, openTime: '08:00', closeTime: '15:00' };
@@ -15,7 +15,7 @@ const defaultTradingHours = () => Array.from({ length: 7 }, (_, dayOfWeek) => {
 
 const parseTime = (value) => {
   if (typeof value !== 'string') return null;
-  const match = HOURS_TIME_RE.exec(value);
+  const match = TIME_OF_DAY_RE.exec(value);
   if (!match) return null;
   return Number(match[1]) * 60 + Number(match[2]);
 };

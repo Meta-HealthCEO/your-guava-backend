@@ -1,30 +1,15 @@
 const Shift = require('../models/Shift.model');
 const Staff = require('../models/Staff.model');
+const { parseDateOnly, formatDateOnly, inclusiveDateOnlyDays, TIME_OF_DAY_RE } = require('../utils/timezone');
 
 const WEEKLY_HOUR_THRESHOLD = 45; // South African BCEA law
 const MAX_SHIFT_RANGE_DAYS = 93;
-const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
-const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
-
-const parseDateOnly = (value) => {
-  const match = String(value || '').match(DATE_ONLY_RE);
-  if (!match) return null;
-  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
-  return date.getUTCFullYear() === Number(match[1]) &&
-    date.getUTCMonth() === Number(match[2]) - 1 &&
-    date.getUTCDate() === Number(match[3])
-    ? date
-    : null;
-};
-
-const formatDateOnly = (date) => new Date(date).toISOString().slice(0, 10);
-const inclusiveDays = (start, end) => Math.floor((end - start) / 86400000) + 1;
 
 /**
  * Calculate hours between two HH:MM time strings.
  */
 function calcHours(startTime, endTime) {
-  if (!TIME_RE.test(String(startTime || '')) || !TIME_RE.test(String(endTime || ''))) {
+  if (!TIME_OF_DAY_RE.test(String(startTime || '')) || !TIME_OF_DAY_RE.test(String(endTime || ''))) {
     return NaN;
   }
   const [sh, sm] = startTime.split(':').map(Number);
@@ -197,7 +182,7 @@ const list = async (req, res, next) => {
           message: 'startDate and endDate must be a valid YYYY-MM-DD range',
         });
       }
-      if (inclusiveDays(startDate, endDate) > MAX_SHIFT_RANGE_DAYS) {
+      if (inclusiveDateOnlyDays(startDate, endDate) > MAX_SHIFT_RANGE_DAYS) {
         return res.status(400).json({
           success: false,
           message: `Shift ranges cannot exceed ${MAX_SHIFT_RANGE_DAYS} days`,
@@ -279,7 +264,7 @@ const getSummary = async (req, res, next) => {
           message: 'startDate and endDate must be a valid YYYY-MM-DD range',
         });
       }
-      if (inclusiveDays(startDate, endDate) > MAX_SHIFT_RANGE_DAYS) {
+      if (inclusiveDateOnlyDays(startDate, endDate) > MAX_SHIFT_RANGE_DAYS) {
         return res.status(400).json({
           success: false,
           message: `Summary ranges cannot exceed ${MAX_SHIFT_RANGE_DAYS} days`,

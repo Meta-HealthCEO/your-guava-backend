@@ -1,8 +1,7 @@
 const mongoose = require('mongoose');
 const Staff = require('../models/Staff.model');
 const LeaveBalance = require('../models/LeaveBalance.model');
-
-const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const { parseDateOnly } = require('../utils/timezone');
 
 // Pay is owner-only information. Managers get the roster without hourlyRate.
 const staffDto = (staff, user) => {
@@ -11,17 +10,8 @@ const staffDto = (staff, user) => {
   return withoutRate;
 };
 
-const parseDateOnly = (value) => {
-  if (value == null || value === '') return undefined;
-  const match = String(value).match(DATE_ONLY_RE);
-  if (!match) return null;
-  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
-  return date.getUTCFullYear() === Number(match[1]) &&
-    date.getUTCMonth() === Number(match[2]) - 1 &&
-    date.getUTCDate() === Number(match[3])
-    ? date
-    : null;
-};
+// A start date is optional: empty means none, anything else must be a real YYYY-MM-DD (null otherwise).
+const optionalDateOnly = (value) => (value == null || value === '' ? undefined : parseDateOnly(value));
 
 // POST /api/staff — Create staff member + leave balance
 const create = async (req, res, next) => {
@@ -30,7 +20,7 @@ const create = async (req, res, next) => {
     const cafeId = req.user.cafeId;
     const { name, email, phone, role, hourlyRate, startDate } = req.body;
     const parsedRate = Number(hourlyRate);
-    const parsedStartDate = parseDateOnly(startDate);
+    const parsedStartDate = optionalDateOnly(startDate);
 
     if (!String(name || '').trim() || hourlyRate == null) {
       return res.status(400).json({ success: false, message: 'name and hourlyRate are required' });
@@ -123,7 +113,7 @@ const update = async (req, res, next) => {
     const cafeId = req.user.cafeId;
     const { id } = req.params;
     const { name, email, phone, role, hourlyRate, startDate, isActive } = req.body;
-    const parsedStartDate = startDate !== undefined ? parseDateOnly(startDate) : undefined;
+    const parsedStartDate = startDate !== undefined ? optionalDateOnly(startDate) : undefined;
     const parsedRate = hourlyRate !== undefined ? Number(hourlyRate) : undefined;
 
     if (startDate !== undefined && !parsedStartDate) {
