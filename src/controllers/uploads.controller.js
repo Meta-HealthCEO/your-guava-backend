@@ -24,6 +24,7 @@ const { cleanupAbandonedPendingUploads } = require('./uploads/sweeper');
 const { localDownload } = require('./uploads/download');
 const { list } = require('./uploads/list');
 const { detail, rows } = require('./uploads/detail');
+const { confirm } = require('./uploads/confirm');
 
 /**
  * Identity a remapped row would be stored under. A receipt number is only
@@ -101,121 +102,6 @@ const assertRemapHasImportableRows = async (parsed, cafeId, uploadId, sourceFing
     const err = new Error('Every valid row already exists in another upload; remap would leave this upload empty');
     err.statusCode = 409;
     throw err;
-  }
-};
-
-const confirm = async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const {
-      columnMapping,
-      itemsMode = 'packed',
-      allowPartialImport = false,
-    } = req.body;
-    const cafeId = req.user.cafeId;
-    const idempotencyKey = String(req.get?.('Idempotency-Key') || '').trim();
-    if (idempotencyKey.length > CONFIRMATION_KEY_MAX_LENGTH) {
-      return res.status(400).json({ success: false, message: 'Idempotency-Key is too long' });
-    }
-    const mappingHash = confirmationMappingHash(columnMapping, itemsMode);
-    const idempotencyKeyHash = idempotencyKey ? sha256(idempotencyKey) : undefined;
-
-    let upload = await Upload.findOne({ _id: id, cafeId });
-    if (!upload || upload.status === 'deleted') {
-      return res.status(404).json({ success: false, message: 'Upload not found' });
-    }
-    upload = await recoverStaleParsingUpload(upload, cafeId);
-    if (upload.status === 'completed') {
-      if (upload.confirmation?.mappingHash && upload.confirmation.mappingHash !== mappingHash) {
-        // The key was stored on the first confirm and never read, so a client that
-        // reused one key for two different mappings got the same advice as an owner
-        // deliberately changing their columns. They are different problems: one is a
-        // bug to fix, the other is a feature to use, and only the caller can tell
-        // them apart if we say which happened.
-        if (idempotencyKeyHash && upload.confirmation?.idempotencyKeyHash === idempotencyKeyHash) {
-          return res.status(409).json({
-            success: false,
-            code: 'IDEMPOTENCY_KEY_REUSED',
-            message: 'This Idempotency-Key was already used for a different mapping. '
-              + 'Use a new key, or remap the upload to change its columns.',
-          });
-        }
-        return res.status(409).json({
-          success: false,
-          code: 'MAPPING_ALREADY_COMMITTED',
-          message: 'Upload already completed with a different mapping. Use remap to change it.',
-        });
-      }
-      upload = await Upload.findOneAndUpdate(
-        { _id: upload._id, cafeId, status: 'completed' },
-        { $inc: { 'confirmation.replayCount': 1 } },
-        { new: true }
-      );
-      return res.status(200).json(confirmationResponse(upload, { replayed: true }));
-    }
-
-    const mappingError = validateMapping(upload, columnMapping, itemsMode);
-    if (mappingError) {
-      return res.status(400).json({ success: false, message: mappingError });
-    }
-
-    const previousUploadState = snapshotUploadState(upload);
-    const timezone = await getCafeTimezone(cafeId);
-    upload = await lockUploadForParsing(upload, cafeId);
-    let expectedUpdatedAt = upload.updatedAt;
-    let parsed;
-    let result;
-
-    try {
-      const buffer = await r2.downloadFile(upload.r2Key);
-      if (!Buffer.isBuffer(buffer)) {
-        const err = new Error('Original upload file is unavailable');
-        err.statusCode = 503;
-        throw err;
-      }
-      const ext = upload.fileName.split('.').pop().toLowerCase();
-      parsed = await parser.parseBuffer(buffer, {
-        columnMapping,
-        itemsMode,
-        fileExt: ext,
-        timezone,
-      });
-      assertParsedRowsImportable(parsed, { allowSeverePartial: allowPartialImport === true });
-      upload = await touchParsingLease(upload._id, cafeId, expectedUpdatedAt);
-      expectedUpdatedAt = upload.updatedAt;
-
-      const committed = await commitParsedUpload({
-        upload,
-        cafeId,
-        parsed,
-        columnMapping,
-        itemsMode,
-        persistMapping: upload.posType === 'wizard',
-        mappingHash,
-        idempotencyKeyHash,
-        timezone,
-      });
-      upload = committed.upload;
-      result = committed.result;
-    } catch (err) {
-      const rowErrors = result?.rowErrors || parsed?.rowErrors || previousUploadState.rowErrors;
-      await restoreUploadAfterFailure({
-        uploadId: upload._id,
-        cafeId,
-        expectedUpdatedAt,
-        previousState: previousUploadState,
-        error: err,
-        rowErrors,
-        markFailed: true,
-      });
-      throw err;
-    }
-
-    clearApiCache();
-    await schedulePostImportMaintenance(upload._id, cafeId, result.dateRange, timezone);
-    return res.status(200).json(confirmationResponse(upload));
-  } catch (error) {
-    next(error);
   }
 };
 
