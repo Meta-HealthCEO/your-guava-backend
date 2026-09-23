@@ -133,5 +133,5 @@ const tooManyColumnsError = (limits = parserLimits()) =>
   createClientInputError(`File exceeds the ${limits.maxColumns} column limit`);
 
 module.exports = {
-  parserLimits, createClientInputError, tooManyColumnsError,
+  parserLimits, boundedInteger, createClientInputError, tooManyColumnsError,
 };

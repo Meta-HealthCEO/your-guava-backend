@@ -81,6 +81,6 @@ const validateMapping = (mapping, itemsMode = 'packed') => {
 };
 
 module.exports = {
-  UNNAMED_COLUMN_RE, MAX_HEADER_CHARS, requiredFieldsForMode, normaliseHeader, headerDeduper, normaliseCell,
+  REQUIRED_FIELDS, UNNAMED_COLUMN_RE, MAX_HEADER_CHARS, requiredFieldsForMode, normaliseHeader, headerDeduper, normaliseCell,
   normaliseRow, normaliseRows, validateMapping,
 };
