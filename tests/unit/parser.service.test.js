@@ -909,6 +909,9 @@ describe('xlsx workbook reading', () => {
     // matrix is only built when that size is safe.
     const SALES = [['Receipt', 'Date', 'Total'], ['R1', '2026-04-01', '35.00']];
     const mainHeapGrowthMb = async (run) => {
+      // Warm the reader first: its first use loads modules and JIT code, which
+      // CI counted as 27 MB of "growth" that has nothing to do with the file.
+      await readWorkbook(xlsxWith(SALES));
       const before = process.memoryUsage().heapUsed;
       await run();
       return (process.memoryUsage().heapUsed - before) / (1024 * 1024);
