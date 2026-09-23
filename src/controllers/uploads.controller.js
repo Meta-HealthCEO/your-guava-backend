@@ -1,5 +1,4 @@
 const mongoose = require('mongoose');
-const fs = require('fs');
 const Upload = require('../models/Upload.model');
 const Transaction = require('../models/Transaction.model');
 const Cafe = require('../models/Cafe.model');
@@ -23,6 +22,7 @@ const {
   maintenanceMaxAttempts, fillActualsForRange, invalidateAiInsights, claimAndRunPostImportMaintenance, schedulePostImportMaintenance, recoverPendingUploadMaintenance,
 } = require('./uploads/jobs');
 const { cleanupAbandonedPendingUploads } = require('./uploads/sweeper');
+const { localDownload } = require('./uploads/download');
 
 /**
  * Identity a remapped row would be stored under. A receipt number is only
@@ -100,34 +100,6 @@ const assertRemapHasImportableRows = async (parsed, cafeId, uploadId, sourceFing
     const err = new Error('Every valid row already exists in another upload; remap would leave this upload empty');
     err.statusCode = 409;
     throw err;
-  }
-};
-
-const localDownload = async (req, res, next) => {
-  try {
-    const { key, expires, sig } = req.query;
-    const filePath = r2.getLocalDownloadPath(String(key || ''), String(expires || ''), String(sig || ''));
-    try {
-      const stat = await fs.promises.stat(filePath);
-      if (!stat.isFile()) throw Object.assign(new Error('Stored upload not found'), { code: 'ENOENT' });
-    } catch (error) {
-      if (error.code === 'ENOENT') {
-        error.statusCode = 404;
-        error.message = 'Stored upload not found';
-      }
-      throw error;
-    }
-    return res.download(filePath, (error) => {
-      if (!error) return;
-      if (error.code === 'ENOENT') {
-        error.statusCode = 404;
-        error.message = 'Stored upload not found';
-      }
-      if (res.headersSent) return res.destroy(error);
-      return next(error);
-    });
-  } catch (error) {
-    return next(error);
   }
 };
 
