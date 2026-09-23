@@ -11,19 +11,19 @@ const { normaliseTransactionStatus } = require('../utils/transactionStatus');
 const { computeDedupKey } = require('../utils/dedupKey');
 const { clearApiCache } = require('../middleware/cache.middleware');
 const {
-  MAX_LIST_PAGE, STORAGE_CLEANUP_PENDING, CONFIRMATION_KEY_MAX_LENGTH, sha256, confirmationMappingHash, confirmationResponse,
-  validateMapping, assertParsedRowsImportable, getCafeTimezone,
+  STORAGE_CLEANUP_PENDING, CONFIRMATION_KEY_MAX_LENGTH, sha256, confirmationMappingHash, confirmationResponse, validateMapping,
+  assertParsedRowsImportable, getCafeTimezone,
 } = require('./uploads/shared');
 const {
-  parsingLeaseMs, recoverStaleParsingUpload, lockUploadForParsing, touchParsingLease, snapshotUploadState, restoreUploadAfterFailure,
-  commitParsedUpload,
+  recoverStaleParsingUpload, lockUploadForParsing, touchParsingLease, snapshotUploadState, restoreUploadAfterFailure, commitParsedUpload,
 } = require('./uploads/lease');
 const {
-  maintenanceMaxAttempts, fillActualsForRange, invalidateAiInsights, claimAndRunPostImportMaintenance, schedulePostImportMaintenance, recoverPendingUploadMaintenance,
+  fillActualsForRange, invalidateAiInsights, schedulePostImportMaintenance, recoverPendingUploadMaintenance,
 } = require('./uploads/jobs');
 const { cleanupAbandonedPendingUploads } = require('./uploads/sweeper');
 const { localDownload } = require('./uploads/download');
 const { list } = require('./uploads/list');
+const { detail, rows } = require('./uploads/detail');
 
 /**
  * Identity a remapped row would be stored under. A receipt number is only
@@ -214,70 +214,6 @@ const confirm = async (req, res, next) => {
     clearApiCache();
     await schedulePostImportMaintenance(upload._id, cafeId, result.dateRange, timezone);
     return res.status(200).json(confirmationResponse(upload));
-  } catch (error) {
-    next(error);
-  }
-};
-
-const detail = async (req, res, next) => {
-  try {
-    const upload = await Upload.findOne({ _id: req.params.id, cafeId: req.user.cafeId })
-      .populate('uploadedBy', 'name email')
-      .lean();
-    if (!upload || upload.status === 'deleted') {
-      return res.status(404).json({ success: false, message: 'Upload not found' });
-    }
-    const maintenanceIsStale = upload.maintenance?.status === 'running' &&
-      upload.maintenance?.startedAt &&
-      new Date(upload.maintenance.startedAt) <= new Date(Date.now() - parsingLeaseMs());
-    const maintenanceRetryIsDue = upload.maintenance?.status === 'partial_failure' &&
-      Number(upload.maintenance?.attempts || 0) < maintenanceMaxAttempts() &&
-      (
-        !upload.maintenance?.nextRetryAt ||
-        new Date(upload.maintenance.nextRetryAt) <= new Date()
-      );
-    if (upload.status === 'completed' && (
-      upload.maintenance?.status === 'queued' || maintenanceIsStale || maintenanceRetryIsDue
-    )) {
-      setImmediate(() => {
-        claimAndRunPostImportMaintenance(upload).catch((error) => {
-          console.error('[uploads] request-triggered maintenance recovery failed:', error.message);
-        });
-      });
-    }
-    const downloadUrl = await r2.getSignedDownloadUrl(upload.r2Key, 900);
-    return res.status(200).json({ success: true, upload, downloadUrl });
-  } catch (error) {
-    next(error);
-  }
-};
-
-const rows = async (req, res, next) => {
-  try {
-    const cafeId = req.user.cafeId;
-    const upload = await Upload.findOne({ _id: req.params.id, cafeId }).lean();
-    if (!upload || upload.status === 'deleted') {
-      return res.status(404).json({ success: false, message: 'Upload not found' });
-    }
-
-    const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 50, 200));
-    const page = Math.max(1, Math.min(parseInt(req.query.page, 10) || 1, MAX_LIST_PAGE));
-    const skip = (page - 1) * limit;
-
-    const [transactions, total] = await Promise.all([
-      Transaction.find({ cafeId, uploadId: upload._id })
-        .sort({ date: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
-      Transaction.countDocuments({ cafeId, uploadId: upload._id }),
-    ]);
-
-    return res.status(200).json({
-      success: true,
-      transactions,
-      pagination: { total, page, limit, pages: Math.ceil(total / limit) },
-    });
   } catch (error) {
     next(error);
   }

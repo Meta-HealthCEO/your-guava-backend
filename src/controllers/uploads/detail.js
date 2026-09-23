@@ -1,0 +1,76 @@
+// GET /uploads/:id and its rows.
+// Moved from uploads.controller.js by BE-11-T03; behaviour unchanged.
+const Upload = require('../../models/Upload.model');
+const Transaction = require('../../models/Transaction.model');
+const r2 = require('../../services/r2.service');
+const { MAX_LIST_PAGE } = require('./shared');
+const { parsingLeaseMs } = require('./lease');
+const { maintenanceMaxAttempts, claimAndRunPostImportMaintenance } = require('./jobs');
+
+const detail = async (req, res, next) => {
+  try {
+    const upload = await Upload.findOne({ _id: req.params.id, cafeId: req.user.cafeId })
+      .populate('uploadedBy', 'name email')
+      .lean();
+    if (!upload || upload.status === 'deleted') {
+      return res.status(404).json({ success: false, message: 'Upload not found' });
+    }
+    const maintenanceIsStale = upload.maintenance?.status === 'running' &&
+      upload.maintenance?.startedAt &&
+      new Date(upload.maintenance.startedAt) <= new Date(Date.now() - parsingLeaseMs());
+    const maintenanceRetryIsDue = upload.maintenance?.status === 'partial_failure' &&
+      Number(upload.maintenance?.attempts || 0) < maintenanceMaxAttempts() &&
+      (
+        !upload.maintenance?.nextRetryAt ||
+        new Date(upload.maintenance.nextRetryAt) <= new Date()
+      );
+    if (upload.status === 'completed' && (
+      upload.maintenance?.status === 'queued' || maintenanceIsStale || maintenanceRetryIsDue
+    )) {
+      setImmediate(() => {
+        claimAndRunPostImportMaintenance(upload).catch((error) => {
+          console.error('[uploads] request-triggered maintenance recovery failed:', error.message);
+        });
+      });
+    }
+    const downloadUrl = await r2.getSignedDownloadUrl(upload.r2Key, 900);
+    return res.status(200).json({ success: true, upload, downloadUrl });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const rows = async (req, res, next) => {
+  try {
+    const cafeId = req.user.cafeId;
+    const upload = await Upload.findOne({ _id: req.params.id, cafeId }).lean();
+    if (!upload || upload.status === 'deleted') {
+      return res.status(404).json({ success: false, message: 'Upload not found' });
+    }
+
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 50, 200));
+    const page = Math.max(1, Math.min(parseInt(req.query.page, 10) || 1, MAX_LIST_PAGE));
+    const skip = (page - 1) * limit;
+
+    const [transactions, total] = await Promise.all([
+      Transaction.find({ cafeId, uploadId: upload._id })
+        .sort({ date: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Transaction.countDocuments({ cafeId, uploadId: upload._id }),
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      transactions,
+      pagination: { total, page, limit, pages: Math.ceil(total / limit) },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = {
+  detail, rows,
+};
