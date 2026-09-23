@@ -36,18 +36,6 @@ const CSV_SEPARATOR_CANDIDATES = [',', ';', '\t', '|'];
 const CSV_SEPARATOR_SAMPLE_LINES = 5;
 
 /**
- * Picks the delimiter a CSV is really using.
- *
- * Only ';' was ever weighed against ',', so a tab- or pipe-delimited export --
- * "Text (Tab delimited)" is a standard Excel save-as, and several tills write
- * it with a .csv extension -- collapsed its entire header row into one column.
- * The owner was shown one nonsensical column and had no way forward.
- *
- * The winner is the candidate that appears on EVERY sampled line, scored by its
- * smallest per-line count: a real delimiter separates every row, while a comma
- * inside one quoted item cell shows up on one line only.
- */
-/**
  * Excel writes `sep=;` as the first line of a CSV whenever the machine's list
  * separator is not a comma, which is the default on South African and most
  * European Windows installs. It is a directive to Excel, not data.
@@ -87,6 +75,18 @@ const stripCsvSeparatorDirective = (buffer) => {
   return buffer.subarray(offset);
 };
 
+/**
+ * Picks the delimiter a CSV is really using.
+ *
+ * Only ';' was ever weighed against ',', so a tab- or pipe-delimited export --
+ * "Text (Tab delimited)" is a standard Excel save-as, and several tills write
+ * it with a .csv extension -- collapsed its entire header row into one column.
+ * The owner was shown one nonsensical column and had no way forward.
+ *
+ * The winner is the candidate that appears on EVERY sampled line, scored by its
+ * smallest per-line count: a real delimiter separates every row, while a comma
+ * inside one quoted item cell shows up on one line only.
+ */
 const detectCsvSeparator = (buffer) => {
   // The file declaring its own separator beats guessing from the shape of
   // the rows, which a one-column-per-row export gives nothing to score.
