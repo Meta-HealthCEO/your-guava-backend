@@ -15,25 +15,19 @@ const { computeDedupKey } = require('../utils/dedupKey');
 const { clearApiCache } = require('../middleware/cache.middleware');
 const {
   MAX_LIST_PAGE, STORAGE_CLEANUP_PENDING, ABANDONED_CLEANUP_CLAIM, CONFIRMATION_KEY_MAX_LENGTH, sha256, confirmationMappingHash,
-  sanitizeRowErrors, confirmationResponse, boundedInteger, validateMapping, assertImportableResult, assertParsedRowsImportable,
-  getCafeTimezone,
+  confirmationResponse, boundedInteger, validateMapping, assertParsedRowsImportable, getCafeTimezone,
 } = require('./uploads/shared');
+const {
+  MAX_PARSING_LEASE_MS, parsingLeaseMs, recoverStaleParsingUpload, lockUploadForParsing, touchParsingLease, snapshotUploadState,
+  restoreUploadAfterFailure, commitParsedUpload,
+} = require('./uploads/lease');
 
-const DEFAULT_PARSING_LEASE_MS = 15 * 60 * 1000;
-const MAX_PARSING_LEASE_MS = 60 * 60 * 1000;
 const DEFAULT_PENDING_RETENTION_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_MAINTENANCE_RETRY_MS = 5 * 60 * 1000;
 const MAX_MAINTENANCE_RETRY_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_MAINTENANCE_MAX_ATTEMPTS = 5;
 const MAX_CLEANUP_BATCH = 100;
 const MAX_ACTUALS_REFRESH_FORECASTS = 366;
-
-const parsingLeaseMs = () => boundedInteger(
-  process.env.UPLOAD_PARSING_LEASE_MS,
-  DEFAULT_PARSING_LEASE_MS,
-  60 * 1000,
-  MAX_PARSING_LEASE_MS
-);
 
 const pendingRetentionMs = () => boundedInteger(
   process.env.UPLOAD_PENDING_RETENTION_MS,
@@ -60,83 +54,6 @@ const maintenanceRetryDelayMs = (attempts) => {
     MAX_MAINTENANCE_RETRY_MS,
     baseDelay * (2 ** Math.max(0, Number(attempts || 1) - 1))
   );
-};
-
-const recoverStaleParsingUpload = async (upload, cafeId) => {
-  if (upload.status !== 'parsing') return upload;
-  if (upload.errorMessage === ABANDONED_CLEANUP_CLAIM) {
-    const err = new Error('This unconfirmed upload expired and is being removed.');
-    err.statusCode = 410;
-    throw err;
-  }
-  const staleBefore = new Date(Date.now() - parsingLeaseMs());
-  if (upload.updatedAt > staleBefore) {
-    const err = new Error('Upload is already being parsed. Please retry after it finishes.');
-    err.statusCode = 409;
-    throw err;
-  }
-
-  const fallbackStatus = upload.completedAt ? 'completed' : 'failed';
-  const recovered = await Upload.findOneAndUpdate(
-    {
-      _id: upload._id,
-      cafeId,
-      status: 'parsing',
-      updatedAt: { $lte: staleBefore },
-    },
-    {
-      $set: {
-        status: fallbackStatus,
-        errorMessage: 'Previous import did not finish; the upload is available to retry.',
-      },
-    },
-    { new: true }
-  );
-
-  if (!recovered) {
-    const err = new Error('Upload status changed while recovering a stale import. Please refresh and retry.');
-    err.statusCode = 409;
-    throw err;
-  }
-  return recovered;
-};
-
-const lockUploadForParsing = async (upload, cafeId) => {
-  const locked = await Upload.findOneAndUpdate(
-    {
-      _id: upload._id,
-      cafeId,
-      status: upload.status,
-      updatedAt: upload.updatedAt,
-    },
-    {
-      $set: { status: 'parsing' },
-      $unset: { errorMessage: '' },
-    },
-    { new: true }
-  );
-
-  if (!locked) {
-    const err = new Error('Upload status changed while import was starting. Please refresh and try again.');
-    err.statusCode = 409;
-    throw err;
-  }
-
-  return locked;
-};
-
-const touchParsingLease = async (uploadId, cafeId, expectedUpdatedAt) => {
-  const touched = await Upload.findOneAndUpdate(
-    { _id: uploadId, cafeId, status: 'parsing', updatedAt: expectedUpdatedAt },
-    { $currentDate: { updatedAt: true } },
-    { new: true }
-  );
-  if (!touched) {
-    const err = new Error('Upload parsing lease was lost. Please refresh before retrying.');
-    err.statusCode = 409;
-    throw err;
-  }
-  return touched;
 };
 
 /**
@@ -245,180 +162,6 @@ const fillActualsForRange = async (cafeId, dateRange, timezone) => {
       console.error('[uploads] updateForecastActuals failed for', forecast.date.toISOString(), err.message);
     }
   }
-};
-
-const snapshotUploadState = (upload) => ({
-  status: upload.status,
-  columnMapping: upload.columnMapping?.toObject
-    ? upload.columnMapping.toObject()
-    : { ...(upload.columnMapping || {}) },
-  itemsMode: upload.itemsMode,
-  stats: upload.stats?.toObject ? upload.stats.toObject() : { ...(upload.stats || {}) },
-  dateRange: upload.dateRange?.toObject
-    ? upload.dateRange.toObject()
-    : { ...(upload.dateRange || {}) },
-  rowErrors: Array.isArray(upload.rowErrors)
-    ? upload.rowErrors.map((rowError) => (
-      rowError?.toObject ? rowError.toObject() : { ...rowError }
-    ))
-    : [],
-  completedAt: upload.completedAt,
-});
-
-const restoreUploadAfterFailure = async ({
-  uploadId,
-  cafeId,
-  expectedUpdatedAt,
-  previousState,
-  error,
-  rowErrors,
-  markFailed,
-}) => {
-  const status = markFailed && ['pending_mapping', 'failed'].includes(previousState.status)
-    ? 'failed'
-    : previousState.status;
-  const set = {
-    status,
-    columnMapping: previousState.columnMapping,
-    itemsMode: previousState.itemsMode,
-    stats: previousState.stats,
-    dateRange: previousState.dateRange,
-    rowErrors: sanitizeRowErrors(rowErrors || previousState.rowErrors),
-    errorMessage: error.message,
-  };
-  const update = { $set: set };
-  if (previousState.completedAt) set.completedAt = previousState.completedAt;
-  else update.$unset = { completedAt: '' };
-
-  await Upload.updateOne(
-    { _id: uploadId, cafeId, status: 'parsing', updatedAt: expectedUpdatedAt },
-    update
-  );
-};
-
-const commitParsedUpload = async ({
-  upload,
-  cafeId,
-  parsed,
-  columnMapping,
-  itemsMode,
-  persistMapping,
-  mappingHash,
-  idempotencyKeyHash,
-  timezone,
-}) => {
-  let result;
-  let committedUpload;
-  const session = await mongoose.startSession();
-  try {
-    await session.withTransaction(async () => {
-      await ingestion.reconcileParsedRows(parsed, { cafeId, session });
-      await Transaction.deleteMany({ cafeId, uploadId: upload._id }).session(session);
-      result = await ingestion.persistParsedRows(parsed, {
-        cafeId,
-        uploadId: upload._id,
-        session,
-        bulk: true,
-        itemsAlreadyReconciled: true,
-        rebuildItems: false,
-        failOnPersistenceError: true,
-        sourceFingerprint: upload.fileFingerprint || sha256(upload.r2Key),
-        timezone,
-      });
-      assertImportableResult(result);
-      await ingestion.rebuildItemsForCafe(cafeId, { session });
-
-      committedUpload = await Upload.findOneAndUpdate(
-        {
-          _id: upload._id,
-          cafeId,
-          status: 'parsing',
-          updatedAt: upload.updatedAt,
-        },
-        {
-          $set: {
-            status: 'completed',
-            columnMapping,
-            itemsMode,
-            // If the confirmed mapping is not the one we staged, a human chose it in
-            // the wizard. Saying 'AI mapping' on a mapping the owner corrected by
-            // hand would credit the guess for their work.
-            mappingSource:
-              confirmationMappingHash(columnMapping, itemsMode)
-              === confirmationMappingHash(upload.columnMapping || {}, upload.itemsMode)
-                ? upload.mappingSource || 'manual'
-                : 'manual',
-            stats: {
-              imported: result.imported,
-              skipped: result.skipped,
-              skippedByReason: result.skippedByReason || {},
-              errors: result.errors,
-              totalRows: result.totalRows,
-            },
-            dateRange: {
-              ...result.dateRange,
-              firstDateKey: result.dateRange?.firstDate
-                ? parser.zonedDateKey(result.dateRange.firstDate, timezone)
-                : undefined,
-              lastDateKey: result.dateRange?.lastDate
-                ? parser.zonedDateKey(result.dateRange.lastDate, timezone)
-                : undefined,
-            },
-            rowErrors: sanitizeRowErrors(result.rowErrors || parsed.rowErrors),
-            completedAt: new Date(),
-            confirmation: {
-              mappingHash,
-              idempotencyKeyHash,
-              replayCount: 0,
-            },
-            maintenance: {
-              status: 'queued',
-              errors: [],
-            },
-          },
-          $unset: { errorMessage: '' },
-        },
-        { new: true, session }
-      );
-      if (!committedUpload) {
-        const err = new Error('Upload parsing lease was lost before the import could commit');
-        err.statusCode = 409;
-        throw err;
-      }
-
-      const cafeFields = { dataUploaded: true, lastSyncAt: new Date() };
-      if (persistMapping) {
-        cafeFields.savedColumnMapping = { ...columnMapping, itemsMode };
-      }
-      const cafeUpdate = await Cafe.findByIdAndUpdate(
-        cafeId,
-        { $set: cafeFields },
-        { session }
-      );
-      if (!cafeUpdate) {
-        const err = new Error('Cafe not found while completing upload');
-        err.statusCode = 404;
-        throw err;
-      }
-
-      // Readers must never observe forecasts or generated insights based on
-      // the pre-import dataset, even if the asynchronous regeneration worker
-      // starts later or this process exits immediately after commit.
-      const today = parser.zonedDayStart(new Date(), timezone);
-      await Forecast.deleteMany({ cafeId, date: { $gte: today } }).session(session);
-      await GeneratedInsight.updateOne(
-        { cafeId },
-        { $set: { invalidatedAt: new Date() } },
-        { session }
-      );
-    }, {
-      readConcern: { level: 'snapshot' },
-      writeConcern: { w: 'majority' },
-    });
-  } finally {
-    await session.endSession();
-  }
-  return { upload: committedUpload, result };
 };
 
 const invalidateAiInsights = async (cafeId) => {
