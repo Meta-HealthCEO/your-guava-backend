@@ -436,6 +436,18 @@ const loadReaderSteps = () => {
 // hard limits (25,000 x 250) are 6.5M.
 const XLSX_MAX_SHEET_COST = 10000000;
 
+// The reader's reason, on one line and short enough to sit inside a message.
+const XLSX_REASON_MAX_CHARS = 160;
+const xlsxUnreadableError = (error) => {
+  if (error && error.statusCode) return error;
+  const reason = String(error && error.message ? error.message : error).replace(/\s+/g, ' ').trim().slice(0, XLSX_REASON_MAX_CHARS);
+  const unreadable = createClientInputError(
+    `This spreadsheet could not be read (${reason}). Save it again from Excel, or export it as "CSV UTF-8", and upload that.`
+  );
+  unreadable.code = 'XLSX_UNREADABLE';
+  return unreadable;
+};
+
 /**
  * readSheet(buffer) for sheet 1, as read-excel-file 9.2.0 does it, refusing a
  * sheet whose matrix would be unsafe to allocate. A side of 0 counts as 1:
@@ -448,29 +460,40 @@ const readFirstSheet = async (buffer) => {
     parseSpreadsheetInfo, parseCells, parseSheetDimensions, reconstructSheetDimensions,
     convertCellsToData2dArray,
   } = loadReaderSteps();
-  const contents = await unpackXlsxFile(buffer);
-  const fileContent = (filePath) => {
-    if (!contents[filePath]) {
-      throw new Error(`"${filePath}" file not found inside the *.xlsx file zip archive`);
+  // Everything the reader does to a workbook that reached this point is about
+  // the file's shape (a missing part, a sheet it cannot parse, an unescaped
+  // "<" in an attribute, an undeclared namespace prefix). The reader reports
+  // those as bare Errors, which the error middleware turned into a 500 as if
+  // the API were at fault; they are 400s that tell the owner what to do.
+  let cells;
+  let dimensions;
+  try {
+    const contents = await unpackXlsxFile(buffer);
+    const fileContent = (filePath) => {
+      if (!contents[filePath]) {
+        throw new Error(`"${filePath}" file not found inside the *.xlsx file zip archive`);
+      }
+      return contents[filePath];
+    };
+    const options = { sheets: [1] };
+    const filePaths = parseFilePaths(fileContent('xl/_rels/workbook.xml.rels'), readerXml);
+    const sharedStrings = filePaths.sharedStrings
+      ? parseSharedStrings(fileContent(filePaths.sharedStrings), readerXml)
+      : [];
+    const styles = filePaths.styles ? parseStyles(fileContent(filePaths.styles), readerXml) : {};
+    const { sheets, epoch1904 } = parseSpreadsheetInfo(fileContent('xl/workbook.xml'), readerXml);
+    if (sheets.length < 1) {
+      throw new Error('Sheet number out of bounds: 1. Available sheets count: 0');
     }
-    return contents[filePath];
-  };
-  const options = { sheets: [1] };
-  const filePaths = parseFilePaths(fileContent('xl/_rels/workbook.xml.rels'), readerXml);
-  const sharedStrings = filePaths.sharedStrings
-    ? parseSharedStrings(fileContent(filePaths.sharedStrings), readerXml)
-    : [];
-  const styles = filePaths.styles ? parseStyles(fileContent(filePaths.styles), readerXml) : {};
-  const { sheets, epoch1904 } = parseSpreadsheetInfo(fileContent('xl/workbook.xml'), readerXml);
-  if (sheets.length < 1) {
-    throw new Error('Sheet number out of bounds: 1. Available sheets count: 0');
-  }
-  const sheetPath = filePaths.sheets[sheets[0].relationId];
-  if (!sheetPath) throw new Error('The first sheet of this workbook could not be found');
+    const sheetPath = filePaths.sheets[sheets[0].relationId];
+    if (!sheetPath) throw new Error('The first sheet of this workbook could not be found');
 
-  const sheetDocument = readerXml.createDocument(fileContent(sheetPath));
-  const cells = parseCells(sheetDocument, sharedStrings, styles, epoch1904, options);
-  const dimensions = parseSheetDimensions(sheetDocument) || reconstructSheetDimensions(cells);
+    const sheetDocument = readerXml.createDocument(fileContent(sheetPath));
+    cells = parseCells(sheetDocument, sharedStrings, styles, epoch1904, options);
+    dimensions = parseSheetDimensions(sheetDocument) || reconstructSheetDimensions(cells);
+  } catch (error) {
+    throw xlsxUnreadableError(error);
+  }
   if (cells.length > 0) {
     const { row, column } = dimensions[1];
     const cost = Math.max(row, 1) * (Math.max(column, 1) + 8);
