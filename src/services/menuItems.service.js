@@ -6,7 +6,7 @@ const { inferItemCategory } = require('../utils/itemCategory');
 const MAX_CANONICAL_NAME_CHARS = 200;
 const MAX_ALIASES = 50;
 const MATCH_CANDIDATE_POOL = 100;
-const MATCH_SCORE_THRESHOLD = 0.35;
+const { prepareMatchPool, rankMatchCandidates } = require('./menuMatching');
 
 /**
  * The key that decides menu-item identity: two names with the same key are
@@ -68,34 +68,6 @@ const buildAliasKeys = (aliases = []) =>
   uniqueStrings(aliases).map(normalizeItemName).filter(Boolean);
 
 const withSession = (query, session) => (session ? query.session(session) : query);
-
-const levenshteinDistance = (a = '', b = '') => {
-  const rows = Array.from({ length: a.length + 1 }, (_, index) => [index]);
-  for (let j = 1; j <= b.length; j += 1) rows[0][j] = j;
-
-  for (let i = 1; i <= a.length; i += 1) {
-    for (let j = 1; j <= b.length; j += 1) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      rows[i][j] = Math.min(
-        rows[i - 1][j] + 1,
-        rows[i][j - 1] + 1,
-        rows[i - 1][j - 1] + cost
-      );
-    }
-  }
-  return rows[a.length][b.length];
-};
-
-const stringSimilarity = (a = '', b = '') => {
-  const longest = Math.max(a.length, b.length);
-  if (longest === 0) return 0;
-  // The edit distance is at least the length difference, so the score can never
-  // exceed shortest/longest. Below the threshold the matrix cannot change the
-  // answer, and skipping it is what keeps the reconciliation page — up to 100
-  // items against 100 candidates each — off the event loop.
-  if (Math.min(a.length, b.length) / longest < MATCH_SCORE_THRESHOLD) return 0;
-  return 1 - (levenshteinDistance(a, b) / longest);
-};
 
 // A line whose unitPrice is a basket average spread across a multi-item
 // receipt (parser priceSource 'derived') is not a price observation. Rows
@@ -669,36 +641,37 @@ const loadMatchCandidatePool = (cafeId) => Item.find({
   .limit(MATCH_CANDIDATE_POOL)
   .lean();
 
-const findMatchCandidates = async (cafeId, item, { limit = 3, pool = null } = {}) => {
-  const key = normalizeItemName(item.name);
-  if (!key) return [];
-  const tokens = new Set(key.split(' ').filter(Boolean));
-  const candidates = (pool || await loadMatchCandidatePool(cafeId)).filter(
-    (candidate) => String(candidate._id) !== String(item._id)
-      // A sibling variant is a different product on purpose. Offering it as a
-      // merge target puts the collapse this key change removed one approval
-      // click away from coming back.
-      && !areSiblingVariants(item.name, candidate.name)
-  );
+// One prepared pool per pool array, so a reconciliation page normalises each
+// candidate and alias once and shares one work budget across its items.
+const preparedPools = new WeakMap();
 
-  return candidates
-    .map((candidate) => {
-      const candidateKey = normalizeItemName(candidate.name);
-      const candidateTokens = new Set(candidateKey.split(' ').filter(Boolean));
-      const overlap = [...tokens].filter((token) => candidateTokens.has(token)).length;
-      const union = new Set([...tokens, ...candidateTokens]).size || 1;
-      const tokenScore = overlap / union;
-      const nameScore = stringSimilarity(key, candidateKey);
-      const aliasScore = Math.max(
-        0,
-        ...(candidate.aliases || []).map((alias) => stringSimilarity(key, normalizeItemName(alias)))
-      );
-      const score = Math.max(tokenScore, nameScore, aliasScore);
-      return { item: candidate, score };
-    })
-    .filter((candidate) => candidate.score >= MATCH_SCORE_THRESHOLD)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+const preparedPoolFor = (pool) => {
+  let prepared = preparedPools.get(pool);
+  if (!prepared) {
+    prepared = prepareMatchPool(pool, { normalize: normalizeItemName });
+    preparedPools.set(pool, prepared);
+  }
+  return prepared;
+};
+
+const findMatchCandidates = async (cafeId, item, { limit = 3, pool = null } = {}) => {
+  if (!normalizeItemName(item.name)) return [];
+  const candidatePool = pool || await loadMatchCandidatePool(cafeId);
+  const prepared = preparedPoolFor(candidatePool);
+  const ranked = rankMatchCandidates(item, prepared, {
+    normalize: normalizeItemName,
+    // A sibling variant is a different product on purpose; offering it as a
+    // merge target puts the collapse the key change removed one click away.
+    isSibling: areSiblingVariants,
+    limit,
+  });
+  if (prepared.budget.exhausted && !prepared.budget.reported) {
+    prepared.budget.reported = true;
+    console.warn(JSON.stringify({
+      level: 'warn', event: 'menu_match_budget_exhausted', cafeId: String(cafeId), poolSize: candidatePool.length,
+    }));
+  }
+  return ranked;
 };
 
 module.exports = {
