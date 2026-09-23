@@ -1037,6 +1037,16 @@ const confirm = async (req, res, next) => {
   }
 };
 
+// What the history table draws, and nothing else. sampleRows, headers and
+// rowErrors can be megabytes per upload and are served by GET /uploads/:id;
+// listing 200 of them was enough to exhaust the process (uploads-catalogue-5).
+// An inclusion projection, so a field added to the schema later stays out of
+// the list until someone decides it belongs there.
+const UPLOAD_LIST_FIELDS = [
+  '_id', 'cafeId', 'uploadedBy', 'fileName', 'fileSize', 'posType', 'mappingSource', 'itemsMode', 'status',
+  'stats', 'dateRange', 'errorMessage', 'completedAt', 'maintenance', 'createdAt', 'updatedAt',
+].join(' ');
+
 const list = async (req, res, next) => {
   try {
     const cafeId = req.user.cafeId;
@@ -1049,6 +1059,7 @@ const list = async (req, res, next) => {
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
+        .select(UPLOAD_LIST_FIELDS)
         .populate('uploadedBy', 'name email')
         .lean(),
       Upload.countDocuments({ cafeId, status: { $ne: 'deleted' } }),

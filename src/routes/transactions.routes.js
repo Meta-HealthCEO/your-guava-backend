@@ -49,10 +49,26 @@ const fileFilter = (_req, file, cb) => {
   }
 };
 
+// The portal sends one part, `file`. busboy's defaults allow unlimited text
+// fields of up to 1 MB each and unlimited parts, and multer buffers every
+// field before the controller runs: a thousand fields was a gigabyte of heap
+// (uploads-catalogue-6). Allow the file and a little slack, nothing more.
+const MULTIPART_LIMITS = {
+  files: 1,
+  fields: 4,
+  fieldSize: 1024,
+  fieldNameSize: 100,
+  parts: 5,
+  headerPairs: 50,
+};
+const FORM_TOO_LARGE_CODES = new Set([
+  'LIMIT_PART_COUNT', 'LIMIT_FILE_COUNT', 'LIMIT_FIELD_KEY', 'LIMIT_FIELD_VALUE', 'LIMIT_FIELD_COUNT',
+]);
+
 const multerUpload = multer({
   storage,
   fileFilter,
-  limits: { fileSize: uploadMaxBytes() },
+  limits: { fileSize: uploadMaxBytes(), ...MULTIPART_LIMITS },
 });
 
 const handleMulterUpload = (req, res, next) => {
@@ -64,6 +80,16 @@ const handleMulterUpload = (req, res, next) => {
     }
 
     const isMulterError = err instanceof multer.MulterError;
+    // multer drains the rest of the request before calling back, so the client
+    // gets the 413 rather than a reset connection, and nothing past the first
+    // kilobyte of any field is kept.
+    if (isMulterError && FORM_TOO_LARGE_CODES.has(err.code)) {
+      return res.status(413).json({
+        success: false,
+        code: 'UPLOAD_FORM_TOO_LARGE',
+        message: 'This upload carried more form data than a file upload needs. Choose the file again and upload only the file.',
+      });
+    }
     const statusCode = err.statusCode || (isMulterError ? 400 : 500);
     const message =
       err.code === 'LIMIT_FILE_SIZE'
