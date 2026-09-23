@@ -1,6 +1,6 @@
 // Constants and helpers every uploads handler shares: mapping validation, importability checks, response shapes.
 // Moved from uploads.controller.js by BE-11-T03; behaviour unchanged.
-const crypto = require('crypto');
+const { sha256Hex } = require('../../utils/authPrimitives');
 const { getCafeTimezone } = require('../../utils/timezone');
 const { normaliseTransactionStatus } = require('../../utils/transactionStatus');
 
@@ -18,10 +18,8 @@ const MAPPING_FIELDS = [
   'paymentMethod', 'status', 'quantity',
 ];
 
-const sha256 = (value) =>
-  crypto.createHash('sha256').update(String(value)).digest('hex');
 
-const confirmationMappingHash = (columnMapping, itemsMode) => sha256(JSON.stringify({
+const confirmationMappingHash = (columnMapping, itemsMode) => sha256Hex(JSON.stringify({
   itemsMode,
   columnMapping: Object.fromEntries(
     MAPPING_FIELDS.map((field) => [field, columnMapping?.[field] || null])
@@ -144,6 +142,6 @@ const assertParsedRowsImportable = (parsed, { allowSeverePartial = false } = {})
 
 module.exports = {
   REQUIRED, VALID_ITEMS_MODES, MAX_LIST_PAGE, STORAGE_CLEANUP_PENDING, ABANDONED_CLEANUP_CLAIM, CONFIRMATION_KEY_MAX_LENGTH,
-  sha256, confirmationMappingHash, sanitizeRowErrors, confirmationResponse, boundedInteger, validateMapping,
+  confirmationMappingHash, sanitizeRowErrors, confirmationResponse, boundedInteger, validateMapping,
   assertImportableResult, assertParsedRowsImportable, getCafeTimezone,
 };

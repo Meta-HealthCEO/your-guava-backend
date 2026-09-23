@@ -9,8 +9,9 @@ const GeneratedInsight = require('../../models/GeneratedInsight.model');
 const ingestion = require('../../services/ingestion.service');
 const { zonedDateKey, zonedDayStart } = require('../../utils/timezone');
 const {
-  boundedInteger, ABANDONED_CLEANUP_CLAIM, sanitizeRowErrors, sha256, assertImportableResult, confirmationMappingHash,
+  boundedInteger, ABANDONED_CLEANUP_CLAIM, sanitizeRowErrors, assertImportableResult, confirmationMappingHash,
 } = require('./shared');
+const { sha256Hex } = require('../../utils/authPrimitives');
 
 const DEFAULT_PARSING_LEASE_MS = 15 * 60 * 1000;
 const MAX_PARSING_LEASE_MS = 60 * 60 * 1000;
@@ -174,7 +175,7 @@ const commitParsedUpload = async ({
         itemsAlreadyReconciled: true,
         rebuildItems: false,
         failOnPersistenceError: true,
-        sourceFingerprint: upload.fileFingerprint || sha256(upload.r2Key),
+        sourceFingerprint: upload.fileFingerprint || sha256Hex(upload.r2Key),
         timezone,
       });
       assertImportableResult(result);

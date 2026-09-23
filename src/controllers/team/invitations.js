@@ -1,6 +1,5 @@
 // Invitations: create, preview, accept, resend and revoke, with the TTL and token helpers.
 // Moved from team.controller.js by BE-11-T03; behaviour unchanged.
-const crypto = require('crypto');
 const mongoose = require('mongoose');
 const User = require('../../models/User.model');
 const Cafe = require('../../models/Cafe.model');
@@ -11,12 +10,12 @@ const emailService = require('../../services/email.service');
 const { isValidEmail } = require('../../utils/email');
 const { passwordInputError } = require('../../utils/password');
 const { recordAccessAudit } = require('./audit');
+const { generateOpaqueToken, sha256Hex, normalizedOpaqueToken } = require('../../utils/authPrimitives');
 const { normalizeCafeIds, expirePendingInvitations, validateCafeAccess, buildSeatSummary } = require('./members');
 
 const DEFAULT_INVITE_TTL_HOURS = 48;
 const MIN_INVITE_TTL_HOURS = 1;
 const MAX_INVITE_TTL_HOURS = 168;
-const INVITE_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 const INVALID_INVITATION_MESSAGE = 'This invitation is invalid or has expired';
 
 const inviteTtlMs = () => {
@@ -27,15 +26,6 @@ const inviteTtlMs = () => {
   return hours * 60 * 60 * 1000;
 };
 
-const generateInvitationToken = () => crypto.randomBytes(32).toString('base64url');
-const hashInvitationToken = (token) =>
-  crypto.createHash('sha256').update(String(token)).digest('hex');
-
-const normalizedInvitationToken = (value) => {
-  if (typeof value !== 'string') return null;
-  const token = value.trim();
-  return INVITE_TOKEN_RE.test(token) ? token : null;
-};
 
 const invitationError = (statusCode = 404, message = INVALID_INVITATION_MESSAGE) => {
   const error = new Error(message);
@@ -89,8 +79,8 @@ const inviteManager = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Only owners can add team members' });
     }
 
-    const invitationToken = generateInvitationToken();
-    const tokenHash = hashInvitationToken(invitationToken);
+    const invitationToken = generateOpaqueToken();
+    const tokenHash = sha256Hex(invitationToken);
     let invitation;
     let validCafeIds;
 
@@ -268,11 +258,11 @@ const inviteManager = async (req, res, next) => {
 const previewInvitation = async (req, res, next) => {
   try {
     res.set('Cache-Control', 'no-store');
-    const token = normalizedInvitationToken(req.body?.token);
+    const token = normalizedOpaqueToken(req.body?.token);
     if (!token) throw invitationError();
 
     const invitation = await TeamInvitation.findOne({
-      tokenHash: hashInvitationToken(token),
+      tokenHash: sha256Hex(token),
       status: 'pending',
       expiresAt: { $gt: new Date() },
     }).lean();
@@ -318,7 +308,7 @@ const acceptInvitation = async (req, res, next) => {
   let session;
   try {
     res.set('Cache-Control', 'no-store');
-    const token = normalizedInvitationToken(req.body?.token);
+    const token = normalizedOpaqueToken(req.body?.token);
     const password = req.body?.password;
     if (!token) throw invitationError();
     const passwordError = passwordInputError(password);
@@ -326,7 +316,7 @@ const acceptInvitation = async (req, res, next) => {
       return res.status(400).json({ success: false, message: passwordError });
     }
 
-    const tokenHash = hashInvitationToken(token);
+    const tokenHash = sha256Hex(token);
     let manager;
     session = await mongoose.startSession();
     await session.withTransaction(async () => {
@@ -455,8 +445,8 @@ const resendInvitation = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Only owners can resend invitations' });
     }
 
-    const invitationToken = generateInvitationToken();
-    const tokenHash = hashInvitationToken(invitationToken);
+    const invitationToken = generateOpaqueToken();
+    const tokenHash = sha256Hex(invitationToken);
     let invitation;
     let validCafeIds;
 

@@ -9,8 +9,8 @@ const { isValidEmail } = require('../../utils/email');
 const { passwordTooLong, dummyPasswordHash } = require('../../utils/password');
 const authThrottle = require('../../services/authThrottle.service');
 const { resolveSessionCafeId } = require('../../utils/sessionCafe');
-const { refreshCookieOptions } = require('../../config/posture');
-const { issueSession, hashRefreshToken, generateRefreshToken, refreshTokenExpiry, generateAccessToken } = require('./tokens');
+const { issueSession, generateRefreshToken, refreshTokenExpiry } = require('./tokens');
+const { sha256Hex, generateAccessToken, setRefreshCookie, clearRefreshCookie } = require('../../utils/authPrimitives');
 
 // A lost response on a slow connection is retried well inside this (identity-15).
 const REFRESH_REUSE_GRACE_MS = 2 * 60 * 1000;
@@ -66,7 +66,7 @@ const login = async (req, res, next) => {
 
     const { accessToken, refreshToken, cafeId } = await issueSession(user);
 
-    res.cookie('refreshToken', refreshToken, refreshCookieOptions());
+    setRefreshCookie(res, refreshToken);
 
     return res.status(200).json({
       success: true,
@@ -99,7 +99,7 @@ const refresh = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_REFRESH_SECRET);
-    const tokenHash = hashRefreshToken(token);
+    const tokenHash = sha256Hex(token);
     let user;
     let newRefreshToken;
 
@@ -117,7 +117,7 @@ const refresh = async (req, res, next) => {
         },
         {
           $set: {
-            currentTokenHash: hashRefreshToken(newRefreshToken),
+            currentTokenHash: sha256Hex(newRefreshToken),
             previousTokenHash: tokenHash,
             previousValidUntil: new Date(now.getTime() + REFRESH_REUSE_GRACE_MS),
             graceTokenId: replacementClaims.jti,
@@ -222,7 +222,7 @@ const refresh = async (req, res, next) => {
     // Identity-2: the tab says which cafe it is showing; the user record only supplies the default for a tab that has none.
     const cafeId = resolveSessionCafeId(user, requestedCafeId);
     const accessToken = generateAccessToken(user._id, cafeId, user.role, user.orgId, user.tokenVersion);
-    res.cookie('refreshToken', newRefreshToken, refreshCookieOptions());
+    setRefreshCookie(res, newRefreshToken);
 
     return res.status(200).json({ success: true, accessToken, cafeId });
   } catch (error) {
@@ -250,7 +250,7 @@ const logout = async (req, res, next) => {
           { $set: { revokedAt: new Date(), revokeReason: 'logout' } }
         );
       } else {
-        const tokenHash = hashRefreshToken(token);
+        const tokenHash = sha256Hex(token);
         await User.updateOne(
           {
             $or: [
@@ -269,7 +269,7 @@ const logout = async (req, res, next) => {
       }
     }
 
-    res.clearCookie('refreshToken', refreshCookieOptions({ clearing: true }));
+    clearRefreshCookie(res);
 
     return res.status(200).json({ success: true, message: 'Logged out' });
   } catch (error) {

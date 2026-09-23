@@ -1,4 +1,4 @@
-const crypto = require('crypto');
+const { sha256Hex } = require('../utils/authPrimitives');
 const AuthThrottle = require('../models/AuthThrottle.model');
 
 const LOGIN_FAILURE_LIMIT = 5;
@@ -10,7 +10,7 @@ const RECIPIENT_WINDOW_MS = 60 * 60 * 1000;
 const RECIPIENT_PURPOSES = new Set(['password_reset', 'signup']);
 
 const keyFor = (bucket, email) =>
-  `${bucket}:${crypto.createHash('sha256').update(String(email).toLowerCase().trim()).digest('hex')}`;
+  `${bucket}:${sha256Hex(String(email).toLowerCase().trim())}`;
 
 /**
  * Counts one event atomically in a fixed window that opens at the first event. With `block`, the count becomes a

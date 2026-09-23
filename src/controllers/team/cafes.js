@@ -1,6 +1,5 @@
 // Cafes: switching the active cafe, adding a location, archiving and restoring one (BE-02-T08).
 // Moved from team.controller.js by BE-11-T03; behaviour unchanged.
-const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const User = require('../../models/User.model');
 const Cafe = require('../../models/Cafe.model');
@@ -9,6 +8,7 @@ const TeamInvitation = require('../../models/TeamInvitation.model');
 const { getPlan } = require('../../services/billingPlans.service');
 const { getPlanCapacity } = require('../../services/planCapacity.service');
 const { recordAccessAudit } = require('./audit');
+const { generateAccessToken } = require('../../utils/authPrimitives');
 
 // POST /api/team/switch-cafe - Switch active cafe.
 const switchCafe = async (req, res, next) => {
@@ -29,17 +29,7 @@ const switchCafe = async (req, res, next) => {
     user.activeCafeId = cafeId;
     await user.save();
 
-    const accessToken = jwt.sign(
-      {
-        id: user._id,
-        cafeId,
-        role: user.role,
-        orgId: user.orgId ? user.orgId.toString() : null,
-        tokenVersion: Number(user.tokenVersion || 0),
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
-    );
+    const accessToken = generateAccessToken(user._id, cafeId, user.role, user.orgId, user.tokenVersion);
 
     return res.status(200).json({ success: true, accessToken, activeCafeId: cafeId });
   } catch (error) {

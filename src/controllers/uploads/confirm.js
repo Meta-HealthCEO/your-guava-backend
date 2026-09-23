@@ -5,9 +5,9 @@ const r2 = require('../../services/r2.service');
 const parser = require('../../services/parser.service');
 const { clearApiCache } = require('../../middleware/cache.middleware');
 const {
-  CONFIRMATION_KEY_MAX_LENGTH, confirmationMappingHash, sha256, confirmationResponse, validateMapping, getCafeTimezone,
-  assertParsedRowsImportable,
+  CONFIRMATION_KEY_MAX_LENGTH, confirmationMappingHash, confirmationResponse, validateMapping, getCafeTimezone, assertParsedRowsImportable,
 } = require('./shared');
+const { sha256Hex } = require('../../utils/authPrimitives');
 const {
   recoverStaleParsingUpload, snapshotUploadState, lockUploadForParsing, touchParsingLease, commitParsedUpload, restoreUploadAfterFailure,
 } = require('./lease');
@@ -27,7 +27,7 @@ const confirm = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Idempotency-Key is too long' });
     }
     const mappingHash = confirmationMappingHash(columnMapping, itemsMode);
-    const idempotencyKeyHash = idempotencyKey ? sha256(idempotencyKey) : undefined;
+    const idempotencyKeyHash = idempotencyKey ? sha256Hex(idempotencyKey) : undefined;
 
     let upload = await Upload.findOne({ _id: id, cafeId });
     if (!upload || upload.status === 'deleted') {

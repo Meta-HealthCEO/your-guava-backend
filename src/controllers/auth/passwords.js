@@ -10,8 +10,7 @@ const { isValidEmail } = require('../../utils/email');
 const { passwordInputError, passwordTooLong } = require('../../utils/password');
 const { runAfterResponse } = require('../../utils/afterResponse');
 const authThrottle = require('../../services/authThrottle.service');
-const { refreshCookieOptions } = require('../../config/posture');
-const { generateActionToken, hashActionToken, normalizedActionToken } = require('./tokens');
+const { generateOpaqueToken, sha256Hex, normalizedOpaqueToken, clearRefreshCookie } = require('../../utils/authPrimitives');
 
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
 
@@ -30,10 +29,10 @@ const deliverPasswordReset = async (normalizedEmail) => {
     { userId: user._id, status: 'pending' },
     { $set: { status: 'revoked', revokedAt: new Date() } }
   );
-  const resetToken = generateActionToken();
+  const resetToken = generateOpaqueToken();
   const record = await PasswordResetToken.create({
     userId: user._id,
-    tokenHash: hashActionToken(resetToken),
+    tokenHash: sha256Hex(resetToken),
     expiresAt: new Date(Date.now() + PASSWORD_RESET_TTL_MS),
   });
   const result = await emailService.sendPasswordResetEmail({ user, resetToken, expiresAt: record.expiresAt });
@@ -62,7 +61,7 @@ const resetPassword = async (req, res, next) => {
   let session;
   try {
     res.set('Cache-Control', 'no-store');
-    const token = normalizedActionToken(req.body?.token);
+    const token = normalizedOpaqueToken(req.body?.token);
     const newPassword = req.body?.password;
     if (!token) {
       return res.status(404).json({ success: false, message: 'This reset link is invalid or has expired' });
@@ -77,7 +76,7 @@ const resetPassword = async (req, res, next) => {
     await session.withTransaction(async () => {
       const reset = await PasswordResetToken.findOneAndUpdate(
         {
-          tokenHash: hashActionToken(token),
+          tokenHash: sha256Hex(token),
           status: 'pending',
           expiresAt: { $gt: new Date() },
         },
@@ -128,7 +127,7 @@ const resetPassword = async (req, res, next) => {
     emailService.sendSecurityNoticeEmail({ kind: 'password_reset', user: holder })
       .catch((error) => console.warn('[auth] password reset notice failed:', error.message));
 
-    res.clearCookie('refreshToken', refreshCookieOptions({ clearing: true }));
+    clearRefreshCookie(res);
     return res.status(200).json({
       success: true,
       message: 'Password reset. You can now sign in.',
@@ -207,7 +206,7 @@ const changePassword = async (req, res, next) => {
     emailService.sendSecurityNoticeEmail({ kind: 'password_changed', user: holder })
       .catch((error) => console.warn('[auth] password change notice failed:', error.message));
 
-    res.clearCookie('refreshToken', refreshCookieOptions({ clearing: true }));
+    clearRefreshCookie(res);
 
     return res.status(200).json({
       success: true,

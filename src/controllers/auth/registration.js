@@ -12,7 +12,7 @@ const { isValidEmail } = require('../../utils/email');
 const { passwordInputError, hashPassword, passwordTooLong } = require('../../utils/password');
 const { runAfterResponse } = require('../../utils/afterResponse');
 const authThrottle = require('../../services/authThrottle.service');
-const { generateActionToken, hashActionToken, normalizedActionToken } = require('./tokens');
+const { generateOpaqueToken, sha256Hex, normalizedOpaqueToken } = require('../../utils/authPrimitives');
 
 const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -128,14 +128,14 @@ const register = async (req, res, next) => {
     }
 
     // Identity-3: a pending team invitation in any org no longer blocks a public signup.
-    const verificationToken = generateActionToken();
+    const verificationToken = generateOpaqueToken();
     const registration = await upsertPendingRegistration({
       email: normalizedEmail,
       passwordHash: await hashPassword(password),
       name: normalizedName,
       cafeName: normalizedCafeName,
       orgName: normalizedOrgName,
-      tokenHash: hashActionToken(verificationToken),
+      tokenHash: sha256Hex(verificationToken),
       expiresAt: new Date(Date.now() + VERIFICATION_TTL_MS),
     });
 
@@ -153,8 +153,8 @@ const register = async (req, res, next) => {
 const rotateVerification = async (normalizedEmail) => {
   // Over quota nothing rotates, so the last link sent keeps working.
   if (!(await authThrottle.consumeRecipientQuota('signup', normalizedEmail)).allowed) return;
-  const verificationToken = generateActionToken();
-  const tokenHash = hashActionToken(verificationToken);
+  const verificationToken = generateOpaqueToken();
+  const tokenHash = sha256Hex(verificationToken);
   const expiresAt = new Date(Date.now() + VERIFICATION_TTL_MS);
   const previousRegistration = await PendingRegistration.findOneAndUpdate(
     {
@@ -211,7 +211,7 @@ const verifyEmail = async (req, res, next) => {
   let session;
   try {
     res.set('Cache-Control', 'no-store');
-    const token = normalizedActionToken(req.body?.token);
+    const token = normalizedOpaqueToken(req.body?.token);
     if (!token) {
       return res.status(404).json({ success: false, message: INVALID_VERIFICATION_MESSAGE });
     }
@@ -224,7 +224,7 @@ const verifyEmail = async (req, res, next) => {
       });
     }
 
-    const tokenHash = hashActionToken(token);
+    const tokenHash = sha256Hex(token);
     const candidate = await PendingRegistration.findOne({ tokenHash, expiresAt: { $gt: new Date() } })
       .select('+passwordHash');
     if (!candidate) {

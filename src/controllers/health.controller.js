@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { sha256Hex } = require('../utils/authPrimitives');
 const mongoose = require('mongoose');
 const { getEventLoopStats } = require('../utils/eventLoopMonitor');
 const packageJson = require('../../package.json');
@@ -70,7 +71,7 @@ const eventLoopCheck = () => {
 const READINESS_CACHE_MS = 5000;
 let anonymousReadiness = null; // { at, promise } shared by concurrent anonymous callers
 
-const digest = (value) => crypto.createHash('sha256').update(String(value)).digest();
+const digest = (value) => Buffer.from(sha256Hex(value), 'hex');
 
 // Details are for operators: a 32+ character READINESS_TOKEN sent as X-Readiness-Token (security-11, platform-13).
 const hasReadinessToken = (req) => {

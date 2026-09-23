@@ -7,9 +7,9 @@ const Organization = require('../../models/Organization.model');
 const TeamInvitation = require('../../models/TeamInvitation.model');
 const AuthSession = require('../../models/AuthSession.model');
 const emailService = require('../../services/email.service');
-const { refreshCookieOptions } = require('../../config/posture');
 const { passwordTooLong } = require('../../utils/password');
 const { recordAccessAudit } = require('./audit');
+const { clearRefreshCookie } = require('../../utils/authPrimitives');
 
 // POST /api/team/transfer-ownership - Atomically make one manager the sole owner.
 const transferOwnership = async (req, res, next) => {
@@ -133,7 +133,7 @@ const transferOwnership = async (req, res, next) => {
       }).catch(warn('new owner'));
     }
 
-    res.clearCookie('refreshToken', refreshCookieOptions({ clearing: true }));
+    clearRefreshCookie(res);
     return res.status(200).json({
       success: true,
       message: `${target.name} is now the account owner. Both users must sign in again.`,

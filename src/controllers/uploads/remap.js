@@ -9,9 +9,9 @@ const {
   transactionIdentity, identityComparisonKey, findExistingIdentities,
 } = require('../../services/transactionIdentity');
 const {
-  CONFIRMATION_KEY_MAX_LENGTH, sha256, validateMapping, getCafeTimezone, assertParsedRowsImportable, confirmationMappingHash,
-  confirmationResponse,
+  CONFIRMATION_KEY_MAX_LENGTH, validateMapping, getCafeTimezone, assertParsedRowsImportable, confirmationMappingHash, confirmationResponse,
 } = require('./shared');
+const { sha256Hex } = require('../../utils/authPrimitives');
 const {
   recoverStaleParsingUpload, snapshotUploadState, lockUploadForParsing, touchParsingLease, commitParsedUpload, restoreUploadAfterFailure,
 } = require('./lease');
@@ -47,7 +47,7 @@ const remap = async (req, res, next) => {
     if (remapKey.length > CONFIRMATION_KEY_MAX_LENGTH) {
       return res.status(400).json({ success: false, message: 'Idempotency-Key is too long' });
     }
-    const remapKeyHash = remapKey ? sha256(remapKey) : undefined;
+    const remapKeyHash = remapKey ? sha256Hex(remapKey) : undefined;
 
     let upload = await Upload.findOne({ _id: id, cafeId });
     if (!upload || upload.status === 'deleted') {
@@ -90,7 +90,7 @@ const remap = async (req, res, next) => {
         parsed,
         cafeId,
         upload._id,
-        upload.fileFingerprint || sha256(upload.r2Key),
+        upload.fileFingerprint || sha256Hex(upload.r2Key),
         timezone
       );
 
