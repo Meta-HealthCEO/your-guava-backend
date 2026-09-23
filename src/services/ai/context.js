@@ -12,6 +12,24 @@ const { roundMoney, zonedDateTimeLabel, dayNames, weekdayForKey, relativeDayLabe
 // The bar for "there is something to analyse". Below it we decline before the
 // provider call so nothing is billed: buildSummaryStats has nothing to report,
 // and an insight generated from that sentence is filler dressed up as analysis.
+const MENU_ITEM_CONTEXT_SELECT = 'cafeId name category avgPrice totalSold expectedPrice reviewStatus aliases priceMismatchCount lastPriceMismatchAt observedPriceMin observedPriceMax';
+
+// One 12-field projection for both menu lists; the keys keep their order, so fencedJson(context) is unchanged.
+const menuItemContext = (item, cafeNameById) => ({
+  location: cafeNameById.get(item.cafeId.toString()) || item.cafeId,
+  name: item.name,
+  category: item.category,
+  avgPrice: item.avgPrice,
+  totalSold: item.totalSold,
+  expectedPrice: item.expectedPrice,
+  reviewStatus: item.reviewStatus,
+  aliases: item.aliases || [],
+  priceMismatchCount: item.priceMismatchCount || 0,
+  lastPriceMismatchAt: item.lastPriceMismatchAt,
+  observedPriceMin: item.observedPriceMin,
+  observedPriceMax: item.observedPriceMax,
+});
+
 const MIN_INSIGHT_TRANSACTIONS = 1;
 
 /**
@@ -209,7 +227,7 @@ const buildBusinessContext = async ({ cafeId, orgId, authorizedCafeIds }) => {
     Item.find({ cafeId: { $in: cafeIds }, isActive: true })
       .sort({ totalSold: -1 })
       .limit(30)
-      .select('cafeId name category avgPrice totalSold expectedPrice reviewStatus aliases priceMismatchCount lastPriceMismatchAt observedPriceMin observedPriceMax')
+      .select(MENU_ITEM_CONTEXT_SELECT)
       .lean(),
     Item.find({
       cafeId: { $in: cafeIds },
@@ -222,7 +240,7 @@ const buildBusinessContext = async ({ cafeId, orgId, authorizedCafeIds }) => {
     })
       .sort({ reviewStatus: -1, lastPriceMismatchAt: -1, totalSold: -1 })
       .limit(20)
-      .select('cafeId name category avgPrice totalSold expectedPrice reviewStatus aliases priceMismatchCount lastPriceMismatchAt observedPriceMin observedPriceMax')
+      .select(MENU_ITEM_CONTEXT_SELECT)
       .lean(),
     Forecast.find({ cafeId, date: { $gte: today, $lt: forecastRangeEnd } })
       .sort({ date: 1 })
@@ -298,34 +316,8 @@ const buildBusinessContext = async ({ cafeId, orgId, authorizedCafeIds }) => {
       transactions: row.transactions,
       revenue: roundMoney(row.revenue),
     })),
-    menuItems: menuItems.map((item) => ({
-      location: cafeNameById.get(item.cafeId.toString()) || item.cafeId,
-      name: item.name,
-      category: item.category,
-      avgPrice: item.avgPrice,
-      totalSold: item.totalSold,
-      expectedPrice: item.expectedPrice,
-      reviewStatus: item.reviewStatus,
-      aliases: item.aliases || [],
-      priceMismatchCount: item.priceMismatchCount || 0,
-      lastPriceMismatchAt: item.lastPriceMismatchAt,
-      observedPriceMin: item.observedPriceMin,
-      observedPriceMax: item.observedPriceMax,
-    })),
-    menuItemIssues: menuItemIssues.map((item) => ({
-      location: cafeNameById.get(item.cafeId.toString()) || item.cafeId,
-      name: item.name,
-      category: item.category,
-      avgPrice: item.avgPrice,
-      totalSold: item.totalSold,
-      expectedPrice: item.expectedPrice,
-      reviewStatus: item.reviewStatus,
-      aliases: item.aliases || [],
-      priceMismatchCount: item.priceMismatchCount || 0,
-      lastPriceMismatchAt: item.lastPriceMismatchAt,
-      observedPriceMin: item.observedPriceMin,
-      observedPriceMax: item.observedPriceMax,
-    })),
+    menuItems: menuItems.map((item) => menuItemContext(item, cafeNameById)),
+    menuItemIssues: menuItemIssues.map((item) => menuItemContext(item, cafeNameById)),
     // Relative-date questions -- "what should I prepare tomorrow", "how does this
     // weekend look" -- are the most common thing anyone asks. Without an explicit
     // anchor the model has to infer which forecast is which from bare date keys,

@@ -178,6 +178,18 @@ const currentCreditSnapshot = async (orgId) => {
   return org ? creditSnapshot(org) : null;
 };
 
+// A refresh finished within REFRESH_DEDUPE_MS answers this one for free. One definition; the two
+// callers used to differ only in whether generatedAt was re-wrapped in a Date (it is a Date either way).
+const recentRefreshReplay = async (entry, orgId) => {
+  if (!entry?.generatedAt || insightEntryIsInvalidated(entry)) return null;
+  if (Date.now() - new Date(entry.generatedAt).getTime() >= REFRESH_DEDUPE_MS) return null;
+  return {
+    result: { insights: entry.insights, generatedAt: new Date(entry.generatedAt) },
+    guavaCredits: await currentCreditSnapshot(orgId),
+    replayed: true,
+  };
+};
+
 const performInsightsRefresh = async ({
   cafeId,
   orgId,
@@ -195,17 +207,8 @@ const performInsightsRefresh = async ({
   }
 
   const recent = await cachedInsightEntry(cafeId);
-  if (
-    recent?.generatedAt &&
-    !insightEntryIsInvalidated(recent) &&
-    Date.now() - new Date(recent.generatedAt).getTime() < REFRESH_DEDUPE_MS
-  ) {
-    return {
-      result: { insights: recent.insights, generatedAt: new Date(recent.generatedAt) },
-      guavaCredits: await currentCreditSnapshot(orgId),
-      replayed: true,
-    };
-  }
+  const replay = await recentRefreshReplay(recent, orgId);
+  if (replay) return replay;
 
   if (await insightDatasetIsTooThin(cafeId)) {
     // Deliberately not persisted: a "you have no data" notice is not an
@@ -277,18 +280,8 @@ const performInsightsRefresh = async ({
 const refreshInsights = async (options) => {
   throwIfAborted(options.signal);
   const recent = await cachedInsightEntry(options.cafeId);
-  if (
-    recent?.generatedAt &&
-    !insightEntryIsInvalidated(recent) &&
-    Date.now() - new Date(recent.generatedAt).getTime() < REFRESH_DEDUPE_MS
-  ) {
-    return {
-      result: { insights: recent.insights, generatedAt: recent.generatedAt },
-      guavaCredits: await currentCreditSnapshot(options.orgId),
-      replayed: true,
-      coalesced: false,
-    };
-  }
+  const replay = await recentRefreshReplay(recent, options.orgId);
+  if (replay) return { ...replay, coalesced: false };
 
   const leaseToken = crypto.randomBytes(24).toString('hex');
   const startedAt = new Date();
