@@ -1,6 +1,7 @@
 const validateEnv = require('../../src/config/validateEnv');
 
 const KEYS = [
+  'READINESS_TOKEN',
   'NODE_ENV',
   'JWT_SECRET',
   'JWT_REFRESH_SECRET',
@@ -240,5 +241,24 @@ describe('validateEnv', () => {
     process.env.ACCOUNTING_INTEGRATIONS_ENABLED = 'true';
 
     expect(() => validateEnv()).toThrow(/ACCOUNTING_INTEGRATIONS_ENABLED must remain false in production/i);
+  });
+
+  it('requires CLIENT_URL outside tests and strong secrets on staging, but leaves mock billing to D-010', () => {
+    process.env.NODE_ENV = 'development';
+    process.env.JWT_SECRET = 'dev-secret';
+    process.env.JWT_REFRESH_SECRET = 'dev-refresh-secret';
+    process.env.MONGODB_URI = 'mongodb://localhost:27017/guava-dev';
+    expect(() => validateEnv()).toThrow(/CLIENT_URL is required outside tests/);
+    process.env.CLIENT_URL = 'http://localhost:5185';
+    expect(() => validateEnv()).not.toThrow();
+
+    process.env.NODE_ENV = 'staging';
+    process.env.CLIENT_URL = 'https://staging.yourguava.example';
+    process.env.BILLING_MOCK_ENABLED = 'true';
+    expect(() => validateEnv()).toThrow(/JWT_SECRET must be at least 32 characters outside development and test/);
+    process.env.JWT_SECRET = 'x'.repeat(32);
+    process.env.JWT_REFRESH_SECRET = 'y'.repeat(32);
+    process.env.TOKEN_ENCRYPTION_KEY = 'z'.repeat(32);
+    expect(() => validateEnv()).not.toThrow();
   });
 });

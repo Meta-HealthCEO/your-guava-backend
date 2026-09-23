@@ -1,3 +1,5 @@
+const { isTestEnvironment } = require('../config/posture');
+
 const originOf = (value) => {
   try {
     return new URL(value).origin;
@@ -12,7 +14,8 @@ const originOf = (value) => {
  * reaching the server or setting/rotating a cookie.
  */
 const trustedOrigin = (req, res, next) => {
-  if (process.env.NODE_ENV !== 'production') return next();
+  // Every non-test environment checks the origin (platform-18); a missing Origin is refused, as in production.
+  if (isTestEnvironment()) return next();
 
   const expected = originOf(process.env.CLIENT_URL);
   const received = originOf(req.get('origin'));

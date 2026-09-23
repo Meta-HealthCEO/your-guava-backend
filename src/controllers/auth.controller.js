@@ -16,14 +16,7 @@ const { passwordTooLong, passwordInputError, dummyPasswordHash } = require('../u
 const { runAfterResponse } = require('../utils/afterResponse');
 const authThrottle = require('../services/authThrottle.service');
 const { resolveSessionCafeId } = require('../utils/sessionCafe');
-
-const COOKIE_OPTIONS = {
-  httpOnly: true,
-  sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-  secure: process.env.NODE_ENV === 'production',
-  path: '/api/auth',
-  maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days in ms
-};
+const { refreshCookieOptions, REFRESH_COOKIE_MAX_AGE_MS } = require('../config/posture');
 
 // Max active refresh-token families per user (roughly one per device).
 const MAX_REFRESH_TOKENS = 10;
@@ -42,7 +35,7 @@ const REGISTER_ACCEPTED_MESSAGE =
 
 // New, pending and existing addresses leave register through this one function, so their answers cannot drift apart.
 const respondToRegistration = (res, emailResult, email) => {
-  if (!emailResult?.sent) {
+  if (!emailService.deliveryAccepted(emailResult)) {
     console.error(
       '[auth] Registration email could not be sent:',
       emailResult?.error?.message || emailResult?.reason || 'unknown error'
@@ -54,7 +47,14 @@ const respondToRegistration = (res, emailResult, email) => {
       message: 'Your registration is saved, but the verification email could not be sent. Try resending it.',
     });
   }
-  return res.status(202).json({ success: true, verificationRequired: true, email, message: REGISTER_ACCEPTED_MESSAGE });
+  // deliveryMode is the same for every address, so BE-02-T02's uniformity holds; the page uses it to say when nothing was sent.
+  return res.status(202).json({
+    success: true,
+    verificationRequired: true,
+    email,
+    message: REGISTER_ACCEPTED_MESSAGE,
+    deliveryMode: emailService.deliveryMode(),
+  });
 };
 
 // Identity-1: a new submission replaces a pending one (password, names, token), so the old link dies. Two simultaneous
@@ -100,7 +100,7 @@ const normalizedActionToken = (value) => {
 
 const refreshTokenExpiry = (token) => {
   const decoded = jwt.decode(token);
-  return decoded?.exp ? new Date(decoded.exp * 1000) : new Date(Date.now() + COOKIE_OPTIONS.maxAge);
+  return decoded?.exp ? new Date(decoded.exp * 1000) : new Date(Date.now() + REFRESH_COOKIE_MAX_AGE_MS);
 };
 
 const generateAccessToken = (userId, cafeId, role, orgId, tokenVersion = 0) =>
@@ -270,7 +270,7 @@ const rotateVerification = async (normalizedEmail) => {
     expiresAt,
   };
   const result = await emailService.sendVerificationEmail({ registration, verificationToken });
-  if (!result?.sent) {
+  if (!emailService.deliveryAccepted(result)) {
     await PendingRegistration.updateOne(
       { _id: previousRegistration._id, tokenHash },
       {
@@ -483,12 +483,7 @@ const login = async (req, res, next) => {
 
     const { accessToken, refreshToken, cafeId } = await issueSession(user);
 
-    const cookieOptions = {
-      ...COOKIE_OPTIONS,
-      secure: process.env.NODE_ENV === 'production',
-    };
-
-    res.cookie('refreshToken', refreshToken, cookieOptions);
+    res.cookie('refreshToken', refreshToken, refreshCookieOptions());
 
     return res.status(200).json({
       success: true,
@@ -629,7 +624,7 @@ const refresh = async (req, res, next) => {
     // Identity-2: the tab says which cafe it is showing; the user record only supplies the default for a tab that has none.
     const cafeId = resolveSessionCafeId(user, requestedCafeId);
     const accessToken = generateAccessToken(user._id, cafeId, user.role, user.orgId, user.tokenVersion);
-    res.cookie('refreshToken', newRefreshToken, COOKIE_OPTIONS);
+    res.cookie('refreshToken', newRefreshToken, refreshCookieOptions());
 
     return res.status(200).json({ success: true, accessToken, cafeId });
   } catch (error) {
@@ -676,12 +671,7 @@ const logout = async (req, res, next) => {
       }
     }
 
-    res.clearCookie('refreshToken', {
-      httpOnly: true,
-      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-      secure: process.env.NODE_ENV === 'production',
-      path: '/api/auth',
-    });
+    res.clearCookie('refreshToken', refreshCookieOptions({ clearing: true }));
 
     return res.status(200).json({ success: true, message: 'Logged out' });
   } catch (error) {
@@ -711,7 +701,7 @@ const deliverPasswordReset = async (normalizedEmail) => {
     expiresAt: new Date(Date.now() + PASSWORD_RESET_TTL_MS),
   });
   const result = await emailService.sendPasswordResetEmail({ user, resetToken, expiresAt: record.expiresAt });
-  if (!result?.sent) {
+  if (!emailService.deliveryAccepted(result)) {
     await PasswordResetToken.updateOne(
       { _id: record._id, status: 'pending' },
       { $set: { status: 'revoked', revokedAt: new Date() } }
@@ -797,12 +787,7 @@ const resetPassword = async (req, res, next) => {
       }
     });
 
-    res.clearCookie('refreshToken', {
-      httpOnly: true,
-      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-      secure: process.env.NODE_ENV === 'production',
-      path: '/api/auth',
-    });
+    res.clearCookie('refreshToken', refreshCookieOptions({ clearing: true }));
     return res.status(200).json({
       success: true,
       message: 'Password reset. You can now sign in.',
@@ -875,12 +860,7 @@ const changePassword = async (req, res, next) => {
       }], { session });
     });
 
-    res.clearCookie('refreshToken', {
-      httpOnly: true,
-      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-      secure: process.env.NODE_ENV === 'production',
-      path: '/api/auth',
-    });
+    res.clearCookie('refreshToken', refreshCookieOptions({ clearing: true }));
 
     return res.status(200).json({
       success: true,

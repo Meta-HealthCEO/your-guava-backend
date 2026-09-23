@@ -9,6 +9,7 @@ const AuthSession = require('../models/AuthSession.model');
 const AccessAuditEvent = require('../models/AccessAuditEvent.model');
 const { getPlan } = require('../services/billingPlans.service');
 const emailService = require('../services/email.service');
+const { refreshCookieOptions } = require('../config/posture');
 const { isValidEmail } = require('../utils/email');
 const { passwordInputError, passwordTooLong } = require('../utils/password');
 
@@ -274,7 +275,7 @@ const inviteManager = async (req, res, next) => {
       emailResult = { sent: false, error: emailErr };
     }
 
-    if (emailResult?.skipped || !emailResult?.sent) {
+    if (!emailService.deliveryAccepted(emailResult)) {
       // A failed delivery must not reserve a seat or leave a usable token behind.
       await TeamInvitation.updateOne(
         { _id: invitation._id, status: 'pending', tokenHash },
@@ -309,7 +310,8 @@ const inviteManager = async (req, res, next) => {
       success: true,
       invitation: invitationDto(invitation),
       seats: updatedSeats,
-      emailSent: true,
+      emailSent: emailResult.sent === true,
+      deliveryMode: emailService.deliveryMode(),
     });
   } catch (error) {
     if (error?.statusCode === 402 && error?.seats) {
@@ -678,7 +680,7 @@ const resendInvitation = async (req, res, next) => {
       emailResult = { sent: false, error: emailErr };
     }
 
-    if (emailResult?.skipped || !emailResult?.sent) {
+    if (!emailService.deliveryAccepted(emailResult)) {
       await TeamInvitation.updateOne(
         { _id: invitation._id, status: 'pending', tokenHash },
         { $set: { status: 'revoked', revokedAt: new Date() } }
@@ -696,7 +698,8 @@ const resendInvitation = async (req, res, next) => {
       success: true,
       invitation: invitationDto(invitation),
       seats: await buildSeatSummary(owner.orgId),
-      emailSent: true,
+      emailSent: emailResult.sent === true,
+      deliveryMode: emailService.deliveryMode(),
     });
   } catch (error) {
     if (error?.isInvitationError || (error?.statusCode && error.statusCode < 500)) {
@@ -1029,12 +1032,7 @@ const transferOwnership = async (req, res, next) => {
       });
     });
 
-    res.clearCookie('refreshToken', {
-      httpOnly: true,
-      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-      secure: process.env.NODE_ENV === 'production',
-      path: '/api/auth',
-    });
+    res.clearCookie('refreshToken', refreshCookieOptions({ clearing: true }));
     return res.status(200).json({
       success: true,
       message: `${target.name} is now the account owner. Both users must sign in again.`,

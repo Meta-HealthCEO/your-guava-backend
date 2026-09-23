@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const mongoose = require('mongoose');
 const { getEventLoopStats } = require('../utils/eventLoopMonitor');
 const packageJson = require('../../package.json');
@@ -47,15 +48,6 @@ const basePayload = (req) => ({
   requestId: req.id,
 });
 
-const health = (req, res) => {
-  res.status(200).json({
-    success: true,
-    status: 'ok',
-    message: 'Your Guava API is running',
-    ...basePayload(req),
-  });
-};
-
 // Informational: one instance (D-005) must not take itself out of rotation
 // because the loop was busy, so ok is always true; `degraded` says whether
 // the last complete window's p99 passed 200 ms.
@@ -75,7 +67,20 @@ const eventLoopCheck = () => {
   };
 };
 
-const readiness = async (req, res) => {
+const READINESS_CACHE_MS = 5000;
+let anonymousReadiness = null; // { at, promise } shared by concurrent anonymous callers
+
+const digest = (value) => crypto.createHash('sha256').update(String(value)).digest();
+
+// Details are for operators: a 32+ character READINESS_TOKEN sent as X-Readiness-Token (security-11, platform-13).
+const hasReadinessToken = (req) => {
+  const expected = process.env.READINESS_TOKEN;
+  const supplied = req.get('x-readiness-token');
+  if (!expected || expected.length < 32 || typeof supplied !== 'string' || supplied.length === 0) return false;
+  return crypto.timingSafeEqual(digest(supplied), digest(expected));
+};
+
+const computeReadiness = async () => {
   const databaseState = DB_STATES[mongoose.connection.readyState] || 'unknown';
   const database = await databaseCapability();
   const required = requiredEnvNames();
@@ -89,39 +94,68 @@ const readiness = async (req, res) => {
     environmentValid = false;
   }
   const checks = {
-    database: {
-      ...database,
-      state: databaseState,
-    },
+    database: { ...database, state: databaseState },
     environment: {
       ok: environmentValid && required.every((key) => Boolean(process.env[key])),
       state: environmentValid ? 'valid' : 'invalid',
       required,
     },
-    storage: {
-      ok: storage.ok,
-      configured: storage.configured,
-      mode: storage.mode,
-      missing: storage.missing,
-    },
-    // Capability, not env presence. A deploy that boots, connects and stores files
-    // but cannot email a verification link or take a payment is not ready to serve
-    // customers, and used to report itself ready anyway.
+    storage: { ok: storage.ok, configured: storage.configured, mode: storage.mode, missing: storage.missing },
+    // Capability, not env presence (BE-00): a deploy that cannot email a verification link is not ready.
     email: email.deliveryCapability(),
     payments: paymentProvider.paymentCapability(),
     eventLoop: eventLoopCheck(),
   };
-  const ready = Object.values(checks).every((check) => check.ok);
+  return { ready: Object.values(checks).every((check) => check.ok), checks };
+};
 
-  res.status(ready ? 200 : 503).json({
-    success: ready,
-    status: ready ? 'ready' : 'not_ready',
-    ...basePayload(req),
-    checks,
+// Anonymous callers share one computation per 5 s, so a flood cannot run validateEnv and an admin command per request.
+const anonymousReadinessResult = () => {
+  const now = Date.now();
+  if (!anonymousReadiness || now - anonymousReadiness.at >= READINESS_CACHE_MS) {
+    // A probe that throws is "not ready", never a rejected promise that every caller in the window would inherit as a 500.
+    anonymousReadiness = { at: now, promise: computeReadiness().then((result) => result.ready).catch(() => false) };
+  }
+  return anonymousReadiness.promise;
+};
+
+const health = (req, res) => {
+  res.status(200).json({
+    success: true,
+    status: 'ok',
+    message: 'Your Guava API is running',
+    service: 'your-guava-api',
+    requestId: req.id,
+    ...(hasReadinessToken(req) ? basePayload(req) : {}),
   });
+};
+
+const readiness = async (req, res) => {
+  if (hasReadinessToken(req)) {
+    let result;
+    try {
+      result = await computeReadiness();
+    } catch (error) {
+      console.error('[readiness] probe failed:', error?.message || String(error));
+      return res.status(503).json({ success: false, status: 'not_ready', ...basePayload(req), checks: null, probe: 'failed' });
+    }
+    return res.status(result.ready ? 200 : 503).json({
+      success: result.ready,
+      status: result.ready ? 'ready' : 'not_ready',
+      ...basePayload(req),
+      checks: result.checks,
+    });
+  }
+  const ready = await anonymousReadinessResult();
+  return res.status(ready ? 200 : 503).json({ success: ready, status: ready ? 'ready' : 'not_ready', requestId: req.id });
+};
+
+const _resetReadinessCache = () => {
+  anonymousReadiness = null;
 };
 
 module.exports = {
   health,
   readiness,
+  _resetReadinessCache,
 };

@@ -4,6 +4,9 @@ const { setup, teardown, clearDB, app } = require('../setup');
 const request = supertest(app);
 
 beforeAll(setup);
+const READINESS_TOKEN = 'r'.repeat(40);
+// Details need the readiness token after BE-02-T06; these tests read checks, so they send it.
+beforeAll(() => { process.env.READINESS_TOKEN = READINESS_TOKEN; });
 afterAll(teardown);
 afterEach(clearDB);
 
@@ -28,7 +31,7 @@ describe('Observability', () => {
   });
 
   it('reports readiness with database and env checks', async () => {
-    const res = await request.get('/api/ready');
+    const res = await request.get('/api/ready').set('X-Readiness-Token', READINESS_TOKEN);
 
     expect(res.status).toBe(200);
     expect(res.body.status).toBe('ready');
@@ -103,7 +106,7 @@ describe('Observability', () => {
     });
 
     it('reports email ready outside production via the console transport', async () => {
-      const res = await request.get('/api/ready');
+      const res = await request.get('/api/ready').set('X-Readiness-Token', READINESS_TOKEN);
       expect(res.status).toBe(200);
       expect(res.body.checks.email).toEqual(
         expect.objectContaining({ ok: true, mode: 'console' })
@@ -115,7 +118,7 @@ describe('Observability', () => {
       delete process.env.RESEND_API_KEY;
       delete process.env.RESEND_FROM_EMAIL;
 
-      const res = await request.get('/api/ready');
+      const res = await request.get('/api/ready').set('X-Readiness-Token', READINESS_TOKEN);
 
       expect(res.status).toBe(503);
       expect(res.body.status).toBe('not_ready');
@@ -128,7 +131,7 @@ describe('Observability', () => {
       process.env.NODE_ENV = 'production';
       delete process.env.PAYMENT_PROVIDER;
 
-      const res = await request.get('/api/ready');
+      const res = await request.get('/api/ready').set('X-Readiness-Token', READINESS_TOKEN);
 
       expect(res.status).toBe(503);
       expect(res.body.checks.payments.ok).toBe(false);
@@ -139,7 +142,7 @@ describe('Observability', () => {
       process.env.PAYMENT_PROVIDER = 'paystack';
       process.env.PAYSTACK_SECRET_KEY = 'sk_test_readiness_probe';
 
-      const res = await request.get('/api/ready');
+      const res = await request.get('/api/ready').set('X-Readiness-Token', READINESS_TOKEN);
 
       expect(res.body.checks.payments).toEqual(
         expect.objectContaining({ ok: true, provider: 'paystack' })
@@ -148,20 +151,20 @@ describe('Observability', () => {
 
     it('does not gate readiness on payments outside production', async () => {
       delete process.env.PAYMENT_PROVIDER;
-      const res = await request.get('/api/ready');
+      const res = await request.get('/api/ready').set('X-Readiness-Token', READINESS_TOKEN);
       expect(res.status).toBe(200);
       expect(res.body.checks.payments.ok).toBe(true);
     });
   });
   it('reports event-loop lag on readiness without letting it decide readiness', async () => {
     const { startEventLoopMonitor, stopEventLoopMonitor } = require('../../src/utils/eventLoopMonitor');
-    const idle = await request.get('/api/ready');
+    const idle = await request.get('/api/ready').set('X-Readiness-Token', READINESS_TOKEN);
     expect(idle.body.checks.eventLoop).toEqual(expect.objectContaining({ ok: true, running: false, p99Ms: null }));
 
     startEventLoopMonitor({ intervalMs: 50, log: () => {} });
     try {
       await new Promise((resolve) => setTimeout(resolve, 150));
-      const res = await request.get('/api/ready');
+      const res = await request.get('/api/ready').set('X-Readiness-Token', READINESS_TOKEN);
       expect(res.status).toBe(200);
       expect(res.body.checks.eventLoop).toEqual(expect.objectContaining({
         ok: true, running: true, p50Ms: expect.any(Number), p99Ms: expect.any(Number),

@@ -1,3 +1,4 @@
+const { isHardenedEnvironment } = require('../config/posture');
 const errorMiddleware = (err, req, res, next) => {
   let statusCode = err.statusCode || err.status || 500;
   let message = err.message || 'Internal Server Error';
@@ -45,11 +46,11 @@ const errorMiddleware = (err, req, res, next) => {
   // cafe owner with no idea what had happened and a reasonable fear they had
   // just paid for nothing. `exposeMessage` is opt-in, is set only on fixed
   // product-authored strings, and never on a raw thrown error.
-  if (statusCode >= 500 && process.env.NODE_ENV === 'production' && !err.exposeMessage) {
+  if (statusCode >= 500 && isHardenedEnvironment() && !err.exposeMessage) {
     message = 'Internal Server Error';
   }
 
-  const exposeDetails = err.details && !(statusCode >= 500 && process.env.NODE_ENV === 'production');
+  const exposeDetails = err.details && !(statusCode >= 500 && isHardenedEnvironment());
 
   res.status(statusCode).json({
     success: false,

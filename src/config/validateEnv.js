@@ -1,4 +1,5 @@
 const { parseTrustProxyHops } = require('./proxy');
+const { isTestEnvironment, isHardenedEnvironment } = require('./posture');
 const PLACEHOLDER_VALUES = new Set([
   'your_jwt_secret_here',
   'your_jwt_refresh_secret_here',
@@ -98,6 +99,23 @@ const validateEnv = () => {
   // TRUST_PROXY_HOPS: a whole number from 0 to 5 (src/config/proxy.js); a bad value stops boot instead of trusting a guess.
   const proxy = parseTrustProxyHops();
   if (proxy.error) errors.push(proxy.error);
+
+  if (!isTestEnvironment() && !process.env.CLIENT_URL) {
+    errors.push('CLIENT_URL is required outside tests: it is the CORS origin and the only origin trusted for cookie-setting requests');
+  }
+  const readinessToken = process.env.READINESS_TOKEN;
+  if (readinessToken && readinessToken.length < 32) {
+    errors.push('READINESS_TOKEN must be at least 32 characters when it is set');
+  }
+  if (isHardenedEnvironment() && !isProduction) {
+    // Staging and preview hold sessions and tokens too; mock billing stays their choice (D-010), weak secrets do not.
+    for (const name of ['JWT_SECRET', 'JWT_REFRESH_SECRET', 'TOKEN_ENCRYPTION_KEY']) {
+      if ((process.env[name] || '').length < 32) errors.push(`${name} must be at least 32 characters outside development and test`);
+    }
+    if (process.env.CLIENT_URL && !isHttpsUrl(process.env.CLIENT_URL)) {
+      errors.push('CLIENT_URL must be a valid HTTPS URL outside development and test');
+    }
+  }
 
   if (isProduction) {
     if ((process.env.JWT_SECRET || '').length < 32) {

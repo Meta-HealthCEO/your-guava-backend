@@ -1,4 +1,5 @@
 const { Resend } = require('resend');
+const { isRelaxedEnvironment } = require('../config/posture');
 
 let client = null;
 
@@ -60,52 +61,44 @@ const baseHtml = ({ title, intro, children, ctaLabel, ctaUrl }) => `
 </html>`;
 
 /**
- * Local-development transport.
- *
- * Without RESEND_API_KEY there is no way to complete a signup or accept a team
- * invite, because both depend on a token that only ever leaves the system by
- * email. That made the two flows every new customer touches first completely
- * untestable on a developer machine.
- *
- * When email is unconfigured outside production, the message is written to the
- * server log with its action link extracted, and reported as delivered so the
- * calling flow proceeds exactly as it would in production. The token is still
- * a real single-use token and still has to be redeemed through the normal
- * endpoint -- nothing about the verification contract is bypassed.
- *
- * Hard-guarded: in production an unconfigured mailer still refuses, as before.
- * Set EMAIL_DEV_CONSOLE=false to opt out locally.
+ * Development and test only. Nothing is delivered, so the result says sent:false; the calling flows still proceed because
+ * deliveryAccepted() counts the console as a transport. Action links reach the log only with EMAIL_CONSOLE_LINKS=true: a
+ * staging deploy without Resend used to print live reset tokens into its log store (security-7, identity-5).
  */
+const consoleLinksEnabled = () => String(process.env.EMAIL_CONSOLE_LINKS || '').toLowerCase() === 'true';
+
+const canUseConsoleTransport = () =>
+  isRelaxedEnvironment() && String(process.env.EMAIL_DEV_CONSOLE || 'true').toLowerCase() !== 'false';
+
 const deliverToConsole = ({ to, subject, text, html }) => {
   const body = text || String(html || '').replace(/<[^>]+>/g, ' ');
   const link = (body.match(/https?:\/\/\S+/) || [])[0];
+  const printLink = Boolean(link) && consoleLinksEnabled();
+  const linkLine = !link
+    ? '  │ (no action link found in this message)'
+    : printLink
+      ? `  │ link:    ${link}`
+      : '  │ link:    withheld (set EMAIL_CONSOLE_LINKS=true to print it)';
   console.warn(
     [
       '',
       '  ┌─ email not configured — delivering to console (development only) ─',
       `  │ to:      ${Array.isArray(to) ? to.join(', ') : to}`,
       `  │ subject: ${subject}`,
-      link ? `  │ link:    ${link}` : '  │ (no action link found in this message)',
+      linkLine,
       '  └───────────────────────────────────────────────────────────────────',
       '',
     ].join('\n')
   );
-  return { sent: true, transport: 'console' };
+  return { sent: false, transport: 'console', linkLogged: printLink };
 };
 
-const canUseConsoleTransport = () =>
-  process.env.NODE_ENV !== 'production' &&
-  String(process.env.EMAIL_DEV_CONSOLE || 'true').toLowerCase() !== 'false';
+/** True when the flow may proceed: a real send, or the development console. */
+const deliveryAccepted = (result) => result?.sent === true || result?.transport === 'console';
 
-/**
- * What the mailer can actually do right now, for the readiness probe.
- *
- * Readiness used to check that two env vars were present and call that healthy,
- * which is how a production deploy that could not send a single verification
- * email reported itself ready for three months. This answers the question the
- * probe is really asking: if a customer signs up in the next second, does a
- * message reach them?
- */
+/** What register and invite responses tell the portal; the same for every address. */
+const deliveryMode = () => (isConfigured() ? 'email' : canUseConsoleTransport() ? 'console' : 'none');
+
 const deliveryCapability = () => {
   if (isConfigured()) return { ok: true, configured: true, mode: 'resend' };
   if (canUseConsoleTransport()) {
@@ -113,7 +106,10 @@ const deliveryCapability = () => {
       ok: true,
       configured: false,
       mode: 'console',
-      reason: 'RESEND_API_KEY is not set; links are written to the server log (never in production)',
+      linksLogged: consoleLinksEnabled(),
+      reason: consoleLinksEnabled()
+        ? 'RESEND_API_KEY is not set; action links are written to the server log (development and test only)'
+        : 'RESEND_API_KEY is not set; nothing is delivered and links are withheld (set EMAIL_CONSOLE_LINKS=true in development)',
     };
   }
   const missing = [
@@ -334,6 +330,8 @@ module.exports = {
   sendPasswordResetEmail,
   sendTeamInviteEmail,
   sendEmail,
+  deliveryAccepted,
+  deliveryMode,
   isConfigured,
   deliveryCapability,
   _resetClient,
