@@ -76,7 +76,6 @@ const buildSummaryStats = (transactions, timezone = 'Africa/Johannesburg') => {
     .map(([name, qty]) => ({ name, qty }));
 
   // Day of week averages
-  const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
   const dailyRevenueByDow = Object.entries(dailyRevenue).reduce((acc, [date, revenue]) => {
     const dow = zonedDayOfWeek(zonedDayStart(date, timezone), timezone);
     if (!acc[dow]) acc[dow] = [];
