@@ -131,6 +131,25 @@ const aiPolicyError = (code, message, details) => {
   return error;
 };
 
+// An $expr over a computed field cannot use an index, so this used to scan every
+// ledger row the organisation had ever written -- inside the reservation
+// transaction, on every paid AI request. The $or is the same 24-hour window as an
+// indexable range plus a legacy branch for rows written before reservedAt existed.
+const dailyAiCredits = (scope, since, session) => UsageLedger.aggregate([
+  {
+    $match: {
+      ...scope,
+      featureKey: { $in: [...AI_FEATURE_KEYS] },
+      status: { $in: ['reserved', 'recovering', 'committed'] },
+      $or: [
+        { reservedAt: { $gte: since } },
+        { reservedAt: null, createdAt: { $gte: since } },
+      ],
+    },
+  },
+  { $group: { _id: null, credits: { $sum: '$credits' } } },
+]).session(session);
+
 const enforceAiUsagePolicy = async ({ orgId, userId, featureKey, credits }, session) => {
   if (!AI_FEATURE_KEYS.has(featureKey)) return;
   const limits = aiUsagePolicy();
@@ -144,45 +163,8 @@ const enforceAiUsagePolicy = async ({ orgId, userId, featureKey, credits }, sess
     : userId;
 
   const [userDaily, orgDaily, userConcurrent, orgConcurrent] = await Promise.all([
-    UsageLedger.aggregate([
-      {
-        $match: {
-          orgId: policyOrgId,
-          userId: policyUserId,
-          featureKey: { $in: [...AI_FEATURE_KEYS] },
-          status: { $in: ['reserved', 'recovering', 'committed'] },
-          // An $expr over a computed field cannot use an index, so this used to
-          // scan every ledger row the organisation had ever written -- inside
-          // the reservation transaction, on every paid AI request. The $or is
-          // the same 24-hour window as an indexable range plus a legacy branch
-          // for rows written before reservedAt existed.
-          $or: [
-            { reservedAt: { $gte: since } },
-            { reservedAt: null, createdAt: { $gte: since } },
-          ],
-        },
-      },
-      { $group: { _id: null, credits: { $sum: '$credits' } } },
-    ]).session(session),
-    UsageLedger.aggregate([
-      {
-        $match: {
-          orgId: policyOrgId,
-          featureKey: { $in: [...AI_FEATURE_KEYS] },
-          status: { $in: ['reserved', 'recovering', 'committed'] },
-          // An $expr over a computed field cannot use an index, so this used to
-          // scan every ledger row the organisation had ever written -- inside
-          // the reservation transaction, on every paid AI request. The $or is
-          // the same 24-hour window as an indexable range plus a legacy branch
-          // for rows written before reservedAt existed.
-          $or: [
-            { reservedAt: { $gte: since } },
-            { reservedAt: null, createdAt: { $gte: since } },
-          ],
-        },
-      },
-      { $group: { _id: null, credits: { $sum: '$credits' } } },
-    ]).session(session),
+    dailyAiCredits({ orgId: policyOrgId, userId: policyUserId }, since, session),
+    dailyAiCredits({ orgId: policyOrgId }, since, session),
     UsageLedger.countDocuments({
       orgId: policyOrgId,
       userId: policyUserId,
