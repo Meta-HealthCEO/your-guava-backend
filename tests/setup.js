@@ -43,10 +43,28 @@ const setup = async () => {
   await mongoose.connect(uri);
 };
 
+// A key taken from tenant data and written through a plain object can land on
+// Object.prototype (an item named "__proto__") or on the Object constructor
+// (an item named "constructor") for the whole process (security-2). Every
+// suite that uses this setup proves on the way out that nothing did.
+const assertPrototypesClean = () => {
+  const leaks = [
+    ['Object.prototype', Object.keys(Object.prototype)],
+    ['Object', Object.keys(Object)],
+    ['Function.prototype', Object.keys(Function.prototype)],
+    ['Array.prototype', Object.keys(Array.prototype)],
+  ].filter(([, keys]) => keys.length > 0);
+  if (leaks.length > 0) {
+    throw new Error(`Prototype pollution: ${leaks.map(([where, keys]) => `${where}.${keys.join(',')}`).join('; ')}`);
+  }
+};
+
 const teardown = async () => {
   await mongoose.connection.dropDatabase();
   await mongoose.connection.close();
   await mongoServer.stop();
+  // Last, after every resource is closed, so a leak fails the suite without leaving a server running.
+  assertPrototypesClean();
 };
 
 const clearDB = async () => {
@@ -149,4 +167,4 @@ const createTestManager = async (ownerToken, cafeIds) => {
   };
 };
 
-module.exports = { setup, teardown, clearDB, createTestUser, createTestManager, app };
+module.exports = { setup, teardown, clearDB, createTestUser, createTestManager, app, assertPrototypesClean };

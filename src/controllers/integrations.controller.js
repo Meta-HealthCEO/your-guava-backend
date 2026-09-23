@@ -21,7 +21,19 @@ const SERVICES = Object.freeze({
  * resolved to a built-in, walked past the "Unknown provider" guard and ended
  * in a 500.
  */
-const getService = (provider) => (Object.hasOwn(SERVICES, provider) ? SERVICES[provider] : null);
+const isKnownProvider = (provider) => typeof provider === 'string' && Object.hasOwn(SERVICES, provider);
+
+const getService = (provider) => (isKnownProvider(provider) ? SERVICES[provider] : null);
+
+/**
+ * router.param('provider', ...): every /:provider route is checked here once,
+ * before its handler and before the feature flag, against the one list. With
+ * the flag off, an unknown provider used to answer 503 like a real one.
+ */
+const validateProviderParam = (req, res, next, provider) => {
+  if (!isKnownProvider(provider)) return res.status(400).json({ success: false, message: 'Unknown provider' });
+  return next();
+};
 
 const isConfigError = (error) =>
   /CLIENT_ID|CLIENT_SECRET|REDIRECT_URI|is not set/i.test(error?.message || '');
@@ -43,7 +55,7 @@ const unavailable = (res) =>
 const list = async (req, res, next) => {
   try {
     const cafe = await Cafe.findById(req.user.cafeId).lean();
-    const providers = ['xero', 'quickbooks', 'sage'];
+    const providers = Object.keys(SERVICES);
     const status = {};
     for (const p of providers) {
       const integ = cafe?.accountingIntegrations?.[p] || {};
@@ -290,4 +302,4 @@ const disconnect = async (req, res, next) => {
   }
 };
 
-module.exports = { list, getAuthUrl, callback, sync, disconnect };
+module.exports = { list, getAuthUrl, callback, sync, disconnect, isKnownProvider, validateProviderParam };
