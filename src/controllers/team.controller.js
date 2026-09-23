@@ -1,17 +1,23 @@
-const { listAccessAudit } = require('./team/audit');
+/**
+ * Re-export barrel (BE-11-T03). Invitations, members, ownership, cafes and the
+ * access audit each live in ./team/*. team.routes.js imports this path.
+ */
+const {
+  inviteManager, previewInvitation, acceptInvitation, resendInvitation, revokeInvitation,
+} = require('./team/invitations');
 const { listTeam, removeMember, updateMemberCafes, updateMember } = require('./team/members');
-const { inviteManager, previewInvitation, acceptInvitation, resendInvitation, revokeInvitation } = require('./team/invitations');
+const { listAccessAudit } = require('./team/audit');
 const { transferOwnership } = require('./team/ownership');
 const { switchCafe, addCafe, archiveCafe, restoreCafe } = require('./team/cafes');
 
 module.exports = {
   inviteManager,
+  listTeam,
+  listAccessAudit,
   previewInvitation,
   acceptInvitation,
   resendInvitation,
   revokeInvitation,
-  listTeam,
-  listAccessAudit,
   removeMember,
   updateMemberCafes,
   updateMember,
