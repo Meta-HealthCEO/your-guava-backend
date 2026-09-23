@@ -282,6 +282,36 @@ describe('Auth API', () => {
       expect(response.status).toBe(400);
       expect(elapsedMs).toBeLessThan(1000);
     });
+
+    it('login answers a 100 KB email with 401 in under 50 ms (median of 5)', async () => {
+      // One warm-up call so connection set-up and JIT are not in the sample.
+      await request.post('/api/auth/login').send({ email: 'warm@up.co', password: 'password123' });
+      const samples = [];
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const started = process.hrtime.bigint();
+        const response = await request.post('/api/auth/login').send({ email: hostile, password: 'password123' });
+        samples.push(Number(process.hrtime.bigint() - started) / 1e6);
+        expect(response.status).toBe(401);
+        expect(response.body.message).toBe('Invalid credentials');
+      }
+      const median = [...samples].sort((a, b) => a - b)[2];
+      console.log(`login 100 KB email: median ${median.toFixed(1)} ms, all ${samples.map((ms) => ms.toFixed(1)).join(', ')}`);
+      expect(median).toBeLessThan(50);
+      expect(Math.max(...samples)).toBeLessThan(250);
+    });
+
+    it('a billing-email change answers a 100 KB address at once', async () => {
+      const owner = await createTestUser({ name: 'Billing Owner', email: 'billing-owner@yourguava.com' });
+      const started = process.hrtime.bigint();
+      const response = await request
+        .patch('/api/account/profile')
+        .set('Authorization', `Bearer ${owner.token}`)
+        .send({ billingEmail: hostile });
+      const ms = Number(process.hrtime.bigint() - started) / 1e6;
+      expect(response.status).toBe(400);
+      expect(response.body.message).toBe('Enter a valid billing email address');
+      expect(ms).toBeLessThan(250);
+    });
   });
 
   describe('login, profile, and logout', () => {
