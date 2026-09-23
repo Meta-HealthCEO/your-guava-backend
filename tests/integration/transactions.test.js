@@ -66,6 +66,22 @@ describe('Transactions API', () => {
       expect(res.body.message).toMatch(/csv/i);
     });
 
+    it('refuses a tiny workbook that declares a million rows, and keeps serving', async () => {
+      // 2.6 KB on disk with <dimension ref="A1:XFD1048576"/>. read-excel-file
+      // allocates what a sheet declares before any row limit applies, and this
+      // file took the API down for every cafe. It is now refused from the
+      // reader's own sizing, before the matrix is built.
+      const bomb = path.join(__dirname, '..', 'fixtures', 'xlsx-declares-A1-XFD1048576.xlsx');
+      const res = await request
+        .post('/api/transactions/upload')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('file', bomb);
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/too large to read safely/i);
+      expect((await request.get('/api/health')).status).toBe(200);
+    }, 60000);
+
     it('takes an Excel "sep=;" export from upload through confirm', async () => {
       // The first customer's file. The import learned to skip the directive in
       // b1d532c, but the upload preview still read "sep=" as the header row,

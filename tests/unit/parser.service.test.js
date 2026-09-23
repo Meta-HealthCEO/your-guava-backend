@@ -858,7 +858,7 @@ describe('line-per-row receipt grouping across days', () => {
 });
 
 describe('xlsx workbook reading', () => {
-  const { readWorkbookRows } = require('../../src/services/parser.service');
+  const { readWorkbook, readWorkbookRows } = require('../../src/services/parser.service');
 
   // A minimal but genuinely valid .xlsx. read-excel-file is a hard dependency of
   // every spreadsheet import, and its v8 release renamed the matrix-returning
@@ -866,7 +866,7 @@ describe('xlsx workbook reading', () => {
   // sheet as [{ sheet, data }]. Nothing here parsed a real workbook, so the
   // upgrade to ^9 broke every .xlsx import silently: the parser destructured a
   // sheet object as a header row and threw "headerRow.map is not a function".
-  const xlsxWith = (rows) => {
+  const xlsxWith = (rows, { dimension, extraRowsXml = '', secondSheetXml } = {}) => {
     const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
     const colName = (i) => {
       let s = '';
@@ -879,16 +879,86 @@ describe('xlsx workbook reading', () => {
         `<c r="${colName(c)}${r + 1}" t="inlineStr"><is><t xml:space="preserve">${esc(v)}</t></is></c>`
       ).join('');
       return `<row r="${r + 1}">${cells}</row>`;
-    }).join('');
+    }).join('') + extraRowsXml;
+    const dimensionTag = dimension ? `<dimension ref="${dimension}"/>` : '';
+    const WORKSHEET = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"';
+    const second = secondSheetXml
+      ? { sheet: '<sheet name="Notes" sheetId="2" r:id="rId2"/>',
+        rel: '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>',
+        entry: [{ name: 'xl/worksheets/sheet2.xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet ${WORKSHEET}>${secondSheetXml}</worksheet>` }] }
+      : { sheet: '', rel: '', entry: [] };
 
     return buildStoredZip([
       { name: '[Content_Types].xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>' },
       { name: '_rels/.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>' },
-      { name: 'xl/workbook.xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sales" sheetId="1" r:id="rId1"/></sheets></workbook>' },
-      { name: 'xl/_rels/workbook.xml.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>' },
-      { name: 'xl/worksheets/sheet1.xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${sheetRows}</sheetData></worksheet>` },
+      { name: 'xl/workbook.xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sales" sheetId="1" r:id="rId1"/>${second.sheet}</sheets></workbook>` },
+      { name: 'xl/_rels/workbook.xml.rels', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>${second.rel}</Relationships>` },
+      { name: 'xl/worksheets/sheet1.xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${dimensionTag}<sheetData>${sheetRows}</sheetData></worksheet>` },
+      ...second.entry,
     ]);
   };
+
+  describe('a sheet that declares itself enormous', () => {
+    // read-excel-file allocates rows x columns from what a sheet declares - its
+    // <dimension ref>, or its furthest cell - before any row limit applies, so
+    // a 2.6 KB file declaring A1:XFD1048576 asks for about 17 billion slots and
+    // took the API down for every cafe. A guard that imitated the reader with
+    // regexes was bypassed by r="XFD 1048576" (the reader trims the letters),
+    // and a worker with a memory cap still handed a sparse 1,048,576-row matrix
+    // back to the API. So the size comes from the reader's own steps, and the
+    // matrix is only built when that size is safe.
+    const SALES = [['Receipt', 'Date', 'Total'], ['R1', '2026-04-01', '35.00']];
+    const mainHeapGrowthMb = async (run) => {
+      const before = process.memoryUsage().heapUsed;
+      await run();
+      return (process.memoryUsage().heapUsed - before) / (1024 * 1024);
+    };
+
+    it.each([
+      ['a declared A1:XFD1048576', { dimension: 'A1:XFD1048576' }],
+      ['a cell at "XFD 1048576", which the reader trims to XFD1048576', {
+        extraRowsXml: '<row r="1048576"><c r="XFD 1048576" t="inlineStr"><is><t>x</t></is></c></row>',
+      }],
+      ['one real cell at Z1048576, which sizes a sparse 27-million-slot matrix', {
+        extraRowsXml: '<row r="1048576"><c r="Z1048576" t="inlineStr"><is><t>x</t></is></c></row>',
+      }],
+      ['a declared size with no column letters (A1:1000000000)', { dimension: 'A1:1000000000' }],
+    ])('refuses %s with a 400, and the API keeps its memory', async (_label, options) => {
+      const bomb = xlsxWith(SALES, options);
+      expect(bomb.length).toBeLessThan(4096);
+      let thrown;
+      const growth = await mainHeapGrowthMb(async () => {
+        try { await readWorkbook(bomb); } catch (error) { thrown = error; }
+      });
+
+      expect(thrown && thrown.statusCode).toBe(400);
+      expect(thrown && thrown.message).toMatch(/too large to read safely/i);
+      expect(growth).toBeLessThan(20);
+    }, 60_000);
+
+    it('reads the first sheet when a second tab is enormous', async () => {
+      // The reader parses sheet 1 only; a big notes tab is not a reason to refuse.
+      const workbook = xlsxWith(SALES, {
+        secondSheetXml: '<dimension ref="A1:XFD1048576"/><sheetData><row r="1048576"><c r="XFD1048576" t="inlineStr"><is><t>note</t></is></c></row></sheetData>',
+      });
+      expect(await readWorkbookRows(workbook)).toHaveLength(1);
+    });
+
+    it('still reads a workbook whose declared size overshoots its data', async () => {
+      // Real exports overstate their size (A1:Z65536 over a few rows); the
+      // reader trims the empty space, and this imported before the check.
+      const workbook = xlsxWith(SALES, { dimension: 'A1:Z65536' });
+      expect(await readWorkbookRows(workbook)).toHaveLength(1);
+    });
+
+    it('still tells an owner their file has too many rows', async () => {
+      // The portal turns "row limit" into its split-by-date-range advice, so an
+      // over-limit export must keep hearing it, not a size refusal.
+      const rows = [['Receipt', 'Date', 'Total']];
+      for (let i = 0; i < 10001; i += 1) rows.push([`R${i}`, '2026-04-01', '1.00']);
+      await expect(readWorkbook(xlsxWith(rows))).rejects.toThrow(/row limit/);
+    }, 60_000);
+  });
 
   it('reads a spreadsheet into header-keyed rows', async () => {
     const rows = await readWorkbookRows(xlsxWith([

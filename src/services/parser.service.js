@@ -1,11 +1,7 @@
 const csv = require('csv-parser');
 const { Readable } = require('stream');
+const path = require('path');
 const zlib = require('zlib');
-// read-excel-file v8 renamed the matrix-returning function to `readSheet` and
-// repurposed the default export to return every sheet as [{ sheet, data }].
-// Importing the default and treating it as a matrix is what broke every .xlsx
-// upload, so take the named export deliberately.
-const { readSheet } = require('read-excel-file/node');
 
 const REQUIRED_FIELDS = ['date', 'items', 'total'];
 const UNNAMED_COLUMN_RE = /^_(\d+)$/;
@@ -362,6 +358,77 @@ const excelSerialDateToDate = (serial, timezone = DEFAULT_TIMEZONE) => {
   }, timezone);
 };
 
+// read-excel-file's own steps for reading sheet 1, with one check added before
+// it allocates. The reader sizes its matrix from the sheet's declared
+// <dimension ref> (or, with none, its furthest cell) and fills rows x columns
+// before any row limit applies, so a 2.6 KB workbook declaring A1:XFD1048576
+// asked for about 17 billion slots and took the API down for every cafe. Two
+// imitations of that sizing failed review (a regex guard read r="XFD 1048576"
+// differently from the reader; a capped worker still returned a sparse
+// 1,048,576-row matrix), so the size is taken from the reader's own functions.
+// These are read-excel-file 9.2.0's internal modules, pinned by the lockfile;
+// the parser tests read real workbooks through them, so an upgrade that moves
+// them fails loudly rather than silently skipping the check.
+const READER_ROOT = path.join(path.dirname(require.resolve('read-excel-file/node')), '..', 'commonjs');
+const readerStep = (file) => require(path.join(READER_ROOT, file)).default;
+const unpackXlsxFile = readerStep('export/unpackXlsxFileNode.js');
+const readerXml = readerStep('xml/xml.js');
+const parseFilePaths = readerStep('xlsx/parseFilePaths.js');
+const parseSharedStrings = readerStep('xlsx/parseSharedStrings.js');
+const parseStyles = readerStep('xlsx/parseStyles.js');
+const parseSpreadsheetInfo = readerStep('xlsx/parseSpreadsheetInfo.js');
+const parseCells = readerStep('xlsx/parseCells.js');
+const parseSheetDimensions = readerStep('xlsx/parseSheetDimensions.js');
+const reconstructSheetDimensions = readerStep('xlsx/reconstructSheetDimensionsFromSheetCells.js');
+const convertCellsToData2dArray = readerStep('xlsx/convertCellsToData2dArray.js');
+
+// Ten million slots is about 80 MB of transient arrays, far above any real
+// export, including the ones that overstate their size (A1:Z65536 is 1.7M).
+const XLSX_MAX_SHEET_SLOTS = 10000000;
+
+/**
+ * readSheet(buffer) for sheet 1, as read-excel-file 9.2.0 does it, refusing a
+ * sheet whose matrix would be unsafe to allocate. A side of 0 counts as 1:
+ * A1:1000000000 has no column letters, and the reader still builds a billion
+ * empty rows for it.
+ */
+const readFirstSheet = async (buffer) => {
+  const contents = await unpackXlsxFile(buffer);
+  const fileContent = (filePath) => {
+    if (!contents[filePath]) {
+      throw new Error(`"${filePath}" file not found inside the *.xlsx file zip archive`);
+    }
+    return contents[filePath];
+  };
+  const options = { sheets: [1] };
+  const filePaths = parseFilePaths(fileContent('xl/_rels/workbook.xml.rels'), readerXml);
+  const sharedStrings = filePaths.sharedStrings
+    ? parseSharedStrings(fileContent(filePaths.sharedStrings), readerXml)
+    : [];
+  const styles = filePaths.styles ? parseStyles(fileContent(filePaths.styles), readerXml) : {};
+  const { sheets, epoch1904 } = parseSpreadsheetInfo(fileContent('xl/workbook.xml'), readerXml);
+  if (sheets.length < 1) {
+    throw new Error('Sheet number out of bounds: 1. Available sheets count: 0');
+  }
+  const sheetPath = filePaths.sheets[sheets[0].relationId];
+  if (!sheetPath) throw new Error('The first sheet of this workbook could not be found');
+
+  const sheetDocument = readerXml.createDocument(fileContent(sheetPath));
+  const cells = parseCells(sheetDocument, sharedStrings, styles, epoch1904, options);
+  const dimensions = parseSheetDimensions(sheetDocument) || reconstructSheetDimensions(cells);
+  if (cells.length > 0) {
+    const { row, column } = dimensions[1];
+    const slots = Math.max(row, 1) * Math.max(column, 1);
+    if (!(slots <= XLSX_MAX_SHEET_SLOTS)) {
+      throw createClientInputError(
+        `This spreadsheet says it spans ${row} rows by ${column} columns, which is too large to read safely. `
+        + 'Save it again from Excel, or export it as "CSV UTF-8", and upload that.'
+      );
+    }
+  }
+  return convertCellsToData2dArray(cells, dimensions);
+};
+
 /**
  * Reads a workbook into its header row and its data rows.
  *
@@ -372,7 +439,7 @@ const excelSerialDateToDate = (serial, timezone = DEFAULT_TIMEZONE) => {
  */
 const readWorkbook = async (buffer) => {
   const limits = parserLimits();
-  const matrix = await readSheet(buffer);
+  const matrix = await readFirstSheet(buffer);
   if (!matrix.length) return { headers: [], rows: [] };
   if (matrix.length - 1 > limits.maxRows) {
     throw createClientInputError(`File exceeds the ${limits.maxRows} row limit`);
