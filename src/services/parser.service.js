@@ -1272,10 +1272,115 @@ const PACKED_MARKER = String.raw`\s+[x×]\s+`;
 // read: `.` never matches a newline and `$` is end-of-string, so the earlier
 // items vanished with no error and the survivor absorbed the whole basket
 // total as an "exact" price.
-const PACKED_ITEM_RE = new RegExp(
-  `(${PACKED_QUANTITY})${PACKED_MARKER}([^\\n]+?)(?:[,;\\n](?=\\s*${PACKED_QUANTITY}${PACKED_MARKER})|$)`,
-  'gi'
-);
+// The packed grammar, `-?\d+(?:[.,]\d+)?\s+[x×]\s+NAME` repeated, where NAME
+// runs to the first `,` `;` or newline that is followed by another quantity
+// and marker, or to the end of the cell, and never crosses a newline. It used
+// to be one global regex, `(QTY)MARKER([^\n]+?)(?:[,;\n](?=\s*QTY MARKER)|$)`,
+// whose lazy NAME re-scanned to the next newline from every digit: a
+// 10,000-character cell cost tens of millions of steps and an XLSX could repeat
+// it on every row (parsing-2). This reads it in one pass with three precomputed
+// look-up arrays, and returns exactly what that regex returned.
+const CODE_NEWLINE = 10;
+const CODE_COMMA = 44;
+const CODE_MINUS = 45;
+const CODE_DOT = 46;
+const CODE_SEMICOLON = 59;
+const MARKER_CODES = new Set([120, 88, 215]); // x, X, ×
+
+const isDigitCode = (code) => code >= 48 && code <= 57;
+
+// Exactly the code units JavaScript's \s matches.
+const isJsWhitespace = (code) =>
+  (code >= 9 && code <= 13) || code === 32 || code === 160 || code === 5760
+  || (code >= 8192 && code <= 8202) || code === 8232 || code === 8233 || code === 8239
+  || code === 8287 || code === 12288 || code === 65279;
+
+// Reused between calls: parsePackedItems is synchronous and never re-entered,
+// and four fresh arrays per 10,000-character cell were 160 KB of garbage per
+// row, 1.6 GB across a 10,000-row file. Every slot in [0, n] is rewritten on
+// each call, so nothing stale is ever read.
+let packedScratch = new Int32Array(4 * 1024);
+
+const buildPackedIndex = (text) => {
+  const n = text.length;
+  const size = n + 1;
+  if (packedScratch.length < size * 4) packedScratch = new Int32Array(size * 4);
+  const digitEnd = packedScratch.subarray(0, size); // first non-digit at or after i
+  const spaceEnd = packedScratch.subarray(size, size * 2); // first non-whitespace at or after i
+  const newlineAt = packedScratch.subarray(size * 2, size * 3); // first newline at or after i (n if none)
+  const nextTerminator = packedScratch.subarray(size * 3, size * 4);
+  digitEnd[n] = n;
+  spaceEnd[n] = n;
+  newlineAt[n] = n;
+  for (let i = n - 1; i >= 0; i -= 1) {
+    const code = text.charCodeAt(i);
+    digitEnd[i] = isDigitCode(code) ? digitEnd[i + 1] : i;
+    spaceEnd[i] = isJsWhitespace(code) ? spaceEnd[i + 1] : i;
+    newlineAt[i] = code === CODE_NEWLINE ? i : newlineAt[i + 1];
+  }
+  return { n, digitEnd, spaceEnd, newlineAt, nextTerminator };
+};
+
+// Where `-?\d+(?:[.,]\d+)?\s+[x×]\s+` matches from `start`: the end of the
+// quantity and the start of the name. Constant time with the index.
+const packedHeadAt = (text, index, start) => {
+  const { n, digitEnd, spaceEnd } = index;
+  let cursor = start;
+  if (cursor < n && text.charCodeAt(cursor) === CODE_MINUS) cursor += 1;
+  if (cursor >= n || !isDigitCode(text.charCodeAt(cursor))) return null;
+  cursor = digitEnd[cursor];
+  const decimal = cursor < n ? text.charCodeAt(cursor) : -1;
+  if ((decimal === CODE_DOT || decimal === CODE_COMMA) && cursor + 1 < n && isDigitCode(text.charCodeAt(cursor + 1))) {
+    cursor = digitEnd[cursor + 1];
+  }
+  const qtyEnd = cursor;
+  const markerAt = spaceEnd[qtyEnd];
+  if (markerAt === qtyEnd || markerAt >= n || !MARKER_CODES.has(text.charCodeAt(markerAt))) return null;
+  const nameStart = spaceEnd[markerAt + 1];
+  if (nameStart === markerAt + 1) return null;
+  return { qtyEnd, nameStart };
+};
+
+// nextTerminator[i]: the first position at or after i where a name may end:
+// a separator followed by another quantity and marker, or the end of the cell.
+const buildPackedTerminators = (text, index) => {
+  const { n, spaceEnd, nextTerminator } = index;
+  nextTerminator[n] = n;
+  for (let i = n - 1; i >= 0; i -= 1) {
+    const code = text.charCodeAt(i);
+    const separator = code === CODE_COMMA || code === CODE_SEMICOLON || code === CODE_NEWLINE;
+    nextTerminator[i] = separator && packedHeadAt(text, index, spaceEnd[i + 1]) ? i : nextTerminator[i + 1];
+  }
+  return nextTerminator;
+};
+
+const scanPackedItems = (text) => {
+  const index = buildPackedIndex(text);
+  const nextTerminator = buildPackedTerminators(text, index);
+  const items = [];
+  let start = 0;
+  while (start < index.n) {
+    const code = text.charCodeAt(start);
+    const head = code === CODE_MINUS || isDigitCode(code) ? packedHeadAt(text, index, start) : null;
+    if (head && head.nameStart < index.n) {
+      const end = nextTerminator[head.nameStart + 1];
+      // The name may not cross a newline; the newline can only be its terminator.
+      if (end <= index.newlineAt[head.nameStart]) {
+        const quantity = packedQuantity(text.slice(start, head.qtyEnd));
+        const name = text.slice(head.nameStart, end).trim();
+        if (name && quantity != null) items.push({ name, quantity });
+        start = end < index.n ? end + 1 : index.n;
+        continue;
+      }
+    }
+    // Every later start inside this digit run reaches the same quantity end,
+    // the same marker check and the same name start, so it fails the same way
+    // (the regex's backtracked matches only ever produced whitespace-only
+    // names, which were dropped): skip the run. A minus steps on by one.
+    start = isDigitCode(code) ? index.digitEnd[start] : start + 1;
+  }
+  return items;
+};
 // The marker is mandatory here. With `x` optional, any description starting
 // with a number was read as a quantity: "500 Still Water" became 500 units of
 // "Still Water", and "2 Minute Noodles" two units of "Minute Noodles".
@@ -1293,14 +1398,7 @@ const packedQuantity = (raw) => {
  */
 const parsePackedItems = (str) => {
   if (!str) return [];
-  const items = [];
-  const regex = new RegExp(PACKED_ITEM_RE.source, PACKED_ITEM_RE.flags);
-  let match;
-  while ((match = regex.exec(str)) !== null) {
-    const quantity = packedQuantity(match[1]);
-    const name = match[2].trim();
-    if (name && quantity != null) items.push({ name, quantity });
-  }
+  const items = scanPackedItems(String(str));
   if (items.length > 0) return items;
 
   return String(str)

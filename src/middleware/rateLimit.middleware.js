@@ -98,17 +98,38 @@ const uploadLimiter = rateLimit({
   },
 });
 
+// Confirm and remap parse a whole stored file every time, and a failed upload
+// can be confirmed again, so a member could repeat the heaviest work the API
+// does behind nothing but the loose global limiter (security-3).
+const PARSE_LIMIT = 20;
+const parseLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: PARSE_LIMIT,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  skip: isTest,
+  keyGenerator: (req) => req.user?.id || req.ip,
+  validate: { keyGeneratorIpFallback: false },
+  message: {
+    success: false,
+    code: 'PARSE_RATE_LIMITED',
+    message: 'That is a lot of imports at once. Wait a minute, then continue.',
+  },
+});
+
 // Exposed so tests can assert the budgets stay in the right relationship to each
 // other without reaching into express-rate-limit internals.
 const getLimiterOptions = (name) => {
   if (name === 'ai') return { limit: AI_LIMIT, windowMs: 60 * 1000 };
   if (name === 'upload') return { limit: UPLOAD_LIMIT, windowMs: 60 * 1000 };
+  if (name === 'parse') return { limit: PARSE_LIMIT, windowMs: 60 * 1000 };
   throw new Error(`Unknown limiter: ${name}`);
 };
 
 module.exports = {
   aiLimiter,
   uploadLimiter,
+  parseLimiter,
   getLimiterOptions,
   globalLimiter,
   authLimiter,
