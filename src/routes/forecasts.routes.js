@@ -6,18 +6,21 @@ const { aiLimiter } = require('../middleware/rateLimit.middleware');
 const { apiCache } = require('../middleware/cache.middleware');
 const {
   getToday,
+  getTomorrow,
   getWeek,
   generate,
   getFactors,
   updateFactors,
   getAccuracy,
   getHistory,
+  getRecent,
+} = require('../controllers/forecasts.controller');
+const {
   getInsights,
   refreshGeneratedInsights,
   chatInsights,
   streamChatInsights,
-  getRecent,
-} = require('../controllers/forecasts.controller');
+} = require('../controllers/askGuava.controller');
 
 router.use(authMiddleware);
 
@@ -28,7 +31,7 @@ const cacheHistoryReads = (req, res, next) => (
 );
 
 router.get('/today', forecastCache, getToday);
-router.get('/tomorrow', forecastCache, require('../controllers/forecasts.controller').getTomorrow);
+router.get('/tomorrow', forecastCache, getTomorrow);
 router.get('/week', forecastCache, getWeek);
 router.get('/recent', forecastCache, getRecent);
 router.get('/history', cacheHistoryReads, getHistory);
